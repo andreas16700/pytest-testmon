@@ -27,7 +27,6 @@ function App() {
     
     useEffect(() => {
         loadRepos();
-        
     }, []);
 
     useEffect(() => {
@@ -43,7 +42,6 @@ function App() {
             const response = await fetch(`${API_BASE}/repos`);
             const data = await response.json();
             setRepos(data.repos || []);
-            console.log("Response is",data)
         } catch (err) {
             console.error('Failed to load repos:', err);
             setError('Failed to load repositories');

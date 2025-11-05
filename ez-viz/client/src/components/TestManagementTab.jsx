@@ -8,7 +8,6 @@ function TestManagementTab({ files , currentRepo , currentJob }) {
   const [isOpen, setIsOpen] = useState(false);
 
   const [testList, setTestList] = useState(files);
-  console.log("Test lists are", testList);
   const filteredTests = testList.filter((test) =>
     test.filename.toLowerCase().includes(searchTerm.toLowerCase())
   );
@@ -21,33 +20,30 @@ function TestManagementTab({ files , currentRepo , currentJob }) {
     );
   };
 
-  async function handleSave() {
-  try {
-    const response = await fetch('/api/client/testPreferences', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        repo_id:currentRepo,
-        job_id:currentJob,
-        selectedTests: selectedTests,
-        
-      })
-    });
+  const handleSave =  async () =>  {
+    try {
+      const response = await fetch('/api/client/testPreferences', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          repo_id: currentRepo,
+          job_id: currentJob,
+          selectedTests: selectedTests,
+        })
+      });
 
-    if (response.ok) {
-      const data = await response.json();
-      alert(`Saved test choices:\n${selectedTests.join(", ")}`);
-      console.log("Save successful:", data);
-    } else {
-      alert("Failed to save test preferences");
+      if (response.ok) {
+        alert(`Saved test choices:\n${selectedTests.join(", ")}`);
+      } else {
+        alert("Failed to save test preferences");
+      }
+    } catch (error) {
+      console.error("Error saving preferences:", error);
+      alert("Error saving test preferences");
     }
-  } catch (error) {
-    console.error("Error saving preferences:", error);
-    alert("Error saving test preferences");
   }
-}
 
   const handleDragEnd = (result) => {
     if (!result.destination) return;
