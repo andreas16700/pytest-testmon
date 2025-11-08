@@ -36,7 +36,7 @@ function MainContent({ loading, error, summary, allTests, allFiles, activeTab, s
                 )}
 
                 {activeTab === 'management' && (
-                    <TestManagementTab files={allFiles} currentRepo={currentRepo} currentJob={currentJob} />
+                    <TestManagementTab currentRepo={currentRepo} currentJob={currentJob} />
                 )}
             </div>
         </>

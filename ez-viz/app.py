@@ -260,16 +260,18 @@ def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None
 # SQLite with logging
 # -----------------------------------------------------------------------------
 def get_db_connection(db_path: Path, readonly: bool = True):
-    """Get a connection to a testmon database"""
     mode = "ro" if readonly else "rwc"
-    log.info("db_connect_attempt path=%s readonly=%s mode=%s", db_path, readonly, mode)
+    abs_path = os.path.abspath(str(db_path))
+    log.info("db_connect_attempt path=%s abs_path=%s readonly=%s", db_path, abs_path, readonly)
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode={mode}", uri=True, timeout=60)
+        conn = sqlite3.connect(f"file:{abs_path}?mode={mode}", uri=True, timeout=60)
         log.info("db_connect_success path=%s", db_path)
         return conn
     except Exception:
-        log_exception("db_connect", path=str(db_path), readonly=readonly, mode=mode)
+        log_exception("db_connect", path=abs_path, readonly=readonly, mode=mode)
         raise
+
+
 
 # -----------------------------------------------------------------------------
 # API ENDPOINTS - Client Operations (GitHub Actions)
@@ -475,6 +477,55 @@ def get_summary(repo_id: str, job_id: str):
     except Exception:
         log_exception("summary_query", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read summary"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/test_files", methods=["GET"])
+def list_test_files(repo_id: str, job_id: str):
+    g.repo_id, g.job_id = repo_id, job_id
+
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    if resp:
+        return resp, code
+
+    try:
+        conn = get_db_connection(db_path, readonly=True)
+        conn.row_factory = sqlite3.Row
+
+        test_files = conn.execute(
+            """
+            SELECT
+                CASE 
+                    WHEN instr(te.test_name, '::') > 0 THEN substr(te.test_name, 1, instr(te.test_name, '::') - 1)
+                    ELSE te.test_name
+                END AS file_name,
+                COUNT(*) AS test_count,
+                SUM(te.duration) AS total_duration,
+                SUM(CASE WHEN te.failed = 1 THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN te.forced = 1 THEN 1 ELSE 0 END) AS forced_count,
+                COUNT(DISTINCT tef.fingerprint_id) AS dependency_count,
+                GROUP_CONCAT(
+                    DISTINCT
+                    CASE 
+                        WHEN instr(te.test_name, '::') > 0 THEN substr(te.test_name, instr(te.test_name, '::') + 2)
+                        ELSE NULL
+                    END
+                ) AS test_methods
+            FROM test_execution te
+            LEFT JOIN test_execution_file_fp tef
+                ON te.id = tef.test_execution_id
+            GROUP BY file_name
+            ORDER BY file_name;
+        """
+        ).fetchall()
+
+        conn.close()
+        log.info("test_file_list_success count=%s", len(test_files))
+
+        return jsonify({"test_files": [dict(test) for test in test_files]})
+
+    except Exception:
+        log_exception("test_list_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to read test list"}), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/tests", methods=["GET"])
 def get_tests(repo_id: str, job_id: str):
