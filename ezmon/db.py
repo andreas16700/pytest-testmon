@@ -150,6 +150,20 @@ class DB:  # pylint: disable=too-many-public-methods
         ) = self.fetch_current_run_stats(exec_id)
 
         attribute_prefix = "" if select else "potential_"
+        self.write_attribute(
+        f"{attribute_prefix}run_time_saved",
+        run_saved_time,
+        exec_id=exec_id
+        )
+      
+        self.write_run_info_attribute(
+            exec_id=exec_id,
+            run_saved_time=run_saved_time,
+            run_all_time=run_all_time,
+            run_saved_tests=run_saved_tests,
+            run_all_tests=run_all_tests,
+            
+        )
         self.increment_attributes(
             {
                 f"{attribute_prefix}time_saved": run_saved_time,
@@ -159,6 +173,11 @@ class DB:  # pylint: disable=too-many-public-methods
             },
             exec_id=None,
         )
+
+  
+        
+
+
 
     def fetch_saving_stats(self, exec_id, select):
         (
@@ -306,7 +325,16 @@ class DB:  # pylint: disable=too-many-public-methods
                 "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
                 [dataid, json.dumps(data)],
             )
-
+    def write_run_info_attribute(self, exec_id, run_saved_time, run_all_time, 
+                              run_saved_tests, run_all_tests):
+        with self.con as con:
+            con.execute(
+                """INSERT OR REPLACE INTO run_infos 
+                (runid, run_time_saved, run_time_all, tests_saved, tests_all)
+                VALUES (?, ?, ?, ?, ?)""",
+                (exec_id, run_saved_time, run_all_time, run_saved_tests, run_all_tests),
+            )
+    
     def fetch_attribute(self, attribute, default=None, exec_id=None):
         cursor = self.con.execute(
             "SELECT data FROM metadata WHERE dataid=?",
@@ -339,6 +367,15 @@ class DB:  # pylint: disable=too-many-public-methods
 
     def _create_metadata_statement(self) -> str:
         return """CREATE TABLE metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
+
+    def _create_run_infos_statement(self) -> str:
+        return """CREATE TABLE run_infos (
+            runid INTEGER PRIMARY KEY,
+            run_time_saved REAL,
+            run_time_all REAL,
+            tests_saved INTEGER,
+            tests_all INTEGER
+        );"""
 
     def _create_environment_statement(self) -> str:
         return """
@@ -417,7 +454,8 @@ class DB:  # pylint: disable=too-many-public-methods
             + self._create_test_execution_statement()
             + self._create_temp_tables_statement()
             + self._create_file_fp_statement()
-            + self._create_test_execution_ffp_statement()
+            + self._create_test_execution_ffp_statement() 
+            + self._create_run_infos_statement()
         )
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
