@@ -18,6 +18,8 @@ function TestManagementTab({currentRepo, currentJob}) {
     const [expandedFile, setExpandedFile] = useState(null);
     const [alwaysRunTests, setAlwaysRunTests] = useState([]);
     const [prioritizedTests, setPrioritizedTests] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [failedAttemptId, setFailedAttemptId] = useState(null);
 
     const filteredTests = testFileList.filter((testFile) =>
         testFile.file_name.toLowerCase().includes(searchTerm.toLowerCase())
@@ -29,6 +31,13 @@ function TestManagementTab({currentRepo, currentJob}) {
                 ? prev.filter((filename) => filename !== testName)
                 : [...prev, testName]
         );
+        setPrioritizedTests((prev) => {
+            if (!prev.includes(testName)) {
+                return [...prev, testName];
+            } else {
+                return prev;
+            }
+        });
     };
 
     const handleFileClick = (fileName) => {
@@ -69,14 +78,21 @@ function TestManagementTab({currentRepo, currentJob}) {
             const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/test_files`);
             const data = await response.json();
             setTestFileList(data.test_files || []);
+            setLoading(true);
         } catch (err) {
             console.error('Failed to load test file list:', err);
         }
     }
 
+    const onDragStart = () => {
+        setFailedAttemptId(null);
+    };
+
     const onDragEnd = (result) => {
         const {source, destination} = result;
         if (!destination) return;
+
+        setFailedAttemptId(null);
 
         let available = testFileList.filter((t) => !prioritizedTests.includes(t.file_name));
         let prioritized = testFileList.filter((t) => prioritizedTests.includes(t.file_name));
@@ -95,6 +111,13 @@ function TestManagementTab({currentRepo, currentJob}) {
                 const [moved] = available.splice(source.index, 1);
                 prioritized.splice(destination.index, 0, moved);
             } else {
+                const itemToMove = prioritized[source.index];
+
+                if (alwaysRunTests.includes(itemToMove.file_name)) {
+                    setFailedAttemptId(itemToMove.file_name);
+                    return;
+                }
+
                 const [moved] = prioritized.splice(source.index, 1);
                 available.splice(destination.index, 0, moved);
             }
@@ -108,7 +131,7 @@ function TestManagementTab({currentRepo, currentJob}) {
     };
 
 
-    return (
+    return (loading ?
         <div className="animate-fadeIn p-6 max-w-2xl mx-auto">
             <h3 className="text-lg font-medium text-gray-800 mb-2">Manage Tests</h3>
             <div className="relative mb-6">
@@ -117,7 +140,7 @@ function TestManagementTab({currentRepo, currentJob}) {
                     className="flex items-center justify-between w-full px-5 py-2.5 rounded-md text-white text-sm font-medium bg-blue-600 hover:bg-blue-700 transition"
                 >
                     Select Tests
-                    <ChevronDown size={18} className={`ml-2 transition-transform ${isOpen ? "rotate-180" : ""}`} />
+                    <ChevronDown size={18} className={`ml-2 transition-transform ${isOpen ? "rotate-180" : ""}`}/>
                 </button>
                 {isOpen && (
                     <ul className="absolute left-0 right-0 mt-2 bg-white border border-gray-200 shadow-lg rounded-md z-50 max-h-80 overflow-auto">
@@ -160,16 +183,20 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                 {test.file_name}
                                             </label>
                                             {methods.length > 0 && (
-                                                <ChevronDown size={14} className={`ml-2 transition-transform text-gray-400 ${isExpanded ? "rotate-180" : ""}`} />
+                                                <ChevronDown size={14}
+                                                             className={`ml-2 transition-transform text-gray-400 ${isExpanded ? "rotate-180" : ""}`}/>
                                             )}
                                         </li>
                                         {isExpanded && (
                                             <ul className="pl-12 pr-4 pb-2 pt-1 bg-gray-50 border-t border-b border-gray-100">
                                                 {methods.length > 0 ? (
                                                     <>
-                                                        <li className="text-xs text-gray-500 font-semibold mb-1">Test Functions ({methods.length})</li>
+                                                        <li className="text-xs text-gray-500 font-semibold mb-1">Test
+                                                            Functions ({methods.length})
+                                                        </li>
                                                         {methods.map((method, methodIndex) => (
-                                                            <li key={methodIndex} className="text-xs text-gray-600 truncate py-0.5">
+                                                            <li key={methodIndex}
+                                                                className="text-xs text-gray-600 truncate py-0.5">
                                                                 • {method}
                                                             </li>
                                                         ))}
@@ -195,12 +222,14 @@ function TestManagementTab({currentRepo, currentJob}) {
 
             <div className="mb-6">
                 <h3 className="text-lg font-medium text-gray-800 mb-2">Test Prioritization</h3>
-                <p className="text-gray-500 text-sm mb-4">Drag tests from the left to prioritize them (right). You can reorder the prioritized list.</p>
-                <DragDropContext onDragEnd={onDragEnd}>
+                <p className="text-gray-500 text-sm mb-4">Drag tests from the left to prioritize them (right). You
+                    can reorder the prioritized list.</p>
+                <DragDropContext onDragEnd={onDragEnd} onDragStart={onDragStart}>
                     <div className="grid grid-cols-2 gap-6">
                         <Droppable droppableId="available">
                             {(provided) => (
-                                <div ref={provided.innerRef} {...provided.droppableProps} className="bg-gray-50 border border-gray-200 rounded-lg shadow-sm p-3 min-h-[300px]" >
+                                <div ref={provided.innerRef} {...provided.droppableProps}
+                                     className="bg-gray-50 border border-gray-200 rounded-lg shadow-sm p-3 h-[300px] overflow-y-auto">
                                     <h4 className="text-gray-700 font-medium mb-2 text-sm">Available Tests</h4>
                                     <ul className="space-y-1">
                                         {testFileList
@@ -212,7 +241,9 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                     : [];
 
                                                 return (
-                                                    <Draggable key={test.file_name} draggableId={`available-${test.file_name}`} index={index} >
+                                                    <Draggable key={test.file_name}
+                                                               draggableId={`available-${test.file_name}`}
+                                                               index={index}>
                                                         {(provided, snapshot) => (
                                                             <React.Fragment>
                                                                 <li
@@ -224,19 +255,29 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                                                 ${snapshot.isDragging ? "shadow-lg" : "shadow-sm"} 
                                                                                 ${isExpanded ? 'rounded-b-none' : 'rounded-md'}`}
                                                                 >
-                                                                    <div className="flex items-center flex-1 min-w-0">
-                                                                        <GripVertical size={16} className="text-gray-400 mr-2 shrink-0"/>
-                                                                        <span className="truncate">{test.file_name}</span>
+                                                                    <div
+                                                                        className="flex items-center flex-1 min-w-0">
+                                                                        <GripVertical size={16}
+                                                                                      className="text-gray-400 mr-2 shrink-0"/>
+                                                                        <span
+                                                                            className="truncate">{test.file_name}</span>
                                                                         {methods.length > 0 && (
-                                                                            <ChevronDown size={14} className={`ml-2 transition-transform text-gray-400 shrink-0 ${isExpanded ? "rotate-180" : ""}`} />
+                                                                            <ChevronDown size={14}
+                                                                                         className={`ml-2 transition-transform text-gray-400 shrink-0 ${isExpanded ? "rotate-180" : ""}`}/>
                                                                         )}
                                                                     </div>
-                                                                    <div className="relative inline-block group ml-2 shrink-0">
-                                                                        <Info size={16} className="text-gray-400 cursor-pointer" />
-                                                                        <div className="absolute left-1/2 transform -translate-x-1/2 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
-                                                                            <div className="bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative">
-                                                                                Took {(test.total_duration / 2).toFixed(4)}s last run
-                                                                                <div className="absolute left-1/2 transform -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
+                                                                    <div
+                                                                        className="relative inline-block group ml-2 shrink-0">
+                                                                        <Info size={16}
+                                                                              className="text-gray-400 cursor-pointer"/>
+                                                                        <div
+                                                                            className="absolute left-1/2 transform -translate-x-1/2 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
+                                                                            <div
+                                                                                className="bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative">
+                                                                                Took {(test.total_duration / 2).toFixed(4)}s
+                                                                                last run
+                                                                                <div
+                                                                                    className="absolute left-1/2 transform -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
                                                                             </div>
                                                                         </div>
                                                                     </div>
@@ -244,11 +285,13 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                                 {isExpanded && (
                                                                     <ul className="pl-8 pr-3 pb-2 pt-1 bg-white border-x border-b border-gray-100 rounded-b-md shadow-sm">
                                                                         {methods.length > 0 ? methods.map((method, methodIndex) => (
-                                                                            <li key={methodIndex} className="text-xs text-gray-600 truncate py-0.5">
+                                                                            <li key={methodIndex}
+                                                                                className="text-xs text-gray-600 truncate py-0.5">
                                                                                 • {method}
                                                                             </li>
                                                                         )) : (
-                                                                            <li className="text-xs text-gray-500 italic">No individual methods listed.</li>
+                                                                            <li className="text-xs text-gray-500 italic">No
+                                                                                individual methods listed.</li>
                                                                         )}
                                                                     </ul>
                                                                 )}
@@ -265,7 +308,8 @@ function TestManagementTab({currentRepo, currentJob}) {
 
                         <Droppable droppableId="prioritized">
                             {(provided) => (
-                                <div ref={provided.innerRef} {...provided.droppableProps} className="bg-gray-50 border border-gray-200 rounded-lg shadow-sm p-3 min-h-[300px]" >
+                                <div ref={provided.innerRef} {...provided.droppableProps}
+                                     className="bg-gray-50 border border-gray-200 rounded-lg shadow-sm p-3 h-[300px] overflow-y-auto">
                                     <h4 className="text-gray-700 font-medium mb-2 text-sm">Prioritized Tests</h4>
                                     <ul className="space-y-1">
                                         {testFileList
@@ -277,7 +321,9 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                     : [];
 
                                                 return (
-                                                    <Draggable key={test.file_name} draggableId={`prioritized-${test.file_name}`} index={index} >
+                                                    <Draggable key={test.file_name}
+                                                               draggableId={`prioritized-${test.file_name}`}
+                                                               index={index}>
                                                         {(provided, snapshot) => (
                                                             <React.Fragment>
                                                                 <li
@@ -289,27 +335,41 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                                                 ${snapshot.isDragging ? "shadow-lg" : "shadow-sm"} 
                                                                                 ${isExpanded ? 'rounded-b-none' : 'rounded-md'}`}
                                                                 >
-                                                                    <div className="flex items-center flex-1 min-w-0">
-                                                                        <GripVertical size={16} className="text-gray-400 mr-2 shrink-0"/>
+                                                                    <div
+                                                                        className="flex items-center flex-1 min-w-0">
+                                                                        <GripVertical size={16}
+                                                                                      className="text-gray-400 mr-2 shrink-0"/>
                                                                         <span className="truncate">{test.file_name}</span>
                                                                         {methods.length > 0 && (
-                                                                            <ChevronDown size={14} className={`ml-2 transition-transform text-gray-400 shrink-0 ${isExpanded ? "rotate-180" : ""}`} />
+                                                                            <ChevronDown size={14} className={`ml-2 transition-transform text-gray-400 shrink-0 ${isExpanded ? "rotate-180" : ""}`}/>
                                                                         )}
                                                                     </div>
-                                                                    <div className="relative inline-block group ml-2 shrink-0">
-                                                                        <Info size={16} className="text-gray-400 cursor-pointer" />
-                                                                        <div className="absolute left-1/2 transform -translate-x-1/2 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
-                                                                            <div className="bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative">
-                                                                                Took {(test.total_duration / 2).toFixed(4)}s last run
-                                                                                <div className="absolute left-1/2 transform -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
+                                                                    <div
+                                                                        className="relative inline-block group ml-2 shrink-0">
+                                                                        <Info size={16}
+                                                                              className="text-gray-400 cursor-pointer"/>
+                                                                        <div
+                                                                            className="absolute left-1/2 transform -translate-x-1/2 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
+                                                                            <div
+                                                                                className="bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative">
+                                                                                Took {(test.total_duration / 2).toFixed(4)}s
+                                                                                last run
+                                                                                <div
+                                                                                    className="absolute left-1/2 transform -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
                                                                             </div>
                                                                         </div>
                                                                     </div>
                                                                 </li>
+                                                                {failedAttemptId === test.file_name && (
+                                                                    <div className="p-3 text-xs text-red-800 bg-red-100 border-b border-l border-r border-red-400 rounded-b-md -mt-1 shadow-sm" style={{}}>
+                                                                        Since this was selected to always run, it is prioritized by default. To remove it, first uncheck the box in the above component.
+                                                                    </div>
+                                                                )}
                                                                 {isExpanded && (
                                                                     <ul className="pl-8 pr-3 pb-2 pt-1 bg-white border-x border-b border-gray-100 rounded-b-md shadow-sm">
                                                                         {methods.length > 0 ? methods.map((method, methodIndex) => (
-                                                                            <li key={methodIndex} className="text-xs text-gray-600 truncate py-0.5">
+                                                                            <li key={methodIndex}
+                                                                                className="text-xs text-gray-600 truncate py-0.5">
                                                                                 • {method}
                                                                             </li>
                                                                         )) : (
@@ -342,11 +402,15 @@ function TestManagementTab({currentRepo, currentJob}) {
             </div>
             <div className="bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded-md shadow-sm">
                 <p className="text-yellow-800 text-sm leading-relaxed">
-                    <strong>Tip:</strong> You can search and select tests to always run AND/OR you can prioritize test runs. Save your configuration for your CI pipeline.
+                    <strong>Tip:</strong> You can search and select tests to always run AND/OR you can prioritize
+                    test runs. Save your configuration for your CI pipeline.
                 </p>
             </div>
-        </div>
-    );
+        </div> :
+        <div className="flex flex-col justify-center items-center p-6 max-w-2xl mx-auto h-64">
+            <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-600"></div>
+            <span className="text-gray-600 font-medium mt-3">Loading...</span>
+        </div>);
 }
 
 export default TestManagementTab;

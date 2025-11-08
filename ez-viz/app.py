@@ -434,7 +434,7 @@ def get_summary(repo_id: str, job_id: str):
             """
             SELECT environment_name, python_version, system_packages
             FROM environment
-            LIMIT 1
+            LIMIT 1;
         """
         ).fetchone()
 
