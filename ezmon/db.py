@@ -75,8 +75,10 @@ class DB:  # pylint: disable=too-many-public-methods
             self.file_created = True
         else:
             self.file_created = False
-
         self.con.executescript(self._local_temp_tables_statement())
+        # Ensure run_infos table exists for older DB files without recreating the DB file.
+        # Using IF NOT EXISTS makes this safe to run against an existing DB.
+        self.con.executescript(self._create_run_infos_statement())
 
     def version_compatibility(self):
         return DATA_VERSION
@@ -369,7 +371,7 @@ class DB:  # pylint: disable=too-many-public-methods
         return """CREATE TABLE metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
 
     def _create_run_infos_statement(self) -> str:
-        return """CREATE TABLE run_infos (
+        return """CREATE TABLE IF NOT EXISTS run_infos (
             runid INTEGER PRIMARY KEY,
             run_time_saved REAL,
             run_time_all REAL,
