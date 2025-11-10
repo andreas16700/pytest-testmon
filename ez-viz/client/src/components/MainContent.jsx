@@ -5,7 +5,7 @@ import SummaryTab from "./SummaryTab.jsx";
 import React from "react";
 import TestManagementTab from "./TestManagementTab.jsx";
 
-function MainContent({ loading, error, summary, allTests, allFiles, activeTab, setActiveTab, testSearch, setTestSearch, fileSearch, setFileSearch, showTestDetails, showFileDetails, currentRepo, currentJob }) {
+function MainContent({ loading, error, summary, allTests, allFiles, activeTab, setActiveTab, testSearch, setTestSearch, fileSearch, setFileSearch, showTestDetails, showFileDetails, currentRepo, currentJob, currentRun }) {
     if (loading) {
         return (
             <div className="flex flex-col justify-center items-center p-6 max-w-2xl mx-auto h-64">
@@ -41,11 +41,11 @@ function MainContent({ loading, error, summary, allTests, allFiles, activeTab, s
                 )}
 
                 {activeTab === 'management' && (
-                    <TestManagementTab currentRepo={currentRepo} currentJob={currentJob} />
+                    <TestManagementTab currentRepo={currentRepo} currentJob={currentJob} currentRun={currentRun}/>
                 )}
             </div>
         </>
     );
 }
 
-export default MainContent
+export default MainContent;

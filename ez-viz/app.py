@@ -206,8 +206,8 @@ def get_repo_path(repo_id: str) -> Path:
         log.info("repo_dir_create_success path=%s", repo_path)
     return repo_path
 
-def get_job_db_path(repo_id: str, job_id: str) -> Path:
-    """Get path for a specific job's testmon database"""
+def get_run_db_path(repo_id: str, job_id: str, run_id: str) -> Path:
+    """Get path for a specific run's testmon database"""
     repo_path = get_repo_path(repo_id)
     safe_job_id = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
     job_path = repo_path / safe_job_id
@@ -221,17 +221,32 @@ def get_job_db_path(repo_id: str, job_id: str) -> Path:
         )
         job_path.mkdir(parents=True, exist_ok=True)
         log.info("job_dir_create_success path=%s", job_path)
-    db_path = job_path / ".testmondata"
-    log.info("job_db_resolve repo_id=%s job_id=%s db_path=%s", repo_id, job_id, db_path)
+
+    safe_run_id = "".join(c for c in run_id if c.isalnum() or c in ("-", "_"))
+    run_path = job_path / safe_run_id
+    if not run_path.exists():
+        log.info(
+            "run_dir_create_attempt repo_id=%s job_id=%s run_id=%s safe_run_id=%s path=%s",
+            repo_id,
+            job_id,
+            run_id,
+            safe_run_id,
+            run_path,
+        )
+        run_path.mkdir(parents=True, exist_ok=True)
+        log.info("run_dir_create_success path=%s", run_path)
+    db_path = run_path / ".testmondata"
+    log.info("run_db_resolve repo_id=%s job_id=%s run_id=%s db_path=%s", repo_id, job_id, run_id, db_path)
     return db_path
 
-def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None):
+def register_repo_job(repo_id: str, job_id: str, run_id: str, repo_name: Optional[str] = None):
     """Register a new repo/job combination in metadata"""
     try:
         log.info(
-            "register_repo_job repo_id=%s job_id=%s repo_name=%s",
+            "register_repo_job repo_id=%s job_id=%s run_id=%s repo_name=%s",
             repo_id,
             job_id,
+            run_id,
             repo_name,
         )
         metadata = get_metadata()
@@ -246,11 +261,19 @@ def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None
 
         if job_id not in metadata["repos"][repo_id]["jobs"]:
             metadata["repos"][repo_id]["jobs"][job_id] = {
+                "name": job_id,
+                "created": now_iso(),
+                "runs": {},
+            }
+            log.info("metadata_add_job repo_id=%s job_id=%s", repo_id, job_id)
+
+        if run_id not in metadata["repos"][repo_id]["jobs"][job_id]["runs"]:
+            metadata["repos"][repo_id]["jobs"][job_id]["runs"][run_id] = {
                 "created": now_iso(),
                 "last_updated": now_iso(),
                 "upload_count": 0,
             }
-            log.info("metadata_add_job repo_id=%s job_id=%s", repo_id, job_id)
+            log.info("metadata_add_job repo_id=%s job_id=%s run_id=%s", repo_id, job_id, run_id)
 
         save_metadata(metadata)
     except Exception:
@@ -281,10 +304,11 @@ def upload_testmon_data():
     file = request.files.get("file")
     repo_id = request.form.get("repo_id")
     job_id = request.form.get("job_id")
+    run_id = request.form.get("run_id")
     repo_name = request.form.get("repo_name")
 
     # Enrich per-request context for logging
-    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
 
     if not file:
         log.warning("upload_missing_file")
@@ -294,14 +318,14 @@ def upload_testmon_data():
         "upload_received filename=%s", getattr(file, "filename", None)
     )
 
-    if not repo_id or not job_id:
+    if not repo_id or not job_id or not run_id:
         log.warning("upload_missing_params")
-        return jsonify({"error": "repo_id and job_id are required"}), 400
+        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
 
     try:
-        register_repo_job(repo_id, job_id, repo_name)
+        register_repo_job(repo_id, job_id, run_id, repo_name)
 
-        db_path = get_job_db_path(repo_id, job_id)
+        db_path = get_run_db_path(repo_id, job_id, run_id)
 
         # Attempt to write uploaded file
         log.info("file_write_attempt dest=%s", db_path)
@@ -311,41 +335,42 @@ def upload_testmon_data():
 
         # Update metadata
         metadata = get_metadata()
-        metadata["repos"][repo_id]["jobs"][job_id]["last_updated"] = now_iso()
-        metadata["repos"][repo_id]["jobs"][job_id]["upload_count"] += 1
+        metadata["repos"][repo_id]["jobs"][job_id]["runs"][run_id]["last_updated"] = now_iso()
+        metadata["repos"][repo_id]["jobs"][job_id]["runs"][run_id]["upload_count"] += 1
         save_metadata(metadata)
         log.info("upload_metadata_updated")
 
         return jsonify(
             {
                 "success": True,
-                "message": f"Testmon data uploaded for {repo_id}/{job_id}",
+                "message": f"Testmon data uploaded for {repo_id}/{job_id}/{run_id}",
                 "db_path": str(db_path.relative_to(BASE_DATA_DIR)),
             }
         ), 200
 
     except Exception:
-        log_exception("upload_handler", repo_id=repo_id, job_id=job_id)
+        log_exception("upload_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Upload failed"}), 500
 
 @app.route("/api/client/download", methods=["GET"])
 def download_testmon_data():
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+    run_id = request.args.get("run_id")
+    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
 
     log.info("download_request")
 
-    if not repo_id or not job_id:
+    if not repo_id or not job_id or not run_id:
         log.warning("download_missing_params")
-        return jsonify({"error": "repo_id and job_id are required"}), 400
+        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
 
-    db_path = get_job_db_path(repo_id, job_id)
+    db_path = get_run_db_path(repo_id, job_id, run_id)
 
     log.info("file_read_attempt path=%s", db_path)
     if not db_path.exists():
         log.warning("file_read_not_found path=%s", db_path)
-        return jsonify({"error": "No data found for this repo/job"}), 404
+        return jsonify({"error": "No data found for this repo/job/run"}), 404
 
     try:
         size = db_path.stat().st_size
@@ -364,25 +389,26 @@ def download_testmon_data():
 def check_testmon_data_exists():
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+    run_id = request.args.get("run_id")
+    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
 
     log.info("exists_request")
 
-    if not repo_id or not job_id:
+    if not repo_id or not job_id or not run_id:
         log.warning("exists_missing_params")
-        return jsonify({"error": "repo_id and job_id are required"}), 400
+        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
 
-    db_path = get_job_db_path(repo_id, job_id)
+    db_path = get_run_db_path(repo_id, job_id, run_id)
     exists = db_path.exists()
     log.info("exists_checked path=%s exists=%s", db_path, exists)
 
-    return jsonify({"exists": exists, "repo_id": repo_id, "job_id": job_id})
+    return jsonify({"exists": exists, "repo_id": repo_id, "job_id": job_id, "run_id": run_id})
 
 # -----------------------------------------------------------------------------
 # API ENDPOINTS - Visualization Data (with DB logging)
 # -----------------------------------------------------------------------------
-def _open_db_or_404(repo_id: str, job_id: str):
-    db_path = get_job_db_path(repo_id, job_id)
+def _open_db_or_404(repo_id: str, job_id: str, run_id: str):
+    db_path = get_run_db_path(repo_id, job_id, run_id)
     log.info("db_read_attempt path=%s", db_path)
     if not db_path.exists():
         log.warning("db_missing path=%s", db_path)
@@ -398,12 +424,22 @@ def list_repos():
     for repo_id, repo_data in metadata.get("repos", {}).items():
         jobs = []
         for job_id, job_data in repo_data.get("jobs", {}).items():
+            runs = []
+            for run_id, run_data in job_data.get("runs", {}).items():
+                runs.append(
+                    {
+                        "id": run_id,
+                        "created": run_data["created"],
+                        "last_updated": run_data["last_updated"],
+                        "upload_count": run_data["upload_count"],
+                    }
+                )
             jobs.append(
                 {
                     "id": job_id,
+                    "name": job_data.get("name", job_id),
                     "created": job_data["created"],
-                    "last_updated": job_data["last_updated"],
-                    "upload_count": job_data["upload_count"],
+                    "runs": runs
                 }
             )
         repos.append(
@@ -417,11 +453,11 @@ def list_repos():
     log.info("repos_list_success count=%s", len(repos))
     return jsonify({"repos": repos})
 
-@app.route('/api/data/<path:repo_id>/<job_id>/summary', methods=['GET'])
-def get_summary(repo_id: str, job_id: str):
-    g.repo_id, g.job_id = repo_id, job_id
-
-    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+@app.route('/api/data/<path:repo_id>/<job_id>/<run_id>/summary', methods=['GET'])
+def get_summary(repo_id: str, job_id: str, run_id: str):
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
+    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
+    print(f"DB Path: {db_path}")
     if resp:
         return resp, code
 
@@ -429,7 +465,7 @@ def get_summary(repo_id: str, job_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-
+        print("HEREEEEE")
         env = cursor.execute(
             """
             SELECT environment_name, python_version, system_packages
@@ -479,11 +515,11 @@ def get_summary(repo_id: str, job_id: str):
         return jsonify({"error": "Failed to read summary"}), 500
 
 
-@app.route("/api/data/<path:repo_id>/<job_id>/test_files", methods=["GET"])
-def list_test_files(repo_id: str, job_id: str):
-    g.repo_id, g.job_id = repo_id, job_id
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/test_files", methods=["GET"])
+def list_test_files(repo_id: str, job_id: str, run_id: str):
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
     if resp:
         return resp, code
 
@@ -527,11 +563,11 @@ def list_test_files(repo_id: str, job_id: str):
         log_exception("test_list_query", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read test list"}), 500
 
-@app.route("/api/data/<path:repo_id>/<job_id>/tests", methods=["GET"])
-def get_tests(repo_id: str, job_id: str):
-    g.repo_id, g.job_id = repo_id, job_id
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/tests", methods=["GET"])
+def get_tests(repo_id: str, job_id: str, run_id: str):
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
     if resp:
         return resp, code
 
@@ -564,11 +600,11 @@ def get_tests(repo_id: str, job_id: str):
         log_exception("tests_query", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read tests"}), 500
 
-@app.route("/api/data/<path:repo_id>/<job_id>/test/<int:test_id>", methods=["GET"])
-def get_test_details(repo_id: str, job_id: str, test_id: int):
-    g.repo_id, g.job_id = repo_id, job_id
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/test/<int:test_id>", methods=["GET"])
+def get_test_details(repo_id: str, job_id: str, run_id: str, test_id: int):
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
     if resp:
         return resp, code
 
@@ -622,11 +658,11 @@ def get_test_details(repo_id: str, job_id: str, test_id: int):
         log_exception("test_details_query", repo_id=repo_id, job_id=job_id, test_id=test_id)
         return jsonify({"error": "Failed to read test details"}), 500
 
-@app.route("/api/data/<path:repo_id>/<job_id>/files", methods=["GET"])
-def get_files(repo_id: str, job_id: str):
-    g.repo_id, g.job_id = repo_id, job_id
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/files", methods=["GET"])
+def get_files(repo_id: str, job_id: str, run_id: str):
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
     if resp:
         return resp, code
 
@@ -660,21 +696,22 @@ def get_files(repo_id: str, job_id: str):
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():
     """Store user's test preferences (which tests to always run)"""
-    
+
     # Get data from request body (JSON)
     data = request.get_json()
     log.info("data is" , data)
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
-    
-    selected_test_files = data.get("selectedTests", [])  # Array of test file names
-    
-    # Enrich per-request context for logging
-    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+    run_id = data.get("run_id")
 
-    if not repo_id or not job_id:
+    selected_test_files = data.get("selectedTests", [])  # Array of test file names
+
+    # Enrich per-request context for logging
+    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
+
+    if not repo_id or not job_id or not run_id:
         log.warning("preferences_missing_params")
-        return jsonify({"error": "repo_id and job_id are required"}), 400
+        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
 
     if not isinstance(selected_test_files, list):
         log.warning("preferences_invalid_format")
@@ -682,26 +719,27 @@ def upload_test_preferences():
 
     try:
         # Create preferences file path
-        job_path = get_job_db_path(repo_id, job_id).parent
-        preferences_path = job_path / "test_preferences.json"
-        
+        run_path = get_run_db_path(repo_id, job_id, run_id).parent
+        preferences_path = run_path / "test_preferences.json"
+
         log.info(
-            "preferences_write_attempt path=%s test_count=%s", 
-            preferences_path, 
+            "preferences_write_attempt path=%s test_count=%s",
+            preferences_path,
             len(selected_test_files)
         )
-        
+
         # Store preferences as JSON
         preferences_data = {
             "repo_id": repo_id,
             "job_id": job_id,
+            "run_id": run_id,
             "always_run_tests": selected_test_files,
             "updated_at": now_iso(),
         }
-        
+
         with open(preferences_path, "w") as f:
             json.dump(preferences_data, f, indent=2)
-        
+
         size = preferences_path.stat().st_size
         log.info(
             "preferences_write_success path=%s size=%s (%s) test_count=%s",
@@ -713,45 +751,47 @@ def upload_test_preferences():
 
         return jsonify({
             "success": True,
-            "message": f"Test preferences saved for {repo_id}/{job_id}",
+            "message": f"Test preferences saved for {repo_id}/{job_id}/{run_id}",
             "test_count": len(selected_test_files),
         }), 200
 
     except Exception:
-        log_exception("preferences_handler", repo_id=repo_id, job_id=job_id)
+        log_exception("preferences_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to save preferences"}), 500
 
 
 @app.route("/api/client/testPreferences", methods=["GET"])
 def get_test_preferences():
     """Retrieve user's test preferences"""
-    
+
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+    run_id = request.args.get("run_id")
+    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
 
-    if not repo_id or not job_id:
+    if not repo_id or not job_id or not run_id:
         log.warning("preferences_get_missing_params")
-        return jsonify({"error": "repo_id and job_id are required"}), 400
+        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
 
     try:
-        job_path = get_job_db_path(repo_id, job_id).parent
+        job_path = get_run_db_path(repo_id, job_id, run_id).parent
         preferences_path = job_path / "test_preferences.json"
-        
+
         log.info("preferences_read_attempt path=%s", preferences_path)
-        
+
         if not preferences_path.exists():
             log.info("preferences_not_found path=%s", preferences_path)
             return jsonify({
                 "repo_id": repo_id,
                 "job_id": job_id,
+                "run_id": run_id,
                 "always_run_tests": [],
                 "updated_at": None,
             }), 200
-        
+
         with open(preferences_path, "r") as f:
             preferences_data = json.load(f)
-        
+
         size = preferences_path.stat().st_size
         log.info(
             "preferences_read_success path=%s size=%s (%s)",
@@ -759,11 +799,11 @@ def get_test_preferences():
             size,
             human_bytes(size)
         )
-        
+
         return jsonify(preferences_data), 200
 
     except Exception:
-        log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id)
+        log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to read preferences"}), 500
 # -----------------------------------------------------------------------------
 # WEB + Health - UPDATED FOR REACT

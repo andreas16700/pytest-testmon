@@ -11,7 +11,7 @@ const reorder = (list, startIndex, endIndex) => {
     return result;
 };
 
-function TestManagementTab({currentRepo, currentJob}) {
+function TestManagementTab({currentRepo, currentJob, currentRun}) {
     const [searchTerm, setSearchTerm] = useState("");
     const [isOpen, setIsOpen] = useState(false);
     const [testFileList, setTestFileList] = useState([]);
@@ -75,7 +75,7 @@ function TestManagementTab({currentRepo, currentJob}) {
 
     const loadTestFileList = async () => {
         try {
-            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/test_files`);
+            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/test_files`);
             const data = await response.json();
             setTestFileList(data.test_files || []);
             setLoading(true);
@@ -271,13 +271,13 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                                         <Info size={16}
                                                                               className="text-gray-400 cursor-pointer"/>
                                                                         <div
-                                                                            className="absolute left-1/2 transform -translate-x-1/2 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
+                                                                            className="absolute right-0 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
                                                                             <div
                                                                                 className="bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative">
                                                                                 Took {(test.total_duration / 2).toFixed(4)}s
                                                                                 last run
                                                                                 <div
-                                                                                    className="absolute left-1/2 transform -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
+                                                                                    className="absolute right-1 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
                                                                             </div>
                                                                         </div>
                                                                     </div>
@@ -349,13 +349,13 @@ function TestManagementTab({currentRepo, currentJob}) {
                                                                         <Info size={16}
                                                                               className="text-gray-400 cursor-pointer"/>
                                                                         <div
-                                                                            className="absolute left-1/2 transform -translate-x-1/2 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
+                                                                            className="absolute right-0 -top-8 opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-20">
                                                                             <div
                                                                                 className="bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative">
                                                                                 Took {(test.total_duration / 2).toFixed(4)}s
                                                                                 last run
                                                                                 <div
-                                                                                    className="absolute left-1/2 transform -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
+                                                                                    className="absolute right-1 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700"></div>
                                                                             </div>
                                                                         </div>
                                                                     </div>

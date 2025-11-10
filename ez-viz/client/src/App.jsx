@@ -12,6 +12,7 @@ function App() {
     const [repos, setRepos] = useState([]);
     const [currentRepo, setCurrentRepo] = useState(null);
     const [currentJob, setCurrentJob] = useState(null);
+    const [currentRun, setCurrentRun] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
 
@@ -24,18 +25,18 @@ function App() {
     const [fileSearch, setFileSearch] = useState('');
 
     const [modal, setModal] = useState({ open: false, title: '', content: null });
-    
+
     useEffect(() => {
         loadRepos();
     }, []);
 
     useEffect(() => {
-        if (currentRepo && currentJob) {
+        if (currentRepo && currentJob && currentRun) {
             loadData();
         } else {
             setSummary(null);
         }
-    }, [currentRepo, currentJob]);
+    }, [currentRepo, currentJob, currentRun]);
 
     const loadRepos = async () => {
         try {
@@ -49,16 +50,16 @@ function App() {
     };
 
     const loadData = async () => {
-        if (!currentRepo || !currentJob) return;
+        if (!currentRepo || !currentJob || !currentRun) return;
 
         setLoading(true);
         setError(null);
 
         try {
             const [summaryData, testsData, filesData] = await Promise.all([
-                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/summary`).then(r => r.json()),
-                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/tests`).then(r => r.json()),
-                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/files`).then(r => r.json())
+                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/summary`).then(r => r.json()),
+                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/tests`).then(r => r.json()),
+                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/files`).then(r => r.json())
             ]);
             setSummary(summaryData);
             setAllTests(testsData.tests || []);
@@ -73,7 +74,7 @@ function App() {
 
     const showTestDetails = async (testId) => {
         try {
-            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/test/${testId}`);
+            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/test/${testId}`);
             const data = await response.json();
 
             setModal({
@@ -100,6 +101,7 @@ function App() {
     };
 
     const selectedRepo = repos.find(r => r.id === currentRepo);
+    const selectedJob = selectedRepo && selectedRepo.jobs.find(r => r.id === currentJob);
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-indigo-500 to-purple-600 p-5">
@@ -110,9 +112,12 @@ function App() {
                     repos={repos}
                     currentRepo={currentRepo}
                     currentJob={currentJob}
+                    currentRun={currentRun}
                     selectedRepo={selectedRepo}
+                    selectedJob={selectedJob}
                     onRepoChange={setCurrentRepo}
                     onJobChange={setCurrentJob}
+                    onRunChange={setCurrentRun}
                     onRefresh={loadRepos}
                 />
 
@@ -132,6 +137,7 @@ function App() {
                     showFileDetails={showFileDetails}
                     currentRepo={currentRepo}
                     currentJob={currentJob}
+                    currentRun={currentRun}
                 />
             </div>
 
