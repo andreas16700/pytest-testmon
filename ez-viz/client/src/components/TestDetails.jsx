@@ -1,12 +1,12 @@
 import React from "react";
 import EnvItem from "./EnvItem.jsx";
-import {formatDuration, getStatusText} from "./utils.jsx";
+import {formatDuration} from "./utils.jsx";
 
 function TestDetails({ test, dependencies }) {
     return (
         <>
             <div className="mb-6">
-                <EnvItem label="Status" value={() => getStatusText()} />
+                <EnvItem label="Status" value={test?.forced === 0 ? "Executed" : "Skipped"} />
                 <EnvItem label="Duration" value={formatDuration(test.duration)} />
             </div>
 

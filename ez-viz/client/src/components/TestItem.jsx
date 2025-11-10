@@ -1,5 +1,5 @@
 import React from "react";
-import {formatDuration, getStatusText} from "./utils.jsx";
+import {formatDuration} from "./utils.jsx";
 
 function TestItem({ test, onClick }) {
     const getStatusClass = () => {
@@ -15,7 +15,9 @@ function TestItem({ test, onClick }) {
         >
             <div className="flex justify-between items-center mb-2">
                 <div className="text-lg font-semibold text-gray-700 flex-1 break-all">{test.test_name}</div>
-                <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getStatusClass()}`}>{() => getStatusText()}</span>
+                <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getStatusClass()}`}>
+                    {test?.forced === 0 ? <p>Executed</p> : <p>Skipped</p>}
+                </span>
             </div>
             <div className="flex gap-5 text-sm text-gray-600">
                 <span>{formatDuration(test.duration)}</span>
