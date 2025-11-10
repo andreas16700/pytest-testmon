@@ -492,7 +492,6 @@ def list_repos():
 def get_summary(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
     db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
-    print(f"DB Path: {db_path}")
     if resp:
         return resp, code
 
@@ -500,7 +499,6 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        print("HEREEEEE")
         env = cursor.execute(
             """
             SELECT environment_name, python_version, system_packages

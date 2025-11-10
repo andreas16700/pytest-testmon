@@ -5,6 +5,8 @@ import StatCard from "./StatCard.jsx";
 function SummaryTab({ summary, allTests, currentRepo, currentJob }) {
     const passed = allTests.filter(t => !t.failed).length;
     const failed = allTests.filter(t => t.failed).length;
+    const ran = allTests.filter(t => t.forced === 0).length;
+    const skipped = summary.test_count - ran;
 
     return (
         <div className="animate-fadeIn">
@@ -12,7 +14,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob }) {
                 <StatCard
                     title="Tests"
                     value={summary.test_count}
-                    label={`${passed} passed, ${failed} failed`}
+                    label={`${passed} passed, ${failed} failed, ${skipped} skipped`}
                 />
                 <StatCard
                     title="Files Tracked"
