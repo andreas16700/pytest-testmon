@@ -206,37 +206,72 @@ def get_repo_path(repo_id: str) -> Path:
         log.info("repo_dir_create_success path=%s", repo_path)
     return repo_path
 
-def get_run_db_path(repo_id: str, job_id: str, run_id: str) -> Path:
+def get_run_db_path(repo_id: str, job_id: str, run_id: Optional[str] = None) -> Path:
     """Get path for a specific run's testmon database"""
     repo_path = get_repo_path(repo_id)
     safe_job_id = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
     job_path = repo_path / safe_job_id
-    if not job_path.exists():
-        log.info(
-            "job_dir_create_attempt repo_id=%s job_id=%s safe_job_id=%s path=%s",
-            repo_id,
-            job_id,
-            safe_job_id,
-            job_path,
-        )
+
+    if run_id:
+        if not job_path.exists():
+            log.info(
+                "job_dir_create_attempt repo_id=%s job_id=%s safe_job_id=%s path=%s",
+                repo_id,
+                job_id,
+                safe_job_id,
+                job_path,
+            )
         job_path.mkdir(parents=True, exist_ok=True)
         log.info("job_dir_create_success path=%s", job_path)
 
-    safe_run_id = "".join(c for c in run_id if c.isalnum() or c in ("-", "_"))
-    run_path = job_path / safe_run_id
-    if not run_path.exists():
-        log.info(
-            "run_dir_create_attempt repo_id=%s job_id=%s run_id=%s safe_run_id=%s path=%s",
-            repo_id,
-            job_id,
-            run_id,
-            safe_run_id,
-            run_path,
-        )
-        run_path.mkdir(parents=True, exist_ok=True)
-        log.info("run_dir_create_success path=%s", run_path)
-    db_path = run_path / ".testmondata"
-    log.info("run_db_resolve repo_id=%s job_id=%s run_id=%s db_path=%s", repo_id, job_id, run_id, db_path)
+
+        safe_run_id = "".join(c for c in run_id if c.isalnum() or c in ("-", "_"))
+        run_path = job_path / safe_run_id
+
+        if not run_path.exists():
+            log.info(
+                "run_dir_create_attempt repo_id=%s job_id=%s run_id=%s safe_run_id=%s path=%s",
+                repo_id,
+                job_id,
+                run_id,
+                safe_run_id,
+                run_path,
+            )
+            run_path.mkdir(parents=True, exist_ok=True)
+            log.info("run_dir_create_success path=%s", run_path)
+
+    else:
+        log.info("find_latest_run repo_id=%s job_id=%s", repo_id, job_id)
+
+        if not job_path.is_dir():
+            log.warning("job_path_not_found_for_download path=%s", job_path)
+            return job_path / "no_such_job" / ".testmondata"
+
+        try:
+            run_dirs = [d for d in job_path.iterdir() if d.is_dir()]
+            if not run_dirs:
+                log.warning("no_runs_found path=%s", job_path)
+                return job_path / "no_runs_found" / ".testmondata"
+
+
+            latest_run_dir = max(
+                run_dirs,
+                key=lambda d: d.stat().st_mtime
+            )
+
+            safe_run_id = latest_run_dir.name
+
+            log.info("latest_run_found path=%s run_id=%s (by mtime)", job_path, safe_run_id)
+
+        except Exception as e:
+            log.error(f"find_latest_run_failed path={job_path} error={e}")
+            return job_path / "find_run_error" / ".testmondata"
+
+    db_path = job_path / safe_run_id / ".testmondata"
+    log.info(
+        "run_db_resolve repo_id=%s job_id=%s run_id_param=%s resolved_run=%s db_path=%s",
+        repo_id, job_id, run_id or "None", safe_run_id, db_path
+    )
     return db_path
 
 def register_repo_job(repo_id: str, job_id: str, run_id: str, repo_name: Optional[str] = None):
@@ -356,21 +391,21 @@ def upload_testmon_data():
 def download_testmon_data():
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-    run_id = request.args.get("run_id")
-    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     log.info("download_request")
 
-    if not repo_id or not job_id or not run_id:
+    if not repo_id or not job_id:
         log.warning("download_missing_params")
-        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
+        return jsonify({"error": "repo_id and job_id are required"}), 400
 
-    db_path = get_run_db_path(repo_id, job_id, run_id)
+    db_path = get_run_db_path(repo_id, job_id)
 
     log.info("file_read_attempt path=%s", db_path)
     if not db_path.exists():
         log.warning("file_read_not_found path=%s", db_path)
-        return jsonify({"error": "No data found for this repo/job/run"}), 404
+        return jsonify({"error": "No data found for this repo/job"}), 404
 
     try:
         size = db_path.stat().st_size
