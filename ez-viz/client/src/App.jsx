@@ -6,9 +6,8 @@ import MainContent from "./components/MainContent.jsx";
 import TestDetails from "./components/TestDetails.jsx";
 import FileDetails from "./components/FileDetails.jsx";
 
-const API_BASE = '/api';
-
 function App() {
+    const [user, setUser] = useState(null);
     const [repos, setRepos] = useState([]);
     const [currentRepo, setCurrentRepo] = useState(null);
     const [currentJob, setCurrentJob] = useState(null);
@@ -27,6 +26,7 @@ function App() {
     const [modal, setModal] = useState({ open: false, title: '', content: null });
 
     useEffect(() => {
+        fetchUser();
         loadRepos();
     }, []);
 
@@ -38,14 +38,55 @@ function App() {
         }
     }, [currentRepo, currentJob, currentRun]);
 
+    const fetchUser = async () => {
+        try {
+            const response = await fetch("/auth/user", {
+                credentials: "include"
+            });
+            const userData = await response.json();
+            setUser(userData);
+        } catch (err) {
+            console.error("Failed to fetch user:", err);
+        }
+    };
+
     const loadRepos = async () => {
         try {
-            const response = await fetch(`${API_BASE}/repos`);
-            const data = await response.json();
-            setRepos(data.repos || []);
+            const response = await fetch("/api/repos", {
+                credentials: "include"
+            });
+            const systemData = await response.json();
+            const systemRepos = systemData.repos || [];
+
+            const userRepos = await loggedUserRepos();
+            if (!userRepos) {
+                setError("Failed to load user repositories");
+                return;
+            }
+
+            const userRepoNames = new Set(userRepos.map(r => r.full_name));
+
+            const matching = systemRepos.filter(repo => userRepoNames.has(repo.name));
+
+            setRepos(matching);
         } catch (err) {
             console.error('Failed to load repos:', err);
             setError('Failed to load repositories');
+        }
+    };
+
+    const loggedUserRepos = async () => {
+        try {
+            const resp = await fetch("/api/userRepositories", {
+                credentials: "include",
+            });
+            if (!resp.ok) return null;
+
+            return await resp.json();
+
+        } catch (err) {
+            console.error("Failed to fetch repositories:", err);
+            return null;
         }
     };
 
@@ -57,9 +98,15 @@ function App() {
 
         try {
             const [summaryData, testsData, filesData] = await Promise.all([
-                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/summary`).then(r => r.json()),
-                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/tests`).then(r => r.json()),
-                fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/files`).then(r => r.json())
+                fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/summary`, {
+                    credentials: "include"
+                }).then(r => r.json()),
+                fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/tests`, {
+                    credentials: "include"
+                }).then(r => r.json()),
+                fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/files`, {
+                    credentials: "include"
+                }).then(r => r.json())
             ]);
             setSummary(summaryData);
             setAllTests(testsData.tests || []);
@@ -74,7 +121,9 @@ function App() {
 
     const showTestDetails = async (testId) => {
         try {
-            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/test/${testId}`);
+            const response = await fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/test/${testId}`, {
+                credentials: "include"
+            });
             const data = await response.json();
 
             setModal({
@@ -87,7 +136,6 @@ function App() {
         }
     };
 
-    // why displaying same test twice?
     const showFileDetails = (filename) => {
         const relatedTests = allTests.filter(t =>
             t.test_name.includes(filename.replace('.py', ''))
@@ -100,13 +148,25 @@ function App() {
         });
     };
 
+    const handleLogout = async () => {
+        try {
+            await fetch("/auth/logout", {
+                method: "POST",
+                credentials: "include"
+            });
+            window.location.href = "/";
+        } catch (err) {
+            console.error("Logout failed:", err);
+        }
+    };
+
     const selectedRepo = repos.find(r => r.id === currentRepo);
     const selectedJob = selectedRepo && selectedRepo.jobs.find(r => r.id === currentJob);
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-indigo-500 to-purple-600 p-5">
             <div className="max-w-7xl mx-auto bg-white rounded-xl shadow-2xl overflow-hidden">
-                <Header />
+                <Header user={user} handleLogout={handleLogout}/>
 
                 <SelectorBar
                     repos={repos}

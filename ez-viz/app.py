@@ -1,10 +1,13 @@
 """
 Testmon Multi-Project/Job Visualization Server with Extensive Logging
 """
+import secrets
 
 from flask import (
     Flask,
     request,
+    session,
+    redirect,
     jsonify,
     send_file,
     send_from_directory,
@@ -12,8 +15,10 @@ from flask import (
     has_request_context,
 )
 
+import requests
 from pathlib import Path
-
+from flask_cors import CORS
+from dotenv import load_dotenv
 import sqlite3
 import json
 import os
@@ -24,7 +29,9 @@ import logging
 import sys
 import time
 import uuid
+from functools import wraps
 import traceback
+from urllib.parse import urlencode
 
 EZMON_FP_DIR = Path(os.getenv("EZMON_FP_DIR", "./.ezmon-fp")).resolve()
 # -----------------------------------------------------------------------------
@@ -96,6 +103,14 @@ log = logging.getLogger("testmon")
 # Flask app + config
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
+load_dotenv()
+app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+allowed_origin = os.environ.get("ORIGIN")
+CORS(app,
+     supports_credentials=True,
+     origins=allowed_origin,
+     allow_headers=["Content-Type"],
+     methods=["GET", "POST", "OPTIONS"])
 
 BASE_DATA_DIR = Path(os.getenv("TESTMON_DATA_DIR", "./testmon_data"))
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,11 +344,84 @@ def get_db_connection(db_path: Path, readonly: bool = True):
         log_exception("db_connect", path=abs_path, readonly=readonly, mode=mode)
         raise
 
-
-
 # -----------------------------------------------------------------------------
 # API ENDPOINTS - Client Operations (GitHub Actions)
 # -----------------------------------------------------------------------------
+CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID")
+CALLBACK = os.environ.get("GITHUB_OAUTH_CALLBACK")
+FRONTEND_URL = os.environ.get("FRONTEND_URL")
+CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET")
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "github_token" not in session:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/auth/github/login")
+def github_login():
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": CALLBACK,
+        "scope": "repo read:user user:email",
+        "state": state,
+        "allow_signup": "false"
+    }
+    return redirect(f"https://github.com/login/oauth/authorize?{urlencode(params)}")
+
+@app.route("/auth/github/callback")
+def github_callback():
+    if request.args.get("state") != session.get("oauth_state"):
+        return jsonify({"error": "State mismatch"}), 403
+
+    code = request.args.get("code")
+    if not code:
+        return jsonify({"error": "No code provided"}), 400
+
+    token_resp = requests.post(
+        "https://github.com/login/oauth/access_token",
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": CALLBACK
+        },
+        headers={"Accept": "application/json"}
+    )
+    token_data = token_resp.json()
+
+    if "access_token" not in token_data:
+        return jsonify({"error": "Failed to get access token"}), 400
+
+    session["github_token"] = token_data["access_token"]
+
+    user_resp = requests.get(
+        "https://api.github.com/user",
+        headers={
+            "Authorization": f"Bearer {session['github_token']}",
+            "Accept": "application/vnd.github+json"
+        }
+    )
+    session["github_user"] = user_resp.json()
+
+    session.pop("oauth_state", None)
+
+    return redirect(f"{FRONTEND_URL}")
+
+@app.route("/auth/user")
+@login_required
+def get_current_user():
+    return jsonify(session.get("github_user"))
+
+@app.route("/auth/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"message": "Logged out"})
+
 @app.route("/api/client/upload", methods=["POST"])
 def upload_testmon_data():
     file = request.files.get("file")
@@ -487,6 +575,50 @@ def list_repos():
         )
     log.info("repos_list_success count=%s", len(repos))
     return jsonify({"repos": repos})
+
+@app.route("/api/userRepositories")
+@login_required
+def get_user_repositories():
+    """Fetch only repositories the user owns or collaborates on"""
+    token = session["github_token"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    all_repos = []
+
+    page = 1
+    while True:
+        resp = requests.get(
+            "https://api.github.com/user/repos",
+            headers=headers,
+            params={
+                "affiliation": "owner,collaborator",
+                "sort": "updated",
+                "per_page": 100,
+                "page": page
+            }
+        )
+        repos = resp.json()
+        if not repos:
+            break
+        all_repos.extend(repos)
+        page += 1
+
+    return jsonify([
+        {
+            "id": repo["id"],
+            "name": repo["name"],
+            "full_name": repo["full_name"],
+            "owner": repo["owner"]["login"],
+            "private": repo["private"],
+            "url": repo["html_url"],
+            "description": repo["description"],
+            "permissions": repo.get("permissions", {})
+        }
+        for repo in all_repos
+    ])
 
 @app.route('/api/data/<path:repo_id>/<job_id>/<run_id>/summary', methods=['GET'])
 def get_summary(repo_id: str, job_id: str, run_id: str):
