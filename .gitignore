@@ -8,6 +8,10 @@ venv/
 # the dreaded DS_Store
 **/*.DS_Store
 
+#any .env
+**/*.env
+.env
+
 # state used by runner to note last successful deployment
 **/ez-viz.deploy-state/
 
