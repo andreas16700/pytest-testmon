@@ -18,8 +18,10 @@ ChartJS.register(
 function SummaryTab({summary, allTests, currentRepo, currentJob}) {
     const passed = allTests.filter(t => !t.failed).length;
     const failed = allTests.filter(t => t.failed).length;
-    const ran = allTests.filter(t => t.forced === 0).length;
-    const skipped = summary.test_count - ran;
+    const skipped = summary.savings.tests_saved ?? 0  ;
+    const ran = summary.test_count-skipped;
+    console.log("Summary is", summary)
+    console.log("all tets are" , allTests)
 
     const testsChartData = {
         labels: ['Tests Executed', 'Tests Skipped'],
@@ -51,17 +53,10 @@ function SummaryTab({summary, allTests, currentRepo, currentJob}) {
         },
     };
 
-    const [runtimeSpent, runtimeSaved] = allTests.reduce(
-        (acc, test) => {
-            if (test.forced === 0) {
-                acc[0] += test.duration;
-            } else {
-                acc[1] += test.duration;
-            }
-            return acc;
-        },
-        [0, 0]
-    );
+
+    const runtimeSaved=summary.savings.time_saved ?? 0
+    const runtimeSpent = summary.savings.time_all-runtimeSaved
+   
 
     runtimeChartData.datasets[0].data = [runtimeSpent, runtimeSaved];
 

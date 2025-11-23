@@ -2,6 +2,8 @@ import {RefreshCw} from "lucide-react";
 import React from "react";
 
 function SelectorBar({ repos, currentRepo, currentJob, currentRun, selectedRepo, selectedJob, onRepoChange, onJobChange, onRunChange, onRefresh }) {
+    console.log("Curren run is" , currentRun)
+    console.log(" repo is" , repos)
     return (
         <div className="bg-gray-50 p-5 border-b-2 border-gray-200 flex gap-5 items-end flex-wrap">
             <div className="flex-1 min-w-[250px]">

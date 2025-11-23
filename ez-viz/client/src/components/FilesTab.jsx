@@ -6,6 +6,7 @@ function FilesTab({ files, search, setSearch, showFileDetails }) {
     const filteredFiles = files.filter(file =>
         file.filename.toLowerCase().includes(search.toLowerCase())
     );
+    console.log("Files are" ,files)
 
     return (
         <div className="animate-fadeIn">

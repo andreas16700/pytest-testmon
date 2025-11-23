@@ -26,6 +26,7 @@ import time
 import uuid
 import traceback
 
+import array
 EZMON_FP_DIR = Path(os.getenv("EZMON_FP_DIR", "./.ezmon-fp")).resolve()
 # -----------------------------------------------------------------------------
 # Logging helpers
@@ -206,82 +207,32 @@ def get_repo_path(repo_id: str) -> Path:
         log.info("repo_dir_create_success path=%s", repo_path)
     return repo_path
 
-def get_run_db_path(repo_id: str, job_id: str, run_id: Optional[str] = None) -> Path:
-    """Get path for a specific run's testmon database"""
+def get_job_db_path(repo_id: str, job_id: str) -> Path:
+    """Get path for a specific job's testmon database"""
     repo_path = get_repo_path(repo_id)
     safe_job_id = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
     job_path = repo_path / safe_job_id
-
-    if run_id:
-        if not job_path.exists():
-            log.info(
-                "job_dir_create_attempt repo_id=%s job_id=%s safe_job_id=%s path=%s",
-                repo_id,
-                job_id,
-                safe_job_id,
-                job_path,
-            )
+    if not job_path.exists():
+        log.info(
+            "job_dir_create_attempt repo_id=%s job_id=%s safe_job_id=%s path=%s",
+            repo_id,
+            job_id,
+            safe_job_id,
+            job_path,
+        )
         job_path.mkdir(parents=True, exist_ok=True)
         log.info("job_dir_create_success path=%s", job_path)
-
-
-        safe_run_id = "".join(c for c in run_id if c.isalnum() or c in ("-", "_"))
-        run_path = job_path / safe_run_id
-
-        if not run_path.exists():
-            log.info(
-                "run_dir_create_attempt repo_id=%s job_id=%s run_id=%s safe_run_id=%s path=%s",
-                repo_id,
-                job_id,
-                run_id,
-                safe_run_id,
-                run_path,
-            )
-            run_path.mkdir(parents=True, exist_ok=True)
-            log.info("run_dir_create_success path=%s", run_path)
-
-    else:
-        log.info("find_latest_run repo_id=%s job_id=%s", repo_id, job_id)
-
-        if not job_path.is_dir():
-            log.warning("job_path_not_found_for_download path=%s", job_path)
-            return job_path / "no_such_job" / ".testmondata"
-
-        try:
-            run_dirs = [d for d in job_path.iterdir() if d.is_dir()]
-            if not run_dirs:
-                log.warning("no_runs_found path=%s", job_path)
-                return job_path / "no_runs_found" / ".testmondata"
-
-
-            latest_run_dir = max(
-                run_dirs,
-                key=lambda d: d.stat().st_mtime
-            )
-
-            safe_run_id = latest_run_dir.name
-
-            log.info("latest_run_found path=%s run_id=%s (by mtime)", job_path, safe_run_id)
-
-        except Exception as e:
-            log.error(f"find_latest_run_failed path={job_path} error={e}")
-            return job_path / "find_run_error" / ".testmondata"
-
-    db_path = job_path / safe_run_id / ".testmondata"
-    log.info(
-        "run_db_resolve repo_id=%s job_id=%s run_id_param=%s resolved_run=%s db_path=%s",
-        repo_id, job_id, run_id or "None", safe_run_id, db_path
-    )
+    db_path = job_path / ".testmondata"
+    log.info("job_db_resolve repo_id=%s job_id=%s db_path=%s", repo_id, job_id, db_path)
     return db_path
 
-def register_repo_job(repo_id: str, job_id: str, run_id: str, repo_name: Optional[str] = None):
+def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None):
     """Register a new repo/job combination in metadata"""
     try:
         log.info(
-            "register_repo_job repo_id=%s job_id=%s run_id=%s repo_name=%s",
+            "register_repo_job repo_id=%s job_id=%s repo_name=%s",
             repo_id,
             job_id,
-            run_id,
             repo_name,
         )
         metadata = get_metadata()
@@ -296,19 +247,11 @@ def register_repo_job(repo_id: str, job_id: str, run_id: str, repo_name: Optiona
 
         if job_id not in metadata["repos"][repo_id]["jobs"]:
             metadata["repos"][repo_id]["jobs"][job_id] = {
-                "name": job_id,
-                "created": now_iso(),
-                "runs": {},
-            }
-            log.info("metadata_add_job repo_id=%s job_id=%s", repo_id, job_id)
-
-        if run_id not in metadata["repos"][repo_id]["jobs"][job_id]["runs"]:
-            metadata["repos"][repo_id]["jobs"][job_id]["runs"][run_id] = {
                 "created": now_iso(),
                 "last_updated": now_iso(),
                 "upload_count": 0,
             }
-            log.info("metadata_add_job repo_id=%s job_id=%s run_id=%s", repo_id, job_id, run_id)
+            log.info("metadata_add_job repo_id=%s job_id=%s", repo_id, job_id)
 
         save_metadata(metadata)
     except Exception:
@@ -330,6 +273,74 @@ def get_db_connection(db_path: Path, readonly: bool = True):
         raise
 
 
+def update_testmon_run_id(db_path, run_id):
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Insert run id if not existing
+        cursor.execute(
+            "INSERT OR IGNORE INTO run_uid (id) VALUES (?)",
+            (run_id,)
+        )
+
+        # Update only NULL values
+        cursor.execute(
+            "UPDATE run_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+        cursor.execute(
+            "UPDATE test_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+        cursor.execute(
+            "UPDATE file_fp_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+        cursor.execute(
+            "UPDATE test_execution_file_fp_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+
+        affected = cursor.rowcount
+        conn.commit()
+
+        # ---- SUCCESS LOG ----
+        log.info(f"Successfully updated run_uid for {affected} rows in file: {db_path}")
+
+        return affected
+
+    except Exception as e:
+        # ---- ERROR LOG ----
+        log.error(f"Error updating testmon run_id for file {db_path}: {e}")
+        return None
+
+    finally:
+        if 'conn' in locals():
+            conn.close()
+            
+
+
+def get_run_ids(db_path):
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        
+        cursor.execute("SELECT id FROM run_uid")
+        rows = cursor.fetchall()  
+        
+        run_ids = [row[0] for row in rows]
+        return run_ids
+
+    except Exception as e:
+        log.error("Error reading run_ids for file %s: %s", db_path, e)
+        return []
+
+    finally:
+        if conn is not None:
+            conn.close()
+
 
 # -----------------------------------------------------------------------------
 # API ENDPOINTS - Client Operations (GitHub Actions)
@@ -339,11 +350,10 @@ def upload_testmon_data():
     file = request.files.get("file")
     repo_id = request.form.get("repo_id")
     job_id = request.form.get("job_id")
-    run_id = request.form.get("run_id")
     repo_name = request.form.get("repo_name")
-
+    run_id= request.form.get("run_id")
     # Enrich per-request context for logging
-    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     if not file:
         log.warning("upload_missing_file")
@@ -353,45 +363,45 @@ def upload_testmon_data():
         "upload_received filename=%s", getattr(file, "filename", None)
     )
 
-    if not repo_id or not job_id or not run_id:
+    if not repo_id or not job_id:
         log.warning("upload_missing_params")
-        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
+        return jsonify({"error": "repo_id and job_id are required"}), 400
 
     try:
-        register_repo_job(repo_id, job_id, run_id, repo_name)
+        register_repo_job(repo_id, job_id, repo_name)
 
-        db_path = get_run_db_path(repo_id, job_id, run_id)
-
+        db_path = get_job_db_path(repo_id, job_id)
+     
         # Attempt to write uploaded file
         log.info("file_write_attempt dest=%s", db_path)
         file.save(db_path)
+        update_testmon_run_id(db_path , run_id)
         size = db_path.stat().st_size
         log.info("file_write_success dest=%s size=%s (%s)", db_path, size, human_bytes(size))
 
         # Update metadata
         metadata = get_metadata()
-        metadata["repos"][repo_id]["jobs"][job_id]["runs"][run_id]["last_updated"] = now_iso()
-        metadata["repos"][repo_id]["jobs"][job_id]["runs"][run_id]["upload_count"] += 1
+        metadata["repos"][repo_id]["jobs"][job_id]["last_updated"] = now_iso()
+        metadata["repos"][repo_id]["jobs"][job_id]["upload_count"] += 1
         save_metadata(metadata)
         log.info("upload_metadata_updated")
 
         return jsonify(
             {
                 "success": True,
-                "message": f"Testmon data uploaded for {repo_id}/{job_id}/{run_id}",
+                "message": f"Testmon data uploaded for {repo_id}/{job_id}",
                 "db_path": str(db_path.relative_to(BASE_DATA_DIR)),
             }
         ), 200
 
     except Exception:
-        log_exception("upload_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        log_exception("upload_handler", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Upload failed"}), 500
 
 @app.route("/api/client/download", methods=["GET"])
 def download_testmon_data():
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     log.info("download_request")
@@ -400,7 +410,7 @@ def download_testmon_data():
         log.warning("download_missing_params")
         return jsonify({"error": "repo_id and job_id are required"}), 400
 
-    db_path = get_run_db_path(repo_id, job_id)
+    db_path = get_job_db_path(repo_id, job_id)
 
     log.info("file_read_attempt path=%s", db_path)
     if not db_path.exists():
@@ -424,26 +434,25 @@ def download_testmon_data():
 def check_testmon_data_exists():
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-    run_id = request.args.get("run_id")
-    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     log.info("exists_request")
 
-    if not repo_id or not job_id or not run_id:
+    if not repo_id or not job_id:
         log.warning("exists_missing_params")
-        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
+        return jsonify({"error": "repo_id and job_id are required"}), 400
 
-    db_path = get_run_db_path(repo_id, job_id, run_id)
+    db_path = get_job_db_path(repo_id, job_id)
     exists = db_path.exists()
     log.info("exists_checked path=%s exists=%s", db_path, exists)
 
-    return jsonify({"exists": exists, "repo_id": repo_id, "job_id": job_id, "run_id": run_id})
+    return jsonify({"exists": exists, "repo_id": repo_id, "job_id": job_id})
 
 # -----------------------------------------------------------------------------
 # API ENDPOINTS - Visualization Data (with DB logging)
 # -----------------------------------------------------------------------------
-def _open_db_or_404(repo_id: str, job_id: str, run_id: str):
-    db_path = get_run_db_path(repo_id, job_id, run_id)
+def _open_db_or_404(repo_id: str, job_id: str):
+    db_path = get_job_db_path(repo_id, job_id)
     log.info("db_read_attempt path=%s", db_path)
     if not db_path.exists():
         log.warning("db_missing path=%s", db_path)
@@ -459,24 +468,23 @@ def list_repos():
     for repo_id, repo_data in metadata.get("repos", {}).items():
         jobs = []
         for job_id, job_data in repo_data.get("jobs", {}).items():
-            runs = []
-            for run_id, run_data in job_data.get("runs", {}).items():
-                runs.append(
-                    {
-                        "id": run_id,
-                        "created": run_data["created"],
-                        "last_updated": run_data["last_updated"],
-                        "upload_count": run_data["upload_count"],
-                    }
-                )
+            db_path = get_job_db_path(repo_id, job_id)
+            run_ids = get_run_ids(db_path)  # [1, 2, 3, ...]
+
+            runs = [
+                {"id": run_id}
+                for run_id in run_ids
+            ]
+
             jobs.append(
                 {
                     "id": job_id,
                     "name": job_data.get("name", job_id),
                     "created": job_data["created"],
-                    "runs": runs
+                    "runs": runs,
                 }
             )
+
         repos.append(
             {
                 "id": repo_id,
@@ -485,13 +493,15 @@ def list_repos():
                 "jobs": jobs,
             }
         )
+
     log.info("repos_list_success count=%s", len(repos))
     return jsonify({"repos": repos})
+
 
 @app.route('/api/data/<path:repo_id>/<job_id>/<run_id>/summary', methods=['GET'])
 def get_summary(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
-    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
 
@@ -507,17 +517,25 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         """
         ).fetchone()
 
-        test_count = cursor.execute("SELECT COUNT(*) FROM test_execution").fetchone()[0]
+        test_count_row = cursor.execute("SELECT tests_all FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
+        test_count = test_count_row[0] if test_count_row else 0
         file_count = cursor.execute(
-            "SELECT COUNT(DISTINCT filename) FROM file_fp"
+            "SELECT COUNT(DISTINCT filename) FROM file_fp_infos WHERE run_uid = ?",
+            (run_id,)
         ).fetchone()[0]
-
-        metadata_cursor = cursor.execute("SELECT dataid, data FROM metadata")
+       
+        test_savings = cursor.execute("SELECT tests_saved FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
+        time_savings = cursor.execute("SELECT run_time_saved FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
+        time_all= cursor.execute("SELECT run_time_all FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
+        
         savings = {}
-        for row in metadata_cursor:
-            if "tests_saved" in row["dataid"] or "time_saved" in row["dataid"]:
-                key = row["dataid"].split(":", 1)[1]
-                savings[key] = json.loads(row["data"])
+        if test_savings and test_savings[0] is not None:
+            savings["tests_saved"] = test_savings[0]
+        if time_savings and time_savings[0] is not None:
+            savings["time_saved"] = time_savings[0]     
+        if time_all and time_all[0] is not None:
+            savings["time_all"] = time_all[0]     
+    
 
         conn.close()
         log.info(
@@ -552,7 +570,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
 def list_test_files(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
 
@@ -564,7 +582,8 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
             """
             SELECT
                 CASE 
-                    WHEN instr(te.test_name, '::') > 0 THEN substr(te.test_name, 1, instr(te.test_name, '::') - 1)
+                    WHEN instr(te.test_name, '::') > 0 
+                        THEN substr(te.test_name, 1, instr(te.test_name, '::') - 1)
                     ELSE te.test_name
                 END AS file_name,
                 COUNT(*) AS test_count,
@@ -575,16 +594,20 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
                 GROUP_CONCAT(
                     DISTINCT
                     CASE 
-                        WHEN instr(te.test_name, '::') > 0 THEN substr(te.test_name, instr(te.test_name, '::') + 2)
+                        WHEN instr(te.test_name, '::') > 0 
+                            THEN substr(te.test_name, instr(te.test_name, '::') + 2)
                         ELSE NULL
                     END
                 ) AS test_methods
             FROM test_execution te
             LEFT JOIN test_execution_file_fp tef
                 ON te.id = tef.test_execution_id
+               AND tef.run_uid = ?          -- keep LEFT JOIN semantics
+            WHERE te.run_uid = ?            -- only this run's tests
             GROUP BY file_name
             ORDER BY file_name;
-        """
+            """,
+            (run_id, run_id),
         ).fetchall()
 
         conn.close()
@@ -600,7 +623,7 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
 def get_tests(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
 
@@ -616,13 +639,17 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
                 te.duration,
                 te.failed,
                 te.forced,
-                COUNT(DISTINCT tef.fingerprint_id) as dependency_count
-            FROM test_execution te
-            LEFT JOIN test_execution_file_fp tef ON te.id = tef.test_execution_id
+                COUNT(DISTINCT tef.fingerprint_id) AS dependency_count
+            FROM test_infos te
+            LEFT JOIN test_execution_file_fp_infos tef 
+                ON te.test_execution_id = tef.test_execution_id
+                AND tef.run_uid = ?
+            WHERE te.run_uid = ?
             GROUP BY te.id, te.test_name, te.duration, te.failed, te.forced
             ORDER BY te.test_name
-        """
-        ).fetchall()
+            """,
+            (run_id, run_id)
+).fetchall()
 
         conn.close()
         log.info("tests_list_success count=%s", len(tests))
@@ -634,10 +661,10 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
         return jsonify({"error": "Failed to read tests"}), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/test/<int:test_id>", methods=["GET"])
-def get_test_details(repo_id: str, job_id: str, run_id: str, test_id: int):
-    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
+def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
+    g.repo_id, g.job_id , g.run_id = repo_id, job_id, run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
 
@@ -646,7 +673,7 @@ def get_test_details(repo_id: str, job_id: str, run_id: str, test_id: int):
         conn.row_factory = sqlite3.Row
 
         test = conn.execute(
-            "SELECT * FROM test_execution WHERE id = ?", (test_id,)
+            "SELECT * FROM test_infos WHERE id = ?", (test_id,)
         ).fetchone()
         if not test:
             conn.close()
@@ -660,16 +687,22 @@ def get_test_details(repo_id: str, job_id: str, run_id: str, test_id: int):
                 fp.fsha,
                 fp.method_checksums,
                 fp.mtime
-            FROM test_execution_file_fp tef
-            JOIN file_fp fp ON tef.fingerprint_id = fp.id
-            WHERE tef.test_execution_id = ?
-        """,
-            (test_id,),
+            FROM test_infos ti
+            JOIN test_execution_file_fp_infos tef
+                ON tef.test_execution_id = ti.test_execution_id
+            JOIN file_fp_infos fp
+                ON fp.fingerprint_id = tef.fingerprint_id
+            WHERE ti.id = ?
+            AND ti.run_uid = ?
+            AND tef.run_uid = ?
+            AND fp.run_uid = ?
+            """,
+            (test_id, run_id, run_id, run_id)
         ).fetchall()
+
 
         conn.close()
 
-        import array
 
         dependencies = []
         for dep in deps:
@@ -692,33 +725,41 @@ def get_test_details(repo_id: str, job_id: str, run_id: str, test_id: int):
         return jsonify({"error": "Failed to read test details"}), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/files", methods=["GET"])
-def get_files(repo_id: str, job_id: str, run_id: str):
-    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
+def get_files(repo_id: str, job_id: str ,run_id:str):
+    g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
 
-    db_path, resp, code = _open_db_or_404(repo_id, job_id, run_id)
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
 
     try:
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
-
         files = conn.execute(
             """
             SELECT 
-                fp.filename,
-                COUNT(DISTINCT tef.test_execution_id) as test_count,
-                COUNT(DISTINCT fp.id) as fingerprint_count
-            FROM file_fp fp
-            LEFT JOIN test_execution_file_fp tef ON fp.id = tef.fingerprint_id
-            GROUP BY fp.filename
-            ORDER BY fp.filename
-        """
+                fpi.filename,
+                COUNT(DISTINCT tefi.test_execution_id) AS test_count,
+                COUNT(DISTINCT fpi.fingerprint_id)     AS fingerprint_count
+            FROM file_fp_infos fpi
+            LEFT JOIN test_execution_file_fp_infos tefi
+                ON  fpi.fingerprint_id = tefi.fingerprint_id
+                AND fpi.run_uid  = tefi.run_uid   
+            WHERE 
+                fpi.run_uid = ?
+            GROUP BY 
+                fpi.filename
+            ORDER BY 
+                fpi.filename
+            """,
+            (run_id,)
         ).fetchall()
+
+
 
         conn.close()
         log.info("files_list_success count=%s", len(files))
-
+        
         return jsonify({"files": [dict(file) for file in files]})
 
     except Exception:
@@ -729,22 +770,21 @@ def get_files(repo_id: str, job_id: str, run_id: str):
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():
     """Store user's test preferences (which tests to always run)"""
-
+    
     # Get data from request body (JSON)
     data = request.get_json()
     log.info("data is" , data)
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
-    run_id = data.get("run_id")
-
+    
     selected_test_files = data.get("selectedTests", [])  # Array of test file names
-
+    
     # Enrich per-request context for logging
-    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
-    if not repo_id or not job_id or not run_id:
+    if not repo_id or not job_id:
         log.warning("preferences_missing_params")
-        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
+        return jsonify({"error": "repo_id and job_id are required"}), 400
 
     if not isinstance(selected_test_files, list):
         log.warning("preferences_invalid_format")
@@ -752,27 +792,26 @@ def upload_test_preferences():
 
     try:
         # Create preferences file path
-        run_path = get_run_db_path(repo_id, job_id, run_id).parent
-        preferences_path = run_path / "test_preferences.json"
-
+        job_path = get_job_db_path(repo_id, job_id).parent
+        preferences_path = job_path / "test_preferences.json"
+        
         log.info(
-            "preferences_write_attempt path=%s test_count=%s",
-            preferences_path,
+            "preferences_write_attempt path=%s test_count=%s", 
+            preferences_path, 
             len(selected_test_files)
         )
-
+        
         # Store preferences as JSON
         preferences_data = {
             "repo_id": repo_id,
             "job_id": job_id,
-            "run_id": run_id,
             "always_run_tests": selected_test_files,
             "updated_at": now_iso(),
         }
-
+        
         with open(preferences_path, "w") as f:
             json.dump(preferences_data, f, indent=2)
-
+        
         size = preferences_path.stat().st_size
         log.info(
             "preferences_write_success path=%s size=%s (%s) test_count=%s",
@@ -784,47 +823,45 @@ def upload_test_preferences():
 
         return jsonify({
             "success": True,
-            "message": f"Test preferences saved for {repo_id}/{job_id}/{run_id}",
+            "message": f"Test preferences saved for {repo_id}/{job_id}",
             "test_count": len(selected_test_files),
         }), 200
 
     except Exception:
-        log_exception("preferences_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        log_exception("preferences_handler", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to save preferences"}), 500
 
 
 @app.route("/api/client/testPreferences", methods=["GET"])
 def get_test_preferences():
     """Retrieve user's test preferences"""
-
+    
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
-    run_id = request.args.get("run_id")
-    g.repo_id, g.job_id, g.run_id = repo_id or "-", job_id or "-", run_id or "-"
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
-    if not repo_id or not job_id or not run_id:
+    if not repo_id or not job_id:
         log.warning("preferences_get_missing_params")
-        return jsonify({"error": "repo_id, job_id and run_id are required"}), 400
+        return jsonify({"error": "repo_id and job_id are required"}), 400
 
     try:
-        job_path = get_run_db_path(repo_id, job_id, run_id).parent
+        job_path = get_job_db_path(repo_id, job_id).parent
         preferences_path = job_path / "test_preferences.json"
-
+        
         log.info("preferences_read_attempt path=%s", preferences_path)
-
+        
         if not preferences_path.exists():
             log.info("preferences_not_found path=%s", preferences_path)
             return jsonify({
                 "repo_id": repo_id,
                 "job_id": job_id,
-                "run_id": run_id,
                 "always_run_tests": [],
                 "updated_at": None,
             }), 200
-
+        
         with open(preferences_path, "r") as f:
             preferences_data = json.load(f)
-
+        
         size = preferences_path.stat().st_size
         log.info(
             "preferences_read_success path=%s size=%s (%s)",
@@ -832,11 +869,11 @@ def get_test_preferences():
             size,
             human_bytes(size)
         )
-
+        
         return jsonify(preferences_data), 200
 
     except Exception:
-        log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read preferences"}), 500
 # -----------------------------------------------------------------------------
 # WEB + Health - UPDATED FOR REACT

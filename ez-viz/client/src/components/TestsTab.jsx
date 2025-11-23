@@ -6,6 +6,7 @@ function TestsTab({ tests, search, setSearch, showTestDetails }) {
     const filteredTests = tests.filter(test =>
         test.test_name.toLowerCase().includes(search.toLowerCase())
     );
+    console.log("Filtered test" , filteredTests)
 
     return (
         <div className="animate-fadeIn">

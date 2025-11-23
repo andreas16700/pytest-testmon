@@ -63,6 +63,8 @@ function App() {
             ]);
             setSummary(summaryData);
             setAllTests(testsData.tests || []);
+           
+            
             setAllFiles(filesData.files || []);
             setActiveTab('summary');
         } catch (err) {
@@ -76,7 +78,7 @@ function App() {
         try {
             const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/test/${testId}`);
             const data = await response.json();
-
+            console.log("test id is" ,testId)
             setModal({
                 open: true,
                 title: data.test.test_name,
@@ -92,7 +94,8 @@ function App() {
         const relatedTests = allTests.filter(t =>
             t.test_name.includes(filename.replace('.py', ''))
         );
-
+        console.log("All tests are" ,allTests)
+        console.log("Related tests are" ,relatedTests)
         setModal({
             open: true,
             title: filename,
