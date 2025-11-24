@@ -405,6 +405,7 @@ def update_testmon_run_id(db_path, run_id):
 
         return affected
 
+
     except Exception as e:
         # ---- ERROR LOG ----
         log.error(f"Error updating testmon run_id for file {db_path}: {e}")
@@ -413,7 +414,25 @@ def update_testmon_run_id(db_path, run_id):
     finally:
         if 'conn' in locals():
             conn.close()
-            
+ 
+ 
+ 
+def add_run_id_to_testmon_data(db_path, run_id):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+        "UPDATE run_uid SET repo_run_id=? WHERE repo_run_id IS NULL",
+        (run_id,)
+                     )
+        conn.commit()
+       
+    except Exception as e:
+        log.error("Error updating run_ids for file %s: %s", db_path, e)
+        return []
+    finally:
+        conn.close()
+                
 def get_run_ids(db_path):
     conn = None
     try:
@@ -421,7 +440,7 @@ def get_run_ids(db_path):
         cursor = conn.cursor()
         
         
-        cursor.execute("SELECT id FROM run_uid")
+        cursor.execute("SELECT repo_run_id FROM run_uid")
         rows = cursor.fetchall()  
         
         run_ids = [row[0] for row in rows]
@@ -465,7 +484,7 @@ def upload_testmon_data():
         # Attempt to write uploaded file
         log.info("file_write_attempt dest=%s", db_path)
         file.save(db_path)
-        update_testmon_run_id(db_path , run_id)
+        add_run_id_to_testmon_data(db_path , run_id)
         size = db_path.stat().st_size
         log.info("file_write_success dest=%s size=%s (%s)", db_path, size, human_bytes(size))
 
@@ -649,17 +668,27 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         """
         ).fetchone()
 
-        test_count_row = cursor.execute("SELECT tests_all FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
+        test_count_row = cursor.execute("SELECT tests_all FROM run_infos Where run_uid = (Select id from run_uid Where repo_run_id=?)", (run_id,)).fetchone()
         test_count = test_count_row[0] if test_count_row else 0
         file_count = cursor.execute(
-            "SELECT COUNT(DISTINCT filename) FROM file_fp_infos WHERE run_uid = ?",
+            "SELECT COUNT(DISTINCT filename) FROM file_fp_infos WHERE run_uid = (Select id from run_uid Where repo_run_id=?) ",
             (run_id,)
         ).fetchone()[0]
        
-        test_savings = cursor.execute("SELECT tests_saved FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
-        time_savings = cursor.execute("SELECT run_time_saved FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
-        time_all= cursor.execute("SELECT run_time_all FROM run_infos WHERE run_uid=?", (run_id,)).fetchone()
-        
+        test_savings = cursor.execute(
+            "SELECT tests_saved FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
+            (run_id,)
+        ).fetchone()
+
+        time_savings = cursor.execute(
+            "SELECT run_time_saved FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
+            (run_id,)
+        ).fetchone()
+
+        time_all = cursor.execute(
+            "SELECT run_time_all FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
+            (run_id,)
+        ).fetchone()
         savings = {}
         if test_savings and test_savings[0] is not None:
             savings["tests_saved"] = test_savings[0]
@@ -731,19 +760,19 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
                         ELSE NULL
                     END
                 ) AS test_methods
-            FROM test_execution te
-            LEFT JOIN test_execution_file_fp tef
-                ON te.id = tef.test_execution_id
-               AND tef.run_uid = ?          -- keep LEFT JOIN semantics
-            WHERE te.run_uid = ?            -- only this run's tests
+            FROM test_infos te
+            LEFT JOIN test_execution_file_fp_infos tef
+                ON te.id = tef.test_execution_id     
+            WHERE te.run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)                      
             GROUP BY file_name
             ORDER BY file_name;
             """,
-            (run_id, run_id),
+            (run_id,),
         ).fetchall()
 
+
         conn.close()
-        log.info("test_file_list_success count=%s", len(test_files))
+       
 
         return jsonify({"test_files": [dict(test) for test in test_files]})
 
@@ -775,8 +804,12 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
             FROM test_infos te
             LEFT JOIN test_execution_file_fp_infos tef 
                 ON te.test_execution_id = tef.test_execution_id
-                AND tef.run_uid = ?
-            WHERE te.run_uid = ?
+                AND tef.run_uid = (
+                    SELECT id FROM run_uid WHERE repo_run_id=?
+                )
+            WHERE te.run_uid = (
+                    SELECT id FROM run_uid WHERE repo_run_id=?
+                )
             GROUP BY te.id, te.test_name, te.duration, te.failed, te.forced
             ORDER BY te.test_name
             """,
@@ -784,7 +817,7 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
 ).fetchall()
 
         conn.close()
-        log.info("tests_list_success count=%s", len(tests))
+        #log.info("tests_list_success count=%s", len(tests))
 
         return jsonify({"tests": [dict(test) for test in tests]})
 
@@ -820,17 +853,20 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
                 fp.method_checksums,
                 fp.mtime
             FROM test_infos ti
+            JOIN run_uid r
+                ON ti.run_uid = r.id
             JOIN test_execution_file_fp_infos tef
                 ON tef.test_execution_id = ti.test_execution_id
+            AND tef.run_uid = r.id
             JOIN file_fp_infos fp
                 ON fp.fingerprint_id = tef.fingerprint_id
+            AND fp.run_uid = r.id
             WHERE ti.id = ?
-            AND ti.run_uid = ?
-            AND tef.run_uid = ?
-            AND fp.run_uid = ?
+            AND r.repo_run_id = ?
             """,
-            (test_id, run_id, run_id, run_id)
+            (test_id, run_id)  # adjust var names as needed
         ).fetchall()
+
 
 
         conn.close()
@@ -849,7 +885,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
                 }
             )
 
-        log.info("test_details_success test_id=%s deps=%s", test_id, len(dependencies))
+       # log.info("test_details_success test_id=%s deps=%s", test_id, len(dependencies))
         return jsonify({"test": dict(test), "dependencies": dependencies})
 
     except Exception:
@@ -878,7 +914,7 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
                 ON  fpi.fingerprint_id = tefi.fingerprint_id
                 AND fpi.run_uid  = tefi.run_uid   
             WHERE 
-                fpi.run_uid = ?
+                fpi.run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)
             GROUP BY 
                 fpi.filename
             ORDER BY 
@@ -890,7 +926,7 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
 
 
         conn.close()
-        log.info("files_list_success count=%s", len(files))
+        #log.info("files_list_success count=%s", len(files))
         
         return jsonify({"files": [dict(file) for file in files]})
 
@@ -905,7 +941,6 @@ def upload_test_preferences():
     
     # Get data from request body (JSON)
     data = request.get_json()
-    log.info("data is" , data)
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
     

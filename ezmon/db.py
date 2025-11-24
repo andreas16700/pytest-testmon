@@ -157,21 +157,32 @@ class DB:  # pylint: disable=too-many-public-methods
         run_saved_time,
         exec_id=exec_id
         )
-      
+        
+        
+        self.write_increment_run_id_attribute()
+        with self.con as con:
+            cursor = con.cursor()
+            cursor.execute(
+                """SELECT MAX(id) FROM run_uid"""
+            )
+            row = cursor.fetchone()
+            run_uid = row[0] if row and row[0] is not None else None
         self.write_run_info_attribute(
             exec_id=exec_id,
             run_saved_time=run_saved_time,
             run_all_time=run_all_time,
             run_saved_tests=run_saved_tests,
             run_all_tests=run_all_tests,
-            
+            run_uid=run_uid
         )
         
-        self.write_test_info_attribute()
         
-        self.write_file_fp_infos()
         
-        self.write_test_exec_file_fp_infos()
+        self.write_test_info_attribute(run_uid)
+        
+        self.write_file_fp_infos(run_uid)
+        
+        self.write_test_exec_file_fp_infos(run_uid)
         
         self.increment_attributes(
             {
@@ -334,46 +345,64 @@ class DB:  # pylint: disable=too-many-public-methods
                 [dataid, json.dumps(data)],
             )
     def write_run_info_attribute(self, exec_id, run_saved_time, run_all_time, 
-                              run_saved_tests, run_all_tests):
+                              run_saved_tests, run_all_tests,run_uid):
         with self.con as con:
             con.execute(
                 """INSERT OR REPLACE INTO run_infos 
-                ( run_time_saved, run_time_all, tests_saved, tests_all)
-                VALUES ( ?, ?, ?, ?)""",
-                (run_saved_time, run_all_time, run_saved_tests, run_all_tests),
+                ( run_time_saved, run_time_all, tests_saved, tests_all,run_uid)
+                VALUES ( ?, ?, ?, ?,?)""",
+                (run_saved_time, run_all_time, run_saved_tests, run_all_tests,run_uid),
             )
             
      #Historical Data Insert
             
-    def write_test_info_attribute(self):
+    def write_test_info_attribute(self,run_uid):
         with self.con as con:
             con.execute(
                 """
-                INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced)
-                SELECT id, test_name, duration, failed, forced
+                INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced,run_uid)
+                SELECT id, test_name, duration, failed, forced , ?
                 FROM test_execution
+               
+                """,
+                (run_uid,)
+            )
+    def write_increment_run_id_attribute(self):
+        with self.con as con:
+            con.execute(
                 """
+                INSERT INTO run_uid DEFAULT VALUES;
+                """
+            )
+    
+    def write_test_exec_file_fp_infos(self ,run_uid):
+        with self.con as con:
+            con.execute(
+                """
+                INSERT INTO test_execution_file_fp_infos (
+                    test_execution_id,
+                    fingerprint_id,
+                    run_uid
+                )
+                SELECT
+                    test_execution_id,
+                    fingerprint_id,        
+                    ?            
+                FROM test_execution_file_fp 
+                """,
+                (run_uid,)
             )
 
-    
-    def write_test_exec_file_fp_infos(self):
-        with self.con as con:
-            con.execute(
-                 """
-                INSERT INTO test_execution_file_fp_infos (test_execution_id,fingerprint_id)
-                SELECT test_execution_id,fingerprint_id
-                FROM test_execution_file_fp
-                """
-            )
             
-    def write_file_fp_infos(self):
+    def write_file_fp_infos(self,run_uid):
         with self.con as con:
             con.execute(
                 """
-                INSERT INTO file_fp_infos (fingerprint_id,filename, method_checksums, mtime, fsha)
-                SELECT id,filename, method_checksums, mtime, fsha
+                INSERT INTO file_fp_infos (fingerprint_id,filename, method_checksums, mtime, fsha ,run_uid)
+                SELECT id,filename, method_checksums, mtime, fsha,?
                 FROM file_fp
                 """
+                ,(run_uid,)
             )
       
     
@@ -412,8 +441,8 @@ class DB:  # pylint: disable=too-many-public-methods
 
     def create_run_uid_statement(self) ->str:
            return """CREATE TABLE IF NOT EXISTS run_uid (
-            id INTEGER PRIMARY KEY
-           
+            id INTEGER PRIMARY KEY,
+            repo_run_id INTEGER NULL
         );"""
     
     def _create_run_infos_statement(self) -> str:
@@ -422,7 +451,7 @@ class DB:  # pylint: disable=too-many-public-methods
             run_time_all REAL,
             tests_saved INTEGER,
             tests_all INTEGER ,
-            run_uid INTEGER NULL,
+            run_uid INTEGER,
             FOREIGN KEY(run_uid) REFERENCES run_uid(id)
             
         );"""
@@ -465,11 +494,10 @@ class DB:  # pylint: disable=too-many-public-methods
                 test_execution_id INTEGER,
                 fingerprint_id INTEGER,
                 run_uid INTEGER NULL,
-                FOREIGN KEY(test_execution_id) REFERENCES test_infos(id),
-                FOREIGN KEY(fingerprint_id) REFERENCES file_fp_infos(id),
                 FOREIGN KEY(run_uid) REFERENCES run_uid(id)
             );
         """
+
   
             
          
