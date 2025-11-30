@@ -11,7 +11,7 @@ const reorder = (list, startIndex, endIndex) => {
     return result;
 };
 
-function TestManagementTab({currentRepo, currentJob, currentRuns}) {
+function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
     const [searchTerm, setSearchTerm] = useState("");
     const [isOpen, setIsOpen] = useState(false);
     const [testFileList, setTestFileList] = useState([]);
@@ -70,12 +70,31 @@ function TestManagementTab({currentRepo, currentJob, currentRuns}) {
     }
 
     useEffect(() => {
-        loadTestFileList();
-    }, []);
+        if (!repos || repos.length === 0) return;
 
-    const loadTestFileList = async () => {
+        let latestContext = null;
+
+        for (const repo of repos) {
+            for (const job of repo.jobs) {
+                for (const run of job.runs) {
+                    if (!latestContext || run.last_updated > latestContext.last_updated) {
+                        latestContext = {
+                            runId: run.id,
+                            last_updated: run.last_updated
+                        };
+                    }
+                }
+            }
+        }
+
+        if (latestContext) {
+            loadTestFileList(latestContext.runId);
+        }
+    }, [repos]);
+
+    const loadTestFileList = async (run_id) => {
         try {
-            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRuns[0]}/test_files`);
+            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${run_id}/test_files`);
             const data = await response.json();
             setTestFileList(data.test_files || []);
             setLoading(true);

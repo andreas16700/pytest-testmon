@@ -87,7 +87,7 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                         type="button"
                         className="w-full p-3 text-base border-2 border-gray-300 rounded-lg bg-white cursor-pointer transition-all hover:border-indigo-500 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed text-left flex items-center justify-between"
                         onClick={() => setIsJobDropdownOpen(!isJobDropdownOpen)}
-                        disabled={!selectedRepo}
+                        disabled={!selectedRepo || selectedRepo.jobs.length === 0}
                     >
                         <span className="truncate">
                             {currentJob ? `${currentJob} (${selectedRepo?.jobs.find(j => j.id === currentJob)?.runs.length || 0} runs)` : 'Select a job'}
@@ -169,6 +169,8 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                                                 const remainingRuns = currentRuns.filter(id => id !== run.id);
                                                 onRunChange(remainingRuns);
                                                 setSummary(prev => prev.filter(item => item.run_id !== run.id));
+                                                setAllTests(prev => prev.filter(item => item.run_id !== run.id));
+                                                setAllFiles(prev => prev.filter(item => item.run_id !== run.id));
                                                 if (run.id === selectedRunId) {
                                                     if (remainingRuns.length > 0) {
                                                         setSelectedRunId(remainingRuns[0]);

@@ -211,6 +211,7 @@ function App() {
                     currentRuns={currentRuns}
                     selectedRunId={selectedRunId}
                     setSelectedRunId={setSelectedRunId}
+                    repos={repos}
                 />
             </div>
 
