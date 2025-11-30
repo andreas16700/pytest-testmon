@@ -11,11 +11,13 @@ function App() {
     const [repos, setRepos] = useState([]);
     const [currentRepo, setCurrentRepo] = useState(null);
     const [currentJob, setCurrentJob] = useState(null);
-    const [currentRun, setCurrentRun] = useState(null);
+    const [currentRuns, setCurrentRuns] = useState([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [selectedRunId, setSelectedRunId] = useState(currentRuns[0]);
+    const [isAdded, setIsAdded] = useState(false);
 
-    const [summary, setSummary] = useState(null);
+    const [summary, setSummary] = useState([]);
     const [allTests, setAllTests] = useState([]);
     const [allFiles, setAllFiles] = useState([]);
 
@@ -31,12 +33,12 @@ function App() {
     }, []);
 
     useEffect(() => {
-        if (currentRepo && currentJob && currentRun) {
+        if (currentRepo && currentJob && currentRuns.length > 0) {
             loadData();
         } else {
-            setSummary(null);
+            setSummary([]);
         }
-    }, [currentRepo, currentJob, currentRun]);
+    }, [currentRepo, currentJob, currentRuns]);
 
     const fetchUser = async () => {
         try {
@@ -91,37 +93,41 @@ function App() {
     };
 
     const loadData = async () => {
-        if (!currentRepo || !currentJob || !currentRun) return;
+        if (!currentRepo || !currentJob || currentRuns.length === 0) return;
 
         setLoading(true);
         setError(null);
-
-        try {
-            const [summaryData, testsData, filesData] = await Promise.all([
-                fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/summary`, {
-                    credentials: "include"
-                }).then(r => r.json()),
-                fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/tests`, {
-                    credentials: "include"
-                }).then(r => r.json()),
-                fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/files`, {
-                    credentials: "include"
-                }).then(r => r.json())
-            ]);
-            setSummary(summaryData);
-            setAllTests(testsData.tests || []);
-            setAllFiles(filesData.files || []);
-            setActiveTab('summary');
-        } catch (err) {
-            setError('Failed to load testmon data: ' + err.message);
-        } finally {
+        if (isAdded) {
+            try {
+                const [summaryData, testsData, filesData] = await Promise.all([
+                    fetch(`/api/data/${currentRepo}/${currentJob}/${currentRuns[currentRuns.length - 1]}/summary`, {
+                        credentials: "include"
+                    }).then(r => r.json()),
+                    fetch(`/api/data/${currentRepo}/${currentJob}/${currentRuns[currentRuns.length - 1]}/tests`, {
+                        credentials: "include"
+                    }).then(r => r.json()),
+                    fetch(`/api/data/${currentRepo}/${currentJob}/${currentRuns[currentRuns.length - 1]}/files`, {
+                        credentials: "include"
+                    }).then(r => r.json())
+                ]);
+                setSummary(prevSummary => [...prevSummary, summaryData]);
+                setAllTests(prevTests => [...prevTests, testsData]);
+                setAllFiles(prevFiles => [...prevFiles, filesData]);
+                setActiveTab('summary');
+            } catch (err) {
+                setError('Failed to load testmon data: ' + err.message);
+            } finally {
+                setLoading(false);
+                setIsAdded(false);
+            }
+        } else {
             setLoading(false);
         }
     };
 
     const showTestDetails = async (testId) => {
         try {
-            const response = await fetch(`/api/data/${currentRepo}/${currentJob}/${currentRun}/test/${testId}`, {
+            const response = await fetch(`/api/data/${currentRepo}/${currentJob}/${currentRuns[0]}/test/${testId}`, {
                 credentials: "include"
             });
             const data = await response.json();
@@ -159,26 +165,31 @@ function App() {
             console.error("Logout failed:", err);
         }
     };
-
     const selectedRepo = repos.find(r => r.id === currentRepo);
     const selectedJob = selectedRepo && selectedRepo.jobs.find(r => r.id === currentJob);
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-indigo-500 to-purple-600 p-5">
-            <div className="max-w-7xl mx-auto bg-white rounded-xl shadow-2xl overflow-hidden">
+            <div className="max-w-7xl mx-auto bg-white rounded-xl shadow-2xl">
                 <Header user={user} handleLogout={handleLogout}/>
 
                 <SelectorBar
                     repos={repos}
                     currentRepo={currentRepo}
                     currentJob={currentJob}
-                    currentRun={currentRun}
+                    currentRuns={currentRuns}
                     selectedRepo={selectedRepo}
                     selectedJob={selectedJob}
                     onRepoChange={setCurrentRepo}
                     onJobChange={setCurrentJob}
-                    onRunChange={setCurrentRun}
+                    onRunChange={setCurrentRuns}
                     onRefresh={loadRepos}
+                    setIsAdded={setIsAdded}
+                    setSummary={setSummary}
+                    setAllTests={setAllTests}
+                    setAllFiles={setAllFiles}
+                    selectedRunId={selectedRunId}
+                    setSelectedRunId={setSelectedRunId}
                 />
 
                 <MainContent
@@ -197,7 +208,9 @@ function App() {
                     showFileDetails={showFileDetails}
                     currentRepo={currentRepo}
                     currentJob={currentJob}
-                    currentRun={currentRun}
+                    currentRuns={currentRuns}
+                    selectedRunId={selectedRunId}
+                    setSelectedRunId={setSelectedRunId}
                 />
             </div>
 

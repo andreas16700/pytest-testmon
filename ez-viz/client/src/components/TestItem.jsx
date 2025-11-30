@@ -1,7 +1,7 @@
 import React from "react";
 import {formatDuration} from "./utils.jsx";
 
-function TestItem({ test, onClick }) {
+function TestItem({ test, runId, onClick }) {
     const getStatusClass = () => {
         if (test.failed) return 'bg-red-100 text-red-800';
         if (test.forced) return 'bg-yellow-100 text-yellow-800';
@@ -14,9 +14,14 @@ function TestItem({ test, onClick }) {
             onClick={onClick}
         >
             <div className="flex justify-between items-center mb-2">
-                <div className="text-lg font-semibold text-gray-700 flex-1 break-all">{test.test_name}</div>
+                <div className="flex items-center gap-2">
+                    <span className="bg-gray-100 border border-gray-200 text-gray-600 text-xs font-mono px-2 py-1 rounded-md whitespace-nowrap">
+                        <span className="text-gray-400 select-none">#</span>{runId}
+                    </span>
+                </div>
+                <div className="text-lg font-semibold text-gray-700 flex-1 break-all ml-2">{test.test_name}</div>
                 <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getStatusClass()}`}>
-                    {test?.forced === 0 ? <p>Executed</p> : <p>Skipped</p>}
+                    {test.forced === 0 ? <p>Executed</p> : <p>Skipped</p>}
                 </span>
             </div>
             <div className="flex gap-5 text-sm text-gray-600">

@@ -2,10 +2,13 @@ import React from "react";
 import TestItem from "./TestItem.jsx";
 import SearchBox from "./SearchBox.jsx";
 
-function TestsTab({ tests, search, setSearch, showTestDetails }) {
-    const filteredTests = tests.filter(test =>
-        test.test_name.toLowerCase().includes(search.toLowerCase())
-    );
+function TestsTab({ allTests, search, setSearch, showTestDetails }) {
+    const filteredTests = allTests.map(runData => ({
+            ...runData,
+            tests: runData.tests.filter(test =>
+                test.test_name.toLowerCase().includes(search.toLowerCase())
+            )
+        })).filter(runData => runData.tests.length > 0);
 
     return (
         <div className="animate-fadeIn">
@@ -16,9 +19,9 @@ function TestsTab({ tests, search, setSearch, showTestDetails }) {
             />
 
             <div className="grid gap-4">
-                {filteredTests.map(test => (
-                    <TestItem key={test.id} test={test} onClick={() => showTestDetails(test.id)} />
-                ))}
+                {filteredTests.map(runData => runData.tests.map(test => (
+                    <TestItem key={test.id} runId={runData.run_id} test={test} onClick={() => showTestDetails(test.id)} />
+                )))}
             </div>
         </div>
     );

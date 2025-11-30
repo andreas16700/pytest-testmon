@@ -11,7 +11,7 @@ const reorder = (list, startIndex, endIndex) => {
     return result;
 };
 
-function TestManagementTab({currentRepo, currentJob, currentRun}) {
+function TestManagementTab({currentRepo, currentJob, currentRuns}) {
     const [searchTerm, setSearchTerm] = useState("");
     const [isOpen, setIsOpen] = useState(false);
     const [testFileList, setTestFileList] = useState([]);
@@ -75,7 +75,7 @@ function TestManagementTab({currentRepo, currentJob, currentRun}) {
 
     const loadTestFileList = async () => {
         try {
-            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRun}/test_files`);
+            const response = await fetch(`${API_BASE}/data/${currentRepo}/${currentJob}/${currentRuns[0]}/test_files`);
             const data = await response.json();
             setTestFileList(data.test_files || []);
             setLoading(true);
