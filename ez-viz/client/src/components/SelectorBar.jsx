@@ -131,7 +131,7 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                         type="button"
                         className="w-full p-3 text-base border-2 border-gray-300 rounded-lg bg-white cursor-pointer transition-all hover:border-indigo-500 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed text-left flex items-center justify-between"
                         onClick={() => setIsRunDropdownOpen(!isRunDropdownOpen)}
-                        disabled={!selectedJob}
+                        disabled={!selectedJob || selectedJob.runs.length === 0}
                     >
                         <span className="truncate">
                             {currentRuns.length === 0 ? 'Select run/s' : currentRuns.length <= 2 ? currentRuns.join(', ') : `${currentRuns.length} runs selected`}
