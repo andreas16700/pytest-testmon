@@ -110,7 +110,7 @@ jobs:
           else
             echo "▶️ Starting ${{ env.PM2_NAME }} from ecosystem file..."
             # You can keep your ecosystem at repo root
-            pm2 start ecosystem.config.cjs --only "${{ env.PM2_NAME }}"
+            pm2 start /Users/andreasloizides/ecosystem.config.js --only "${{ env.PM2_NAME }}"
           fi
 
           pm2 save

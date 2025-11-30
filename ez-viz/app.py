@@ -2,7 +2,9 @@
 Testmon Multi-Project/Job Visualization Server with Extensive Logging
 """
 import secrets
-
+import sys
+print("PYTHON EXECUTABLE:", sys.executable, flush=True)
+print("PYTHON PREFIX:", sys.prefix, flush=True)
 from flask import (
     Flask,
     request,
