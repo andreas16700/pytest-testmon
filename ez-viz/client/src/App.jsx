@@ -143,7 +143,10 @@ function App() {
         const relatedTests = allTests.filter(t =>
             t.test_name.includes(filename.replace('.py', ''))
         );
-       
+        console.log("all tests are" , allTests)
+            
+
+
         setModal({
             open: true,
             title: filename,
