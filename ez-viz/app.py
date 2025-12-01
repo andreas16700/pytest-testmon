@@ -709,6 +709,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
             {
                 "repo_id": repo_id,
                 "job_id": job_id,
+                "run_id": run_id,
                 "test_count": test_count,
                 "file_count": file_count,
                 "environment": {
@@ -819,7 +820,7 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
         conn.close()
         #log.info("tests_list_success count=%s", len(tests))
 
-        return jsonify({"tests": [dict(test) for test in tests]})
+        return jsonify({"run_id": run_id, "tests": [dict(test) for test in tests]})
 
     except Exception:
         log_exception("tests_query", repo_id=repo_id, job_id=job_id)
@@ -929,6 +930,9 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
         #log.info("files_list_success count=%s", len(files))
         
         return jsonify({"files": [dict(file) for file in files]})
+        log.info("files_list_success count=%s", len(files))
+
+        return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
 
     except Exception:
         log_exception("files_query", repo_id=repo_id, job_id=job_id)
