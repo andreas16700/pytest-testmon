@@ -115,7 +115,7 @@ function App() {
                         credentials: "include"
                     }).then(r => r.json())
                 ]);
-                setSummary(prevSummary => [...prevSummary, summaryData]);
+                 setSummary(prevSummary => [...prevSummary, summaryData]);
                 setAllTests(prevTests => [...prevTests, testsData]);
                 setAllFiles(prevFiles => [...prevFiles, filesData]);
                 setActiveTab('summary');
@@ -148,12 +148,13 @@ function App() {
     };
 
     const showFileDetails = (filename) => {
-        const relatedTests = allTests.filter(t =>
+        // Get tests only from the selected run
+        const selectedRunTests = allTests.find(run => run.run_id === selectedRunId);
+        const testsFromSelectedRun = selectedRunTests?.tests || [];
+        
+        const relatedTests = testsFromSelectedRun.filter(t =>
             t.test_name.includes(filename.replace('.py', ''))
         );
-        console.log("all tests are" , allTests)
-            
-
 
         setModal({
             open: true,

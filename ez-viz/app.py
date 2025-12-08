@@ -927,9 +927,6 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
 
 
         conn.close()
-        #log.info("files_list_success count=%s", len(files))
-        
-        return jsonify({"files": [dict(file) for file in files]})
         log.info("files_list_success count=%s", len(files))
 
         return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
