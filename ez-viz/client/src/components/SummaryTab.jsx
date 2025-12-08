@@ -141,9 +141,9 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                 {isComparisonView ? (
                     // Comparison View
                     <div className="comparison-card">
-                        {/* Selectors */}
+                        
                         <div className="comparison-selectors">
-                             {/* Selector A */}
+                           
                              <div className="selector-wrapper">
                                 <label className="selector-label">Base Run (A)</label>
                                 <select 
@@ -156,7 +156,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                     ))}
                                 </select>
                              </div>
-                             {/* Selector B */}
+                             
                              <div className="selector-wrapper">
                                 <label className="selector-label">Comparison Run (B)</label>
                                 <select 
@@ -173,7 +173,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
 
                         {/* Comparison Content */}
                         <div className="comparison-content">
-                            {/* Stats Comparison Table */}
+                            
                             <div className="comparison-section">
                                 <h4 className="comparison-section-title">Statistics Delta</h4>
                                 <table className="comparison-table">
