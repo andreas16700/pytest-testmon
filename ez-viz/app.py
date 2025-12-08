@@ -942,11 +942,16 @@ def upload_test_preferences():
     
     # Get data from request body (JSON)
     data = request.get_json()
+    if len(data)>0:
+        log.info("TEST PREFERENCES !!!!!!!!"  ,data.keys())
+    else:
+          log.info("TEST PREFERENCES length is 0 !!!!!!!!" , )    
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
     
-    selected_test_files = data.get("selectedTests", [])  # Array of test file names
+    selected_test_files = data.get("alwaysRunTests", [])  # Array of test file names
     
+    log.info("Selected test files !!!!!!!!"  ,selected_test_files)
     # Enrich per-request context for logging
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -1043,6 +1048,124 @@ def get_test_preferences():
     except Exception:
         log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read preferences"}), 500
+    
+@app.route("/api/client/testResults", methods=["POST"])
+def upload_test_results():
+    """Store test execution results from CI/CD"""
+    
+    data = request.get_json()
+    repo_id = data.get("repo_id")
+    job_id = data.get("job_id")
+    run_id = data.get("run_id")
+    test_results = data.get("test_results", {})  # Dict with test names as keys
+    
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not run_id:
+        log.warning("test_results_missing_params")
+        return jsonify({"error": "repo_id, job_id, and run_id are required"}), 400
+
+    if not isinstance(test_results, dict):
+        log.warning("test_results_invalid_format")
+        return jsonify({"error": "test_results must be an object"}), 400
+
+    try:
+        # Create results file path
+        job_path = get_job_db_path(repo_id, job_id).parent
+        results_dir = job_path / "test_results"
+        results_dir.mkdir(exist_ok=True)
+        
+        results_path = results_dir / f"{run_id}.json"
+        
+        log.info(
+            "test_results_write_attempt path=%s test_count=%s", 
+            results_path, 
+            len(test_results)
+        )
+        
+        # Store results with metadata
+        results_data = {
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "run_id": run_id,
+            "test_results": test_results,
+            "total_tests": len(test_results),
+            "passed": sum(1 for r in test_results.values() if r.get("outcome") == "passed"),
+            "failed": sum(1 for r in test_results.values() if r.get("outcome") == "failed"),
+            "uploaded_at": now_iso(),
+        }
+        
+        with open(results_path, "w") as f:
+            json.dump(results_data, f, indent=2)
+        
+        size = results_path.stat().st_size
+        log.info(
+            "test_results_write_success path=%s size=%s (%s) test_count=%s",
+            results_path,
+            size,
+            human_bytes(size),
+            len(test_results)
+        )
+
+        return jsonify({
+            "success": True,
+            "message": f"Test results saved for {repo_id}/{job_id}/{run_id}",
+            "test_count": len(test_results),
+            "passed": results_data["passed"],
+            "failed": results_data["failed"],
+        }), 200
+
+    except Exception:
+        log_exception("test_results_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        return jsonify({"error": "Failed to save test results"}), 500
+
+
+@app.route("/api/client/testResults", methods=["GET"])
+def get_test_results():
+    """Retrieve test execution results for a specific run"""
+    
+    repo_id = request.args.get("repo_id")
+    job_id = request.args.get("job_id")
+    run_id = request.args.get("run_id")
+    
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not run_id:
+        log.warning("test_results_get_missing_params")
+        return jsonify({"error": "repo_id, job_id, and run_id are required"}), 400
+
+    try:
+        job_path = get_job_db_path(repo_id, job_id).parent
+        results_path = job_path / "test_results" / f"{run_id}.json"
+        
+        log.info("test_results_read_attempt path=%s", results_path)
+        
+        if not results_path.exists():
+            log.info("test_results_not_found path=%s", results_path)
+            return jsonify({
+                "repo_id": repo_id,
+                "job_id": job_id,
+                "run_id": run_id,
+                "test_results": {},
+                "uploaded_at": None,
+            }), 200
+        
+        with open(results_path, "r") as f:
+            results_data = json.load(f)
+        
+        size = results_path.stat().st_size
+        log.info(
+            "test_results_read_success path=%s size=%s (%s)",
+            results_path,
+            size,
+            human_bytes(size)
+        )
+        
+        return jsonify(results_data), 200
+
+    except Exception:
+        log_exception("test_results_get_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        return jsonify({"error": "Failed to read test results"}), 500
 # -----------------------------------------------------------------------------
 # WEB + Health - UPDATED FOR REACT
 # -----------------------------------------------------------------------------

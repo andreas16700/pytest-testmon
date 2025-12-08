@@ -46,6 +46,7 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
     };
 
     const handleSave = async () => {
+        
         try {
             const response = await fetch('/api/client/testPreferences', {
                 method: 'POST',

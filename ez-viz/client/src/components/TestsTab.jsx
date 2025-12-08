@@ -3,7 +3,7 @@ import TestItem from "./TestItem.jsx";
 import SearchBox from "./SearchBox.jsx";
 
 function TestsTab({ allTests, search, setSearch, showTestDetails }) {
-    console.log("all tests are" , allTests)
+   
     const filteredTests = allTests.map(runData => ({
             ...runData,
             tests: runData.tests.filter(test =>

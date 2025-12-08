@@ -33,9 +33,6 @@ function App() {
     }, []);
 
 
-       useEffect(() => {
-        console.log("sety all tests updated" , allTests)
-    }, [allTests]);
     useEffect(() => {
         if (currentRepo && currentJob && currentRuns.length > 0) {
             loadData();
@@ -62,7 +59,7 @@ function App() {
                 credentials: "include"
             });
             const systemData = await response.json();
-            console.log("System data is " ,systemData)
+            
             const systemRepos = systemData.repos || [];
 
             const userRepos = await loggedUserRepos();
@@ -70,7 +67,7 @@ function App() {
                 setError("Failed to load user repositories");
                 return;
             }
-            console.log("user repos" , userRepos)
+            
             const userRepoNames = new Set(userRepos.map(r => r.full_name));
 
             const matching = systemRepos.filter(repo => userRepoNames.has(repo.name));
@@ -149,7 +146,7 @@ function App() {
 
     const showFileDetails = (filename) => {
         // Get tests only from the selected run
-        const selectedRunTests = allTests.find(run => run.run_id === selectedRunId);
+        const selectedRunTests = allTests.find(run => run.run_id == selectedRunId);
         const testsFromSelectedRun = selectedRunTests?.tests || [];
         
         const relatedTests = testsFromSelectedRun.filter(t =>
