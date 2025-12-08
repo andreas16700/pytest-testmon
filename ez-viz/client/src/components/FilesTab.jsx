@@ -10,13 +10,13 @@ function FilesTab({ allFiles, search, setSearch, showFileDetails }) {
         )
     })).filter(runData => runData => runData.files.length > 0);
 
-    return (
-        <div className="animate-fadeIn">
-            <SearchBox
-                value={search}
-                onChange={setSearch}
-                placeholder="🔍 Search files..."
-            />
+  return (
+    <div className="animate-fadeIn">
+      <SearchBox
+        value={search}
+        onChange={setSearch}
+        placeholder="🔍 Search files..."
+      />
 
             <div className="grid gap-4">
                 {filteredFiles.map(runData => runData.files.map(file => (

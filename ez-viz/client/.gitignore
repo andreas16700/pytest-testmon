@@ -21,3 +21,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+ez-viz/dev-setup.ps1
+ez-viz/sync_prod_data.py
+
+vite.config.js

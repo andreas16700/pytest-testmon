@@ -166,11 +166,12 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                                                     setSelectedRunId(run.id);
                                                 }
                                             } else {
-                                                const remainingRuns = currentRuns.filter(id => id !== run.id);
+                                                const remainingRuns = currentRuns.filter(id => id != run.id);
+                
                                                 onRunChange(remainingRuns);
-                                                setSummary(prev => prev.filter(item => item.run_id !== run.id));
-                                                setAllTests(prev => prev.filter(item => item.run_id !== run.id));
-                                                setAllFiles(prev => prev.filter(item => item.run_id !== run.id));
+                                                setSummary(prev => prev.filter(item => item.run_id != run.id));
+                                                setAllTests(prev => prev.filter(item => item.run_id !=run.id));
+                                                setAllFiles(prev => prev.filter(item => item.run_id != run.id));
                                                 if (run.id === selectedRunId) {
                                                     if (remainingRuns.length > 0) {
                                                         setSelectedRunId(remainingRuns[0]);
@@ -189,15 +190,15 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                 </div>
             </div>
 
-            <button
-                className="px-6 py-3 bg-indigo-500 text-white rounded-lg cursor-pointer font-semibold transition-all hover:bg-indigo-600 hover:-translate-y-0.5 hover:shadow-lg flex items-center gap-2"
-                onClick={onRefresh}
-            >
-                <RefreshCw size={20} />
-                Refresh
-            </button>
-        </div>
-    );
+      <button
+        className="px-6 py-3 bg-indigo-500 text-white rounded-lg cursor-pointer font-semibold transition-all hover:bg-indigo-600 hover:-translate-y-0.5 hover:shadow-lg flex items-center gap-2"
+        onClick={onRefresh}
+      >
+        <RefreshCw size={20} />
+        Refresh
+      </button>
+    </div>
+  );
 }
 
 export default SelectorBar;

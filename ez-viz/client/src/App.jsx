@@ -32,6 +32,7 @@ function App() {
         loadRepos();
     }, []);
 
+
     useEffect(() => {
         if (currentRepo && currentJob && currentRuns.length > 0) {
             loadData();
@@ -58,6 +59,7 @@ function App() {
                 credentials: "include"
             });
             const systemData = await response.json();
+            
             const systemRepos = systemData.repos || [];
 
             const userRepos = await loggedUserRepos();
@@ -65,7 +67,7 @@ function App() {
                 setError("Failed to load user repositories");
                 return;
             }
-
+            
             const userRepoNames = new Set(userRepos.map(r => r.full_name));
 
             const matching = systemRepos.filter(repo => userRepoNames.has(repo.name));
@@ -110,7 +112,7 @@ function App() {
                         credentials: "include"
                     }).then(r => r.json())
                 ]);
-                setSummary(prevSummary => [...prevSummary, summaryData]);
+                 setSummary(prevSummary => [...prevSummary, summaryData]);
                 setAllTests(prevTests => [...prevTests, testsData]);
                 setAllFiles(prevFiles => [...prevFiles, filesData]);
                 setActiveTab('summary');
@@ -131,7 +133,7 @@ function App() {
                 credentials: "include"
             });
             const data = await response.json();
-
+           
             setModal({
                 open: true,
                 title: data.test.test_name,
@@ -143,7 +145,11 @@ function App() {
     };
 
     const showFileDetails = (filename) => {
-        const relatedTests = allTests.filter(t =>
+        // Get tests only from the selected run
+        const selectedRunTests = allTests.find(run => run.run_id == selectedRunId);
+        const testsFromSelectedRun = selectedRunTests?.tests || [];
+        
+        const relatedTests = testsFromSelectedRun.filter(t =>
             t.test_name.includes(filename.replace('.py', ''))
         );
 
@@ -167,6 +173,9 @@ function App() {
     };
     const selectedRepo = repos.find(r => r.id === currentRepo);
     const selectedJob = selectedRepo && selectedRepo.jobs.find(r => r.id === currentJob);
+
+
+
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-indigo-500 to-purple-600 p-5">

@@ -157,15 +157,33 @@ class DB:  # pylint: disable=too-many-public-methods
         run_saved_time,
         exec_id=exec_id
         )
-      
+        
+        
+        self.write_increment_run_id_attribute()
+        with self.con as con:
+            cursor = con.cursor()
+            cursor.execute(
+                """SELECT MAX(id) FROM run_uid"""
+            )
+            row = cursor.fetchone()
+            run_uid = row[0] if row and row[0] is not None else None
         self.write_run_info_attribute(
             exec_id=exec_id,
             run_saved_time=run_saved_time,
             run_all_time=run_all_time,
             run_saved_tests=run_saved_tests,
             run_all_tests=run_all_tests,
-            
+            run_uid=run_uid
         )
+        
+        
+        
+        self.write_test_info_attribute(run_uid)
+        
+        self.write_file_fp_infos(run_uid)
+        
+        self.write_test_exec_file_fp_infos(run_uid)
+        
         self.increment_attributes(
             {
                 f"{attribute_prefix}time_saved": run_saved_time,
@@ -269,7 +287,7 @@ class DB:  # pylint: disable=too-many-public-methods
             ),
         )
         return cursor.lastrowid
-
+     
     def insert_test_file_fps(self, tests_deps_n_outcomes: TestExecutions, exec_id=None):
         assert exec_id
         with self.con as con:
@@ -297,7 +315,6 @@ class DB:  # pylint: disable=too-many-public-methods
                     deps_n_outcomes.get("failed", None),
                     deps_n_outcomes.get("forced", None),
                 )
-
                 fingerprints = deps_n_outcomes["deps"]
                 files_fshas = set()
                 for record in fingerprints:
@@ -328,14 +345,66 @@ class DB:  # pylint: disable=too-many-public-methods
                 [dataid, json.dumps(data)],
             )
     def write_run_info_attribute(self, exec_id, run_saved_time, run_all_time, 
-                              run_saved_tests, run_all_tests):
+                              run_saved_tests, run_all_tests,run_uid):
         with self.con as con:
             con.execute(
                 """INSERT OR REPLACE INTO run_infos 
-                (runid, run_time_saved, run_time_all, tests_saved, tests_all)
-                VALUES (?, ?, ?, ?, ?)""",
-                (exec_id, run_saved_time, run_all_time, run_saved_tests, run_all_tests),
+                ( run_time_saved, run_time_all, tests_saved, tests_all,run_uid)
+                VALUES ( ?, ?, ?, ?,?)""",
+                (run_saved_time, run_all_time, run_saved_tests, run_all_tests,run_uid),
             )
+            
+     #Historical Data Insert
+            
+    def write_test_info_attribute(self,run_uid):
+        with self.con as con:
+            con.execute(
+                """
+                INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced,run_uid)
+                SELECT id, test_name, duration, failed, forced , ?
+                FROM test_execution
+               
+                """,
+                (run_uid,)
+            )
+    def write_increment_run_id_attribute(self):
+        with self.con as con:
+            con.execute(
+                """
+                INSERT INTO run_uid DEFAULT VALUES;
+                """
+            )
+    
+    def write_test_exec_file_fp_infos(self ,run_uid):
+        with self.con as con:
+            con.execute(
+                """
+                INSERT INTO test_execution_file_fp_infos (
+                    test_execution_id,
+                    fingerprint_id,
+                    run_uid
+                )
+                SELECT
+                    test_execution_id,
+                    fingerprint_id,        
+                    ?            
+                FROM test_execution_file_fp 
+                """,
+                (run_uid,)
+            )
+
+            
+    def write_file_fp_infos(self,run_uid):
+        with self.con as con:
+            con.execute(
+                """
+                INSERT INTO file_fp_infos (fingerprint_id,filename, method_checksums, mtime, fsha ,run_uid)
+                SELECT id,filename, method_checksums, mtime, fsha,?
+                FROM file_fp
+                """
+                ,(run_uid,)
+            )
+      
     
     def fetch_attribute(self, attribute, default=None, exec_id=None):
         cursor = self.con.execute(
@@ -370,15 +439,68 @@ class DB:  # pylint: disable=too-many-public-methods
     def _create_metadata_statement(self) -> str:
         return """CREATE TABLE metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
 
+    def create_run_uid_statement(self) ->str:
+           return """CREATE TABLE IF NOT EXISTS run_uid (
+            id INTEGER PRIMARY KEY,
+            repo_run_id INTEGER NULL
+        );"""
+    
     def _create_run_infos_statement(self) -> str:
         return """CREATE TABLE IF NOT EXISTS run_infos (
-            runid INTEGER PRIMARY KEY,
             run_time_saved REAL,
             run_time_all REAL,
             tests_saved INTEGER,
-            tests_all INTEGER
+            tests_all INTEGER ,
+            run_uid INTEGER,
+            FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            
         );"""
+        
+        
+    
+    def _create_test_infos_statement(self) ->str:
+          return f"""
+                CREATE TABLE IF NOT EXISTS test_infos (
+                id INTEGER PRIMARY KEY ASC,
+                test_execution_id INTEGER,
+                test_name TEXT,
+                duration FLOAT,
+                failed BIT,
+                forced BIT,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id));
+                
+            """    
+            
+            
+    def _create__file_fp_infos_statement(self) -> str:
+        return """
+            CREATE TABLE IF NOT EXISTS file_fp_infos (
+                id INTEGER PRIMARY KEY,
+                fingerprint_id INTEGER,
+                filename TEXT,
+                method_checksums BLOB,
+                mtime FLOAT,
+                fsha TEXT,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+        """
+          
+    def _create_test_execution_file_fp_infos_statement(self) -> str:
+        return """
+            CREATE TABLE IF NOT EXISTS test_execution_file_fp_infos (
+                id INTEGER PRIMARY KEY,
+                test_execution_id INTEGER,
+                fingerprint_id INTEGER,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+        """
 
+  
+            
+         
     def _create_environment_statement(self) -> str:
         return """
                 CREATE TABLE environment (
@@ -457,7 +579,13 @@ class DB:  # pylint: disable=too-many-public-methods
             + self._create_temp_tables_statement()
             + self._create_file_fp_statement()
             + self._create_test_execution_ffp_statement() 
+            +self.create_run_uid_statement()
             + self._create_run_infos_statement()
+            +self._create_test_infos_statement()
+            + self._create__file_fp_infos_statement()
+            + self._create_test_execution_file_fp_infos_statement()
+           
+            
         )
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")

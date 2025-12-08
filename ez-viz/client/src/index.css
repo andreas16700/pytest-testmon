@@ -1,3 +1,422 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+.test-management-container {
+    @apply animate-fadeIn p-6 max-w-2xl mx-auto;
+}
+
+.section-heading {
+    @apply text-lg font-medium text-gray-800 mb-2;
+}
+
+.select-tests-container {
+    @apply relative mb-6;
+}
+
+.select-tests-button {
+    @apply flex items-center justify-between w-full px-5 py-2.5 rounded-md text-white text-sm font-medium bg-blue-600 hover:bg-blue-700 transition;
+}
+
+.chevron-icon {
+    @apply ml-2 transition-transform;
+}
+
+.dropdown-list {
+    @apply absolute left-0 right-0 mt-2 bg-white border border-gray-200 shadow-lg rounded-md z-50 max-h-80 overflow-auto;
+}
+
+.search-container {
+    @apply p-2 border-b border-gray-100 sticky top-0 bg-white z-10;
+}
+
+.search-input {
+    @apply w-full px-3 py-2 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500;
+}
+
+.list-item {
+    @apply flex items-center justify-between px-4 py-2.5 hover:bg-gray-50 cursor-pointer;
+}
+
+.item-label {
+    @apply flex items-center gap-3 text-gray-700 text-sm font-medium cursor-pointer;
+}
+
+.item-checkbox {
+    @apply w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 cursor-pointer;
+}
+
+.methods-list {
+    @apply pl-12 pr-4 pb-2 pt-1 bg-gray-50 border-t border-b border-gray-100;
+}
+
+.methods-header {
+    @apply text-xs text-gray-500 font-semibold mb-1;
+}
+
+.method-item {
+    @apply text-xs text-gray-600 truncate py-0.5;
+}
+
+.no-methods {
+    @apply text-xs text-gray-500 italic;
+}
+
+.no-tests-found {
+    @apply px-4 py-3 text-sm text-gray-500 text-center;
+}
+
+.prioritization-section {
+    @apply mb-6;
+}
+
+.section-description {
+    @apply text-gray-500 text-sm mb-4;
+}
+
+.drag-drop-grid {
+    @apply grid grid-cols-2 gap-6;
+}
+
+.droppable-container {
+    @apply bg-gray-50 border border-gray-200 rounded-lg shadow-sm p-3 h-[300px] overflow-y-auto;
+}
+
+.droppable-title {
+    @apply text-gray-700 font-medium mb-2 text-sm;
+}
+
+.draggable-list {
+    @apply space-y-1;
+}
+
+.draggable-item {
+    @apply flex items-start justify-between bg-white px-3 py-2 text-sm text-gray-700 border border-gray-100 cursor-pointer;
+}
+
+.draggable-item-dragging {
+    @apply shadow-lg;
+}
+
+.draggable-item-static {
+    @apply shadow-sm;
+}
+
+.draggable-item-expanded {
+    @apply rounded-b-none;
+}
+
+.draggable-item-collapsed {
+    @apply rounded-md;
+}
+
+.draggable-content {
+    @apply flex items-center flex-1 min-w-0;
+}
+
+.grip-icon {
+    @apply text-gray-400 mr-2 shrink-0;
+}
+
+.file-name {
+    @apply truncate;
+}
+
+.info-icon-container {
+    /* Removed 'group' */
+    @apply relative inline-block ml-2 shrink-0;
+}
+
+.info-icon {
+    @apply text-gray-400 cursor-pointer;
+}
+
+.tooltip {
+    /* Removed 'group-hover:opacity-100' */
+    @apply absolute right-0 -top-8 opacity-0 transition-opacity duration-200 pointer-events-none z-20;
+}
+
+/* Add this new rule to handle the hover effect */
+.info-icon-container:hover .tooltip {
+    opacity: 1;
+}
+
+.tooltip-content {
+    @apply bg-gray-700 text-white text-xs rounded py-1 px-2 whitespace-nowrap relative;
+}
+
+.tooltip-arrow {
+    @apply absolute right-1 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700;
+}
+
+.failed-attempt-message {
+    @apply p-3 text-xs text-red-800 bg-red-100 border-b border-l border-r border-red-400 rounded-b-md -mt-1 shadow-sm;
+}
+
+.draggable-methods-list {
+    @apply pl-8 pr-3 pb-2 pt-1 bg-white border-x border-b border-gray-100 rounded-b-md shadow-sm;
+}
+
+.save-button-container {
+    @apply mb-6 flex gap-4 justify-center;
+}
+
+.save-button {
+    @apply px-6 py-3 bg-indigo-500 text-white rounded-lg font-semibold hover:bg-indigo-600 transition-all flex items-center gap-2;
+}
+
+.tip-box {
+    @apply bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded-md shadow-sm;
+}
+
+.tip-text {
+    @apply text-yellow-800 text-sm leading-relaxed;
+}
+
+.loading-container {
+    @apply flex flex-col justify-center items-center p-6 max-w-2xl mx-auto h-64;
+}
+
+.loading-spinner {
+    @apply animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-600;
+}
+
+.loading-text {
+    @apply text-gray-600 font-medium mt-3;
+}
+
+
+
+/* Test Item Component Styles */
+.test-item-card {
+    @apply bg-white border-2 border-gray-300 rounded-lg p-5 cursor-pointer transition-all hover:border-indigo-500 hover:shadow-lg hover:-translate-y-0.5;
+}
+
+.test-item-header {
+    @apply flex justify-between items-center mb-2;
+}
+
+.run-id-wrapper {
+    @apply flex items-center gap-2;
+}
+
+.run-id-badge {
+    @apply bg-gray-100 border border-gray-200 text-gray-600 text-xs font-mono px-2 py-1 rounded-md whitespace-nowrap;
+}
+
+.hash-symbol {
+    @apply text-gray-400 select-none;
+}
+
+.test-name {
+    @apply text-lg font-semibold text-gray-700 flex-1 break-all ml-2;
+}
+
+.status-badge {
+    @apply px-3 py-1 rounded-full text-xs font-semibold;
+}
+
+.status-failed {
+    @apply bg-red-100 text-red-800;
+}
+
+.status-skipped {
+    @apply bg-yellow-100 text-yellow-800;
+}
+
+.status-success {
+    @apply bg-green-100 text-green-800;
+}
+
+.test-item-footer {
+    @apply flex gap-5 text-sm text-gray-600;
+}
+
+.test-details-env-section {
+    @apply mb-6;
+}
+
+.dependencies-heading {
+    @apply text-gray-700 mb-4 pb-2 border-b-2 border-gray-200 text-xl;
+}
+
+.dependency-card {
+    @apply bg-gray-50 p-4 rounded-lg mb-3 border-l-4 border-indigo-500;
+}
+
+.dependency-filename {
+    @apply font-semibold text-gray-700 mb-2;
+}
+
+.dependency-meta {
+    @apply text-sm text-gray-600 flex gap-5 flex-wrap mb-2;
+}
+
+.dependency-checksums {
+    @apply mt-2 p-2 bg-white rounded text-xs font-mono break-all;
+}
+
+.summary-container {
+    @apply animate-fadeIn;
+}
+
+.summary-inner {
+    @apply max-w-6xl mx-auto p-6;
+}
+
+.summary-header {
+    @apply flex justify-end mb-4;
+}
+
+.mode-switch-button {
+    @apply flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors shadow-sm;
+}
+
+.comparison-card {
+    @apply bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden mb-8;
+}
+
+.comparison-selectors {
+    @apply bg-gray-50 p-6 border-b border-gray-200 grid grid-cols-1 md:grid-cols-2 gap-8;
+}
+
+.selector-label {
+    @apply block text-sm font-medium text-gray-700 mb-2;
+}
+
+.selector-dropdown {
+    @apply w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500;
+}
+
+.comparison-content {
+    @apply p-6 grid grid-cols-1 md:grid-cols-2 gap-8;
+}
+
+.comparison-section-title {
+    @apply font-semibold text-gray-600 mb-4;
+}
+
+.comparison-table {
+    @apply w-full text-sm text-left;
+}
+
+.comparison-table-head {
+    @apply text-xs text-gray-500 uppercase bg-gray-50;
+}
+
+.comparison-table-header-cell {
+    @apply px-4 py-2;
+}
+
+.comparison-table-header-run-a {
+    @apply text-blue-600;
+}
+
+.comparison-table-header-run-b {
+    @apply text-green-600;
+}
+
+.comparison-table-body {
+    @apply divide-y divide-gray-100;
+}
+
+.comparison-table-cell {
+    @apply px-4 py-3 font-medium text-gray-900;
+}
+
+.comparison-table-cell-mono {
+    @apply px-4 py-3 font-mono;
+}
+
+.comparison-table-cell-diff {
+    @apply px-4 py-3 font-mono font-bold;
+}
+
+.comparison-chart-container {
+    @apply h-64;
+}
+
+.run-selection-section {
+    @apply mb-8;
+}
+
+.run-selection-title {
+    @apply text-lg font-semibold text-gray-700 mb-3;
+}
+
+.run-selection-grid {
+    @apply flex flex-wrap gap-3;
+}
+
+.run-card {
+    @apply relative flex flex-col p-3 rounded-lg border cursor-pointer transition-all w-40;
+}
+
+.run-card-selected {
+    @apply border-indigo-600 bg-indigo-50 ring-1 ring-indigo-600;
+}
+
+.run-card-unselected {
+    @apply border-gray-200 bg-white hover:border-gray-300;
+}
+
+.run-card-header {
+    @apply flex justify-between items-center mb-1;
+}
+
+.run-card-label {
+    @apply text-xs font-bold text-gray-500;
+}
+
+.run-card-id {
+    @apply font-mono font-bold text-gray-800 truncate;
+}
+
+.stats-grid {
+    @apply grid grid-cols-1 md:grid-cols-3 gap-5 mb-8;
+}
+
+.charts-grid {
+    @apply grid grid-cols-1 md:grid-cols-2 gap-5;
+}
+
+.chart-card {
+    @apply bg-white p-5 rounded-lg shadow;
+}
+
+.chart-title {
+    @apply text-gray-700 mb-4 text-lg font-semibold text-center;
+}
+
+.chart-wrapper {
+    @apply flex justify-center;
+}
+
+.env-info-card {
+    @apply bg-gray-50 p-5 rounded-lg border-l-4 border-indigo-500 mt-5;
+}
+
+.env-info-title {
+    @apply text-gray-700 mb-4 text-lg font-semibold;
+}
+
+/* Tabs Component Styles */
+.tabs-container {
+    @apply flex bg-gray-50 border-b-2 border-gray-200;
+}
+
+.tab-button {
+    @apply flex-1 p-5 text-center font-semibold transition-all relative;
+}
+
+.tab-button-active {
+    @apply text-indigo-500 bg-white;
+}
+
+.tab-button-inactive {
+    @apply text-gray-500 hover:bg-indigo-50 hover:text-indigo-500;
+}
+
+.tab-indicator {
+    @apply absolute bottom-0 left-0 right-0 h-0.5 bg-indigo-500;
+}
