@@ -415,3 +415,235 @@
 .tab-indicator {
     @apply absolute bottom-0 left-0 right-0 h-0.5 bg-indigo-500;
 }
+/* ...existing code... */
+
+/* Test Results Summary Styles */
+.test-results-summary {
+    background: #1a1a2e;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 24px;
+    border: 1px solid #2a2a4a;
+}
+
+.summary-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+@media (max-width: 768px) {
+    .summary-stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.stat-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 8px;
+    background: #252545;
+}
+
+.stat-card.passed { color: #4ade80; }
+.stat-card.failed { color: #f87171; }
+.stat-card.total { color: #60a5fa; }
+.stat-card.duration { color: #fbbf24; }
+
+.stat-info {
+    display: flex;
+    flex-direction: column;
+}
+
+.stat-value {
+    font-size: 1.5rem;
+    font-weight: bold;
+}
+
+.stat-label {
+    font-size: 0.75rem;
+    opacity: 0.7;
+}
+
+.pass-rate-container {
+    margin-bottom: 20px;
+}
+
+.pass-rate-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    font-size: 0.875rem;
+    color: #e5e5e5;
+}
+
+.pass-rate-value {
+    font-weight: bold;
+    color: #4ade80;
+}
+
+.pass-rate-bar {
+    height: 8px;
+    background: #374151;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.pass-rate-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #4ade80, #22c55e);
+    transition: width 0.3s ease;
+}
+
+.failed-tests-section {
+    background: #2a1a1a;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+.failed-tests-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #f87171;
+    margin: 0 0 12px 0;
+    font-size: 0.95rem;
+}
+
+.failed-tests-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.failed-test-item {
+    padding: 8px 0;
+    border-bottom: 1px solid #3f1d1d;
+}
+
+.failed-test-item:last-child {
+    border-bottom: none;
+}
+
+.failed-test-name {
+    font-weight: 500;
+    margin-bottom: 4px;
+    color: #fca5a5;
+    font-size: 0.875rem;
+}
+
+.failed-test-message {
+    margin-top: 4px;
+}
+
+.failed-test-message code {
+    font-size: 0.75rem;
+    color: #fca5a5;
+    background: #1a0a0a;
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: block;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.test-files-breakdown {
+    margin-top: 16px;
+}
+
+.breakdown-title {
+    margin: 0 0 12px 0;
+    font-size: 0.95rem;
+    color: #e5e5e5;
+}
+
+.breakdown-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.breakdown-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    background: #252545;
+    border-radius: 4px;
+}
+
+.breakdown-file {
+    font-size: 0.875rem;
+    color: #c5c5c5;
+}
+
+.breakdown-stats {
+    display: flex;
+    gap: 8px;
+}
+
+.breakdown-passed { 
+    color: #4ade80; 
+    font-size: 0.875rem;
+}
+
+.breakdown-failed { 
+    color: #f87171; 
+    font-size: 0.875rem;
+}
+
+.run-info {
+    display: flex;
+    gap: 16px;
+    margin-top: 16px;
+    font-size: 0.75rem;
+    color: #888;
+    padding-top: 12px;
+    border-top: 1px solid #2a2a4a;
+}
+
+.summary-loading {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 24px;
+    color: #888;
+}
+
+.summary-loading .loading-spinner.small {
+    width: 20px;
+    height: 20px;
+    border-width: 2px;
+}
+
+.summary-error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px;
+    color: #f87171;
+    background: #2a1a1a;
+    border-radius: 8px;
+}
+
+.no-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px;
+    color: #888;
+}
+
+.summary-content {
+    animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
