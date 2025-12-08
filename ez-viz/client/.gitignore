@@ -24,3 +24,5 @@ dist-ssr
 
 ez-viz/dev-setup.ps1
 ez-viz/sync_prod_data.py
+
+vite.config.js
