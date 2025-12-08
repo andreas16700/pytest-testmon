@@ -167,7 +167,6 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                                                 }
                                             } else {
                                                 const remainingRuns = currentRuns.filter(id => id != run.id);
-                
                                                 onRunChange(remainingRuns);
                                                 setSummary(prev => prev.filter(item => item.run_id != run.id));
                                                 setAllTests(prev => prev.filter(item => item.run_id !=run.id));

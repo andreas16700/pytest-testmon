@@ -42,7 +42,7 @@ function MainContent({loading, error, summary, allTests, allFiles, activeTab, se
                 )}
 
                 {activeTab === 'files' && (
-                    <FilesTab allFiles={allFiles} search={fileSearch} setSearch={setFileSearch} showFileDetails={showFileDetails}/>
+                    <FilesTab currentRepo={currentRepo} allFiles={allFiles} search={fileSearch} setSearch={setFileSearch} showFileDetails={showFileDetails}/>
                 )}
 
                 {activeTab === 'management' && (

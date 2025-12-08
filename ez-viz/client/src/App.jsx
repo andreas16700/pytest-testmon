@@ -32,7 +32,6 @@ function App() {
         loadRepos();
     }, []);
 
-
     useEffect(() => {
         if (currentRepo && currentJob && currentRuns.length > 0) {
             loadData();
@@ -59,19 +58,14 @@ function App() {
                 credentials: "include"
             });
             const systemData = await response.json();
-            
             const systemRepos = systemData.repos || [];
-
             const userRepos = await loggedUserRepos();
             if (!userRepos) {
                 setError("Failed to load user repositories");
                 return;
             }
-            
             const userRepoNames = new Set(userRepos.map(r => r.full_name));
-
             const matching = systemRepos.filter(repo => userRepoNames.has(repo.name));
-
             setRepos(matching);
         } catch (err) {
             console.error('Failed to load repos:', err);
@@ -87,7 +81,6 @@ function App() {
             if (!resp.ok) return null;
 
             return await resp.json();
-
         } catch (err) {
             console.error("Failed to fetch repositories:", err);
             return null;
@@ -171,11 +164,9 @@ function App() {
             console.error("Logout failed:", err);
         }
     };
+
     const selectedRepo = repos.find(r => r.id === currentRepo);
     const selectedJob = selectedRepo && selectedRepo.jobs.find(r => r.id === currentJob);
-
-
-
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-indigo-500 to-purple-600 p-5">
