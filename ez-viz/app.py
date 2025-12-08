@@ -1049,123 +1049,288 @@ def get_test_preferences():
         log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read preferences"}), 500
     
-@app.route("/api/client/testResults", methods=["POST"])
-def upload_test_results():
-    """Store test execution results from CI/CD"""
+
+# -----------------------------------------------------------------------------
+# Pytest JSON Report Storage
+# -----------------------------------------------------------------------------
+
+
+def get_pytest_report_path(repo_id: str, job_id: str, run_id: str) -> Path:
+    """Get path for storing pytest JSON report inside job folder"""
+    repo_path = get_repo_path(repo_id)
+    safe_job_id = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
+    safe_run_id = "".join(c for c in run_id if c.isalnum() or c in ("-", "_"))
     
+    job_path = repo_path / safe_job_id
+    if not job_path.exists():
+        log.info(
+            "job_dir_create_attempt repo_id=%s job_id=%s path=%s",
+            repo_id, job_id, job_path,
+        )
+        job_path.mkdir(parents=True, exist_ok=True)
+        log.info("job_dir_create_success path=%s", job_path)
+    
+    # Store as pytest_report_{run_id}.json in the job folder
+    return job_path / f"pytest_report_{safe_run_id}.json"
+
+
+
+@app.route("/api/client/pytest-report", methods=["POST"])
+def upload_pytest_report():
+    """Store pytest JSON report from CI/CD"""
     data = request.get_json()
-    repo_id = data.get("repo_id")
-    job_id = data.get("job_id")
-    run_id = data.get("run_id")
-    test_results = data.get("test_results", {})  # Dict with test names as keys
+    
+    if not data:
+        log.warning("pytest_report_missing_data")
+        return jsonify({"error": "No JSON data provided"}), 400
+    
+    repo_id = request.args.get("repo_id") or data.get("repo_id")
+    job_id = request.args.get("job_id") or data.get("job_id")
+    run_id = request.args.get("run_id") or data.get("run_id")
     
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
-
+    
     if not repo_id or not job_id or not run_id:
-        log.warning("test_results_missing_params")
+        log.warning("pytest_report_missing_params")
         return jsonify({"error": "repo_id, job_id, and run_id are required"}), 400
-
-    if not isinstance(test_results, dict):
-        log.warning("test_results_invalid_format")
-        return jsonify({"error": "test_results must be an object"}), 400
-
+    
     try:
-        # Create results file path
-        job_path = get_job_db_path(repo_id, job_id).parent
-        results_dir = job_path / "test_results"
-        results_dir.mkdir(exist_ok=True)
+        # Register repo/job in metadata
+        register_repo_job(repo_id, job_id)
         
-        results_path = results_dir / f"{run_id}.json"
+        # Save the pytest report
+        report_path = get_pytest_report_path(repo_id, job_id, run_id)
         
-        log.info(
-            "test_results_write_attempt path=%s test_count=%s", 
-            results_path, 
-            len(test_results)
-        )
+        log.info("pytest_report_write_attempt dest=%s", report_path)
+        with open(report_path, "w") as f:
+            json.dump(data, f, indent=2)
         
-        # Store results with metadata
-        results_data = {
+        size = report_path.stat().st_size
+        log.info("pytest_report_write_success dest=%s size=%s (%s)", 
+                 report_path, size, human_bytes(size))
+        
+        # Update metadata with run info
+        metadata = get_metadata()
+        if repo_id in metadata["repos"] and job_id in metadata["repos"][repo_id]["jobs"]:
+            job_meta = metadata["repos"][repo_id]["jobs"][job_id]
+            if "runs" not in job_meta:
+                job_meta["runs"] = {}
+            job_meta["runs"][run_id] = {
+                "created": now_iso(),
+                "summary": data.get("summary", {}),
+                "duration": data.get("duration"),
+                "exitcode": data.get("exitcode"),
+            }
+            job_meta["last_updated"] = now_iso()
+            save_metadata(metadata)
+        
+        return jsonify({
+            "success": True,
             "repo_id": repo_id,
             "job_id": job_id,
             "run_id": run_id,
-            "test_results": test_results,
-            "total_tests": len(test_results),
-            "passed": sum(1 for r in test_results.values() if r.get("outcome") == "passed"),
-            "failed": sum(1 for r in test_results.values() if r.get("outcome") == "failed"),
-            "uploaded_at": now_iso(),
-        }
-        
-        with open(results_path, "w") as f:
-            json.dump(results_data, f, indent=2)
-        
-        size = results_path.stat().st_size
-        log.info(
-            "test_results_write_success path=%s size=%s (%s) test_count=%s",
-            results_path,
-            size,
-            human_bytes(size),
-            len(test_results)
-        )
-
-        return jsonify({
-            "success": True,
-            "message": f"Test results saved for {repo_id}/{job_id}/{run_id}",
-            "test_count": len(test_results),
-            "passed": results_data["passed"],
-            "failed": results_data["failed"],
-        }), 200
-
-    except Exception:
-        log_exception("test_results_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
-        return jsonify({"error": "Failed to save test results"}), 500
-
-
-@app.route("/api/client/testResults", methods=["GET"])
-def get_test_results():
-    """Retrieve test execution results for a specific run"""
+            "tests_stored": len(data.get("tests", [])),
+        })
     
+    except Exception:
+        log_exception("pytest_report_upload", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        return jsonify({"error": "Failed to store pytest report"}), 500
+
+
+@app.route("/api/client/pytest-report", methods=["GET"])
+def get_pytest_report():
+    """Retrieve pytest JSON report"""
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
     run_id = request.args.get("run_id")
     
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
-
+    
     if not repo_id or not job_id or not run_id:
-        log.warning("test_results_get_missing_params")
+        log.warning("pytest_report_get_missing_params")
         return jsonify({"error": "repo_id, job_id, and run_id are required"}), 400
-
+    
+    report_path = get_pytest_report_path(repo_id, job_id, run_id)
+    
+    if not report_path.exists():
+        log.warning("pytest_report_not_found path=%s", report_path)
+        return jsonify({"error": "Report not found"}), 404
+    
     try:
-        job_path = get_job_db_path(repo_id, job_id).parent
-        results_path = job_path / "test_results" / f"{run_id}.json"
+        with open(report_path, "r") as f:
+            data = json.load(f)
+        log.info("pytest_report_read_success path=%s", report_path)
+        return jsonify(data)
+    except Exception:
+        log_exception("pytest_report_read", path=str(report_path))
+        return jsonify({"error": "Failed to read pytest report"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-summary", methods=["GET"])
+def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
+    """Get summary of pytest run from stored JSON report"""
+    g.repo_id, g.job_id = repo_id, job_id
+    
+    report_path = get_pytest_report_path(repo_id, job_id, run_id)
+    
+    if not report_path.exists():
+        log.warning("pytest_summary_not_found path=%s", report_path)
+        return jsonify({"error": "Report not found"}), 404
+    
+    try:
+        with open(report_path, "r") as f:
+            data = json.load(f)
         
-        log.info("test_results_read_attempt path=%s", results_path)
+        summary = data.get("summary", {})
+        tests = data.get("tests", [])
         
-        if not results_path.exists():
-            log.info("test_results_not_found path=%s", results_path)
-            return jsonify({
-                "repo_id": repo_id,
-                "job_id": job_id,
-                "run_id": run_id,
-                "test_results": {},
-                "uploaded_at": None,
-            }), 200
-        
-        with open(results_path, "r") as f:
-            results_data = json.load(f)
-        
-        size = results_path.stat().st_size
-        log.info(
-            "test_results_read_success path=%s size=%s (%s)",
-            results_path,
-            size,
-            human_bytes(size)
+        # Calculate additional metrics
+        total_duration = sum(
+            t.get("setup", {}).get("duration", 0) +
+            t.get("call", {}).get("duration", 0) +
+            t.get("teardown", {}).get("duration", 0)
+            for t in tests
         )
         
-        return jsonify(results_data), 200
-
+        # Group tests by file
+        test_files = {}
+        for test in tests:
+            nodeid = test.get("nodeid", "")
+            file_name = nodeid.split("::")[0] if "::" in nodeid else nodeid
+            if file_name not in test_files:
+                test_files[file_name] = {"passed": 0, "failed": 0, "total": 0}
+            test_files[file_name]["total"] += 1
+            if test.get("outcome") == "passed":
+                test_files[file_name]["passed"] += 1
+            elif test.get("outcome") == "failed":
+                test_files[file_name]["failed"] += 1
+        
+        # Get failed test details
+        failed_tests = [
+            {
+                "nodeid": t.get("nodeid"),
+                "lineno": t.get("lineno"),
+                "message": t.get("call", {}).get("crash", {}).get("message"),
+                "longrepr": t.get("call", {}).get("longrepr"),
+            }
+            for t in tests if t.get("outcome") == "failed"
+        ]
+        
+        result = {
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "run_id": run_id,
+            "created": data.get("created"),
+            "duration": data.get("duration"),
+            "exitcode": data.get("exitcode"),
+            "root": data.get("root"),
+            "summary": {
+                "passed": summary.get("passed", 0),
+                "failed": summary.get("failed", 0),
+                "total": summary.get("total", 0),
+                "collected": summary.get("collected", 0),
+            },
+            "total_test_duration": total_duration,
+            "test_files": test_files,
+            "file_count": len(test_files),
+            "failed_tests": failed_tests,
+        }
+        
+        log.info("pytest_summary_success repo=%s job=%s run=%s", repo_id, job_id, run_id)
+        return jsonify(result)
+    
     except Exception:
-        log_exception("test_results_get_handler", repo_id=repo_id, job_id=job_id, run_id=run_id)
-        return jsonify({"error": "Failed to read test results"}), 500
+        log_exception("pytest_summary_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        return jsonify({"error": "Failed to read pytest summary"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-tests", methods=["GET"])
+def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
+    """Get all tests from pytest JSON report"""
+    g.repo_id, g.job_id = repo_id, job_id
+    
+    report_path = get_pytest_report_path(repo_id, job_id, run_id)
+    
+    if not report_path.exists():
+        log.warning("pytest_tests_not_found path=%s", report_path)
+        return jsonify({"error": "Report not found"}), 404
+    
+    try:
+        with open(report_path, "r") as f:
+            data = json.load(f)
+        
+        tests = []
+        for t in data.get("tests", []):
+            test_duration = (
+                t.get("setup", {}).get("duration", 0) +
+                t.get("call", {}).get("duration", 0) +
+                t.get("teardown", {}).get("duration", 0)
+            )
+            tests.append({
+                "nodeid": t.get("nodeid"),
+                "lineno": t.get("lineno"),
+                "outcome": t.get("outcome"),
+                "duration": test_duration,
+                "keywords": t.get("keywords", []),
+                "failed": t.get("outcome") == "failed",
+                "error_message": t.get("call", {}).get("crash", {}).get("message") if t.get("outcome") == "failed" else None,
+            })
+        
+        log.info("pytest_tests_success count=%s", len(tests))
+        return jsonify({
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "run_id": run_id,
+            "tests": tests,
+        })
+    
+    except Exception:
+        log_exception("pytest_tests_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        return jsonify({"error": "Failed to read pytest tests"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/runs", methods=["GET"])
+def list_runs(repo_id: str, job_id: str):
+    """List all runs for a specific repo/job"""
+    g.repo_id, g.job_id = repo_id, job_id
+    
+    try:
+        metadata = get_metadata()
+        
+        if repo_id not in metadata.get("repos", {}):
+            return jsonify({"error": "Repository not found"}), 404
+        
+        if job_id not in metadata["repos"][repo_id].get("jobs", {}):
+            return jsonify({"error": "Job not found"}), 404
+        
+        job_meta = metadata["repos"][repo_id]["jobs"][job_id]
+        runs = []
+        
+        for run_id, run_data in job_meta.get("runs", {}).items():
+            runs.append({
+                "run_id": run_id,
+                "created": run_data.get("created"),
+                "summary": run_data.get("summary", {}),
+                "duration": run_data.get("duration"),
+                "exitcode": run_data.get("exitcode"),
+            })
+        
+        # Sort by created date, newest first
+        runs.sort(key=lambda x: x.get("created", ""), reverse=True)
+        
+        log.info("list_runs_success repo=%s job=%s count=%s", repo_id, job_id, len(runs))
+        return jsonify({
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "runs": runs,
+        })
+    
+    except Exception:
+        log_exception("list_runs", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to list runs"}), 500
+
+
+
 # -----------------------------------------------------------------------------
 # WEB + Health - UPDATED FOR REACT
 # -----------------------------------------------------------------------------
