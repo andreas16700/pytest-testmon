@@ -12,6 +12,8 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
+from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync
+
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
 
@@ -138,6 +140,11 @@ def testmon_options(config):
     return result
 
 
+
+def get_testmon_file(config: Config) -> Path:
+    return Path(config.rootdir.strpath) / ".testmondata"
+
+
 def init_testmon_data(config: Config):
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
@@ -146,43 +153,15 @@ def init_testmon_data(config: Config):
 
     system_packages = get_system_packages(ignore=ignore_dependencies)
 
-    url = config.getini("tmnet_url")
-    rpc_proxy = None
-
-    if config.testmon_config.tmnet or getattr(config, "tmnet", None):
-        rpc_proxy = getattr(config, "tmnet", None)
-
-        if not url:
-            url = "https://api1.testmon.net/"
-        if not rpc_proxy:
-            tmnet_api_key = config.getini("tmnet_api_key")
-            if "TMNET_API_KEY" in os.environ:
-                if tmnet_api_key:
-                    logger.warning(
-                        "Duplicate TMNET_API_KEY (environment and ini file). \
-                         Using TMNET_API_KEY from %s",
-                        config.inipath,
-                    )
-                else:
-                    tmnet_api_key = os.getenv("TMNET_API_KEY")
-            elif tmnet_api_key is None:
-                logger.warning(
-                    "TMNET_API_KEY not set.",
-                )
-            rpc_proxy = xmlrpc.client.ServerProxy(
-                url,
-                allow_none=True,
-                headers=[("x-api-key", tmnet_api_key)],
-            )
-
+    
     testmon_data = TestmonData(
         rootdir=config.rootdir.strpath,
-        database=rpc_proxy,
+        database=None,
         environment=environment,
         system_packages=system_packages,
         readonly=get_running_as(config) == "worker",
     )
-    testmon_data.determine_stable(bool(rpc_proxy))
+    testmon_data.determine_stable(bool(None))
     config.testmon_data = testmon_data
 
 
@@ -220,6 +199,32 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
 
 
 def pytest_configure(config):
+    # Download testmon data from server if configured
+    logger.info("NEW VERSION")
+    if should_sync():
+        testmon_file = get_testmon_file(config)
+        
+        # Check if file exists BEFORE download
+        before_exists = testmon_file.exists()
+        before_size = testmon_file.stat().st_size if before_exists else 0
+        
+        logger.info(f"🔍 Before download: exists={before_exists}, size={before_size}")
+        
+        downloaded = download_testmon_data(testmon_file)
+        
+        # Check if file exists AFTER download
+        after_exists = testmon_file.exists()
+        after_size = testmon_file.stat().st_size if after_exists else 0
+        
+        logger.info(f"🔍 After download: downloaded={downloaded}, exists={after_exists}, size={after_size}")
+        
+        if downloaded and after_exists and after_size > 0:
+            logger.info(f"✅ Using downloaded .testmondata ({after_size:,} bytes)")
+        elif after_exists and after_size > 0:
+            logger.info(f"ℹ️  Using existing .testmondata ({after_size:,} bytes)")
+        else:
+            logger.info("ℹ️  Starting with new .testmondata (first run)")
+    
     coverage_stack = None
     try:
         from tmnet.testmon_core import (  # pylint: disable=import-outside-toplevel
@@ -315,9 +320,47 @@ def changed_message(
     return message
 
 
+
 def pytest_unconfigure(config):
+    # Close and commit database FIRST (flush all changes to disk)
     if hasattr(config, "testmon_data"):
-        config.testmon_data.close_connection()
+        try:
+            if hasattr(config.testmon_data, 'db') and hasattr(config.testmon_data.db, 'con'):
+                # 1. Commit changes
+                config.testmon_data.db.con.commit()
+                logger.info("💾 Database committed")
+                
+                # 2. CRITICAL: Close the connection to force WAL checkpoint
+                # This merges .testmondata-wal into .testmondata
+                config.testmon_data.db.con.close()
+                logger.info("🔒 SQLite connection closed (WAL checkpointed)")
+                
+                # Prevent double closing
+                config.testmon_data.db.con = None
+            
+            # Call the class method (even if empty)
+            config.testmon_data.close_connection()
+            
+        except Exception as e:
+            logger.warning(f"Failed to close testmon database: {e}")
+
+    # Only upload from main process (not xdist workers)
+    if get_running_as(config) not in ("single", "controller"):
+        return
+
+    # Upload if sync is enabled - AFTER database is committed and closed
+    if should_sync():
+        testmon_file = get_testmon_file(config)
+        
+        # Give file system time to flush
+        time.sleep(0.2)
+        
+        if testmon_file.exists() and testmon_file.stat().st_size > 0:
+            logger.info(f"📦 Uploading: {testmon_file.stat().st_size:,} bytes")
+            repo_name = os.getenv("GITHUB_REPOSITORY") or os.getenv("REPO_ID") or "unknown"
+            upload_testmon_data(testmon_file, repo_name)
+        else:
+            logger.info("No testmon data to upload")
 
 
 class TestmonCollect:

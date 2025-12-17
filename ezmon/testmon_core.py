@@ -224,9 +224,14 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         return self.db.file_created
 
     def close_connection(self):
-        pass
-        # TODO this is why there are "too many open files" on MacOS.
-        # we need the leave the connection open for tests
+        if hasattr(self, 'db') and self.db:
+            try:
+                # Ensure all changes are committed to disk
+                if hasattr(self.db, 'con') and self.db.con:
+                    self.db.con.commit()
+                    logger.info("✅ Database committed successfully")
+            except Exception as e:
+                logger.warning(f"Failed to commit database: {e}")
 
     @property
     def all_tests(self):
