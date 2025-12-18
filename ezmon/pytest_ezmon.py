@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync
-
+from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
 
@@ -199,32 +199,18 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
 
 
 def pytest_configure(config):
-    # Download testmon data from server if configured
-    logger.info("NEW VERSION")
+    # Initialize default
+    config.always_run_files = []
+
     if should_sync():
+        # 1. Fetch preferences (Always Run Tests)
+        prefs = get_test_preferences()
+        config.always_run_files = list(prefs.get("always_run_tests", []))
+        
+        # 2. Download testmon data
         testmon_file = get_testmon_file(config)
-        
-        # Check if file exists BEFORE download
-        before_exists = testmon_file.exists()
-        before_size = testmon_file.stat().st_size if before_exists else 0
-        
-        logger.info(f"🔍 Before download: exists={before_exists}, size={before_size}")
-        
         downloaded = download_testmon_data(testmon_file)
         
-        # Check if file exists AFTER download
-        after_exists = testmon_file.exists()
-        after_size = testmon_file.stat().st_size if after_exists else 0
-        
-        logger.info(f"🔍 After download: downloaded={downloaded}, exists={after_exists}, size={after_size}")
-        
-        if downloaded and after_exists and after_size > 0:
-            logger.info(f"✅ Using downloaded .testmondata ({after_size:,} bytes)")
-        elif after_exists and after_size > 0:
-            logger.info(f"ℹ️  Using existing .testmondata ({after_size:,} bytes)")
-        else:
-            logger.info("ℹ️  Starting with new .testmondata (first run)")
-    
     coverage_stack = None
     try:
         from tmnet.testmon_core import (  # pylint: disable=import-outside-toplevel
@@ -516,30 +502,72 @@ class TestmonSelect:
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), config.rootdir.strpath)
+        
+        # Check if this file is in the "always run" list
+        always_run_files = getattr(config, "always_run_files", [])
+
+        is_forced = any(strpath.endswith(f) for f in always_run_files)
+        
+        if is_forced:
+            return None  # Don't ignore - force collection
+        
         if strpath in self.deselected_files and self.config.testmon_config.select:
             return True
         return None
 
     @pytest.hookimpl(trylast=True)
-    def pytest_collection_modifyitems(
-        self, session, config, items
-    ):  # pylint: disable=unused-argument
-        selected = []
+    def pytest_collection_modifyitems(self, session, config, items):
+        always_run_files = getattr(config, "always_run_files", [])
+
+        forced_by_file = {f: [] for f in always_run_files}
+        normal_selected = []
         deselected = []
+        forced_count = 0
+
+        def source_order_key(i):
+            path, lineno, name = i.location
+            return (path, lineno, name)
+
         for item in items:
+            item_path = str(item.fspath)
+
+            matched_forced = None
+            for f in always_run_files:  # preserves server order
+                if item_path.endswith(f):
+                    matched_forced = f
+                    break
+
+            if matched_forced:
+                forced_by_file[matched_forced].append(item)
+                if item.nodeid in self.deselected_tests:
+                    forced_count += 1
+                continue
+
             if item.nodeid in self.deselected_tests:
                 deselected.append(item)
             else:
-                selected.append(item)
+                normal_selected.append(item)
 
-        sort_items_by_duration(selected, self.testmon_data.avg_durations)
+        # 1) Forced: file order + source order (DO NOT duration-sort these)
+        forced = []
+        for f in always_run_files:
+            forced_by_file[f].sort(key=source_order_key)
+            forced.extend(forced_by_file[f])
+
+        # 2) Normal selected: duration priority (your existing testmon behavior)
+        sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
+
+        selected = forced + normal_selected
 
         if self.config.testmon_config.select:
             items[:] = selected
             session.config.hook.pytest_deselected(
                 items=([FakeItemFromTestmon(session.config)] * len(deselected))
             )
+            if forced_count > 0:
+                logger.info(f" Forced {forced_count} tests from always_run list")
         else:
+            # 3) In noselect mode: also prioritize deselected by duration
             sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
 

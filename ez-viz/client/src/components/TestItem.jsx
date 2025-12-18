@@ -21,7 +21,7 @@ function TestItem({ test, runId, onClick }) {
                 </div>
                 <div className="test-name">{test.test_name}</div>
                 <span className={`status-badge ${getStatusClass()}`}>
-                    {test.forced === 0 ? <p>Executed</p> : <p>Skipped</p>}
+                    {test.forced === 0 || test.forced===1 ? <p>Executed</p> : <p>Skipped</p>}
                 </span>
             </div>
             <div className="test-item-footer">

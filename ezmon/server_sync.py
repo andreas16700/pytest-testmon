@@ -3,6 +3,7 @@ Functions to sync testmon data with remote server
 """
 import os
 import sqlite3
+import json
 from pathlib import Path
 from typing import Optional, Dict
 from ezmon.common import get_logger
@@ -113,7 +114,35 @@ def download_testmon_data(testmon_file: Path) -> bool:
 
 
 
+def get_test_preferences() -> dict:
+    """
+    Download test_preferences.json from server.
+    Returns dict with 'always_run_tests' list.
+    """
+    if not should_sync():
+        return {"always_run_tests": []}
 
+    env_vars = get_env_vars()
+    server_url = env_vars["server_url"]
+    repo_id = env_vars["repo_id"]
+    job_id = env_vars["job_id"]
+    
+    # Assuming an endpoint exists for this, or we construct the URL
+    url = f"{server_url}/api/client/testPreferences?repo_id={repo_id}&job_id={job_id}"
+    
+    logger.info(f" Fetching test preferences...")
+    
+    try:
+        req = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode())
+                logger.info(f"✅ Loaded preferences. Always run: {len(data.get('always_run_tests', []))} files")
+                return data
+    except Exception as e:
+        logger.warning(f" Could not fetch preferences: {e}")
+    
+    return {"always_run_tests": []}
 
 def upload_testmon_data(testmon_file: Path, repo_name: Optional[str] = None) -> bool:
     """

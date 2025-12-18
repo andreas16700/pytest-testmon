@@ -1,7 +1,6 @@
 import React, {useEffect, useState} from "react";
 import {Save, ChevronDown, GripVertical, Info, TrendingUp} from "lucide-react";
 import {DragDropContext, Droppable, Draggable} from "@hello-pangea/dnd";
-import PriorityTestResults from "./PriorityTestResults";
 
 
 const API_BASE = '/api';
@@ -157,46 +156,9 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
     return (loading ?
         <div className="test-management-container">
             <h3 className="section-heading">Manage Tests</h3>
-            
-            {/* Header with Show Previous Run Button */}
-            <div style={{
-                display: 'flex',
-                justifyContent: 'flex-end',
-                marginBottom: '16px'
-            }}>
-                <button
-                    onClick={() => setShowPreviousRun(!showPreviousRun)}
-                    style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '8px',
-                        padding: '10px 16px',
-                        backgroundColor: showPreviousRun ? '#4f46e5' : 'white',
-                        color: showPreviousRun ? 'white' : '#4f46e5',
-                        border: '1px solid #4f46e5',
-                        borderRadius: '6px',
-                        cursor: 'pointer',
-                        fontSize: '14px',
-                        fontWeight: '500',
-                        transition: 'all 0.2s'
-                    }}
-                >
-                    <TrendingUp size={18} />
-                    {showPreviousRun ? 'Hide Statistics' : 'Show Previous Run Statistics'}
-                </button>
-            </div>
+         
 
-            {/* Summary Section - Show/Hide based on button */}
-            {showPreviousRun && (
-                <PriorityTestResults 
-                    testFileList={testFileList}
-                    alwaysRunTests={alwaysRunTests}
-                    prioritizedTests={prioritizedTests}
-                    currentRepo={currentRepo}
-                    currentJob={currentJob}
-                    currentRuns={currentRuns}
-                />
-            )}
+        
 
             <div className="select-tests-container">
                 <button

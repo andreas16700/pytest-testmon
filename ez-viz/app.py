@@ -461,6 +461,7 @@ def upload_testmon_data():
     job_id = request.form.get("job_id")
     repo_name = request.form.get("repo_name")
     run_id= request.form.get("run_id")
+    
     # Enrich per-request context for logging
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -923,9 +924,6 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
             """,
             (run_id,)
         ).fetchall()
-
-
-
         conn.close()
         log.info("files_list_success count=%s", len(files))
 
@@ -936,16 +934,49 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
         return jsonify({"error": "Failed to read files"}), 500
 
 
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<file_name>", methods=["GET"])
+def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
+    g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
+
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    if resp:
+        return resp, code
+
+    try:
+        conn = get_db_connection(db_path, readonly=True)
+        conn.row_factory = sqlite3.Row
+        files = conn.execute(
+            """
+            SELECT  tei.test_name , tei.duration , tei.failed , tei.forced 
+            FROM file_fp_infos fpi
+            JOIN test_execution_file_fp_infos tefi
+            ON tefi.fingerprint_id = fpi.fingerprint_id
+            AND tefi.run_uid        = fpi.run_uid
+            JOIN test_infos tei
+            ON tei.test_execution_id      = tefi.test_execution_id
+            AND tei.run_uid = fpi.run_uid
+            WHERE fpi.run_uid  = (SELECT id FROM run_uid WHERE repo_run_id = ?)
+            AND fpi.filename = ?
+            ORDER BY tei.test_name
+            """,
+            (run_id, file_name)
+
+        ).fetchall()
+        conn.close()
+        log.info("files_list_success count=%s", len(files))
+
+        return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
+
+    except Exception:
+        log_exception("files_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to read files"}), 500
+
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():
     """Store user's test preferences (which tests to always run)"""
     
     # Get data from request body (JSON)
     data = request.get_json()
-    if len(data)>0:
-        log.info("TEST PREFERENCES !!!!!!!!"  ,data.keys())
-    else:
-          log.info("TEST PREFERENCES length is 0 !!!!!!!!" , )    
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
     

@@ -137,21 +137,25 @@ function App() {
         }
     };
 
-    const showFileDetails = (filename) => {
+     const showFileDetails = async (filename , run_id) => {
         // Get tests only from the selected run
-        const selectedRunTests = allTests.find(run => run.run_id == selectedRunId);
-        const testsFromSelectedRun = selectedRunTests?.tests || [];
-        
-        const relatedTests = testsFromSelectedRun.filter(t =>
-            t.test_name.includes(filename.replace('.py', ''))
-        );
+         try {
+            const response = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/fileDetails/${filename}`, {
+                credentials: "include"
+            });
 
-        setModal({
-            open: true,
-            title: filename,
-            content: <FileDetails filename={filename} tests={relatedTests} />
-        });
+            const data = await response.json();
+            setModal({
+                open: true,
+                title: filename,
+                content: <FileDetails filename={filename} files={data.files} />
+            });
+    }
+          catch(err){
+            alert('Failed to load file details : ' + err.message);
+         }
     };
+
 
     const handleLogout = async () => {
         try {

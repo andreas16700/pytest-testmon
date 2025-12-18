@@ -25,12 +25,11 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         const runSummary = summary.find(s => s.run_id == runId) || {};
 
         const currentTests = runTests.tests || [];
-        const passed = currentTests.filter(t => !t.failed).length;
         const failed = currentTests.filter(t => t.failed).length;
-        const ran = currentTests.filter(t => t.forced === 0).length;
+        const ran = currentTests.filter(t => t.forced === 0 || t.forced===1) .length; 
         const totalTests = runSummary.test_count || 0;
         const skipped = totalTests - ran;
-
+        const passed= totalTests - skipped - failed
         const [runtimeSpent, runtimeSaved] = currentTests.reduce(
             (acc, test) => {
                 if (test.forced === 0) {

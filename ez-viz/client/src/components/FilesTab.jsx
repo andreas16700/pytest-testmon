@@ -9,7 +9,7 @@ function FilesTab({ currentRepo, allFiles, search, setSearch, showFileDetails })
             file.filename.toLowerCase().includes(search.toLowerCase())
         )
     })).filter(runData => runData.files.length > 0);
-
+    
   return (
     <div className="animate-fadeIn">
       <SearchBox
@@ -19,7 +19,7 @@ function FilesTab({ currentRepo, allFiles, search, setSearch, showFileDetails })
       />
             <div className="grid gap-4">
                 {filteredFiles.map(runData => runData.files.map(file => (
-                    <FileItem currentRepo={currentRepo} key={file.filename} runId={runData.run_id} file={file} onClick={() => showFileDetails(file.filename)} />
+                    <FileItem currentRepo={currentRepo} key={file.filename} runId={runData.run_id} file={file} onClick={() => showFileDetails(file.filename , runData.run_id)} />
                 )))}
             </div>
         </div>
