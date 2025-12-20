@@ -934,7 +934,10 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
         return jsonify({"error": "Failed to read files"}), 500
 
 
-@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<file_name>", methods=["GET"])
+@app.route(
+    "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>",
+    methods=["GET"]
+)
 def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
     g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
 
@@ -970,6 +973,100 @@ def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
     except Exception:
         log_exception("files_query", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read files"}), 500
+    
+    
+@app.route("/api/data/<path:repo_id>/<job_id>/<int:run_id>/fileDependencies", methods=["GET"])
+def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
+   
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    if resp:
+        return resp, code
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # 1) Get all files that appear in this run (by external repo_run_id)
+    all_files_sql = """
+        SELECT DISTINCT
+          fpi.filename
+        FROM file_fp_infos fpi
+        JOIN run_uid ru
+          ON fpi.run_uid = ru.id
+        WHERE ru.repo_run_id = ?
+    """
+    cur.execute(all_files_sql, (run_id,))
+    all_files_rows = cur.fetchall()
+
+    # Initialize map: filename -> set(dependencies)
+    deps_map = {row["filename"]: set() for row in all_files_rows}
+
+    # Early-out if no files in this run
+    if not deps_map:
+        conn.close()
+        return jsonify({"run_id": run_id, "files": []})
+
+    # 2) Get pairwise "file -> dependency" relations via shared test executions
+    file_deps_sql = """
+        WITH run AS (
+          SELECT id AS run_uid
+          FROM run_uid
+          WHERE repo_run_id = ?
+        ),
+        file_tests AS (
+          SELECT DISTINCT
+            fpi.filename      AS file,
+            tefi.test_execution_id
+          FROM file_fp_infos fpi
+          JOIN run r
+            ON fpi.run_uid = r.run_uid
+          JOIN test_execution_file_fp_infos tefi
+            ON tefi.run_uid        = r.run_uid
+           AND tefi.fingerprint_id = fpi.fingerprint_id
+        ),
+        file_cofiles AS (
+          SELECT DISTINCT
+            ft.file           AS filename,
+            fpi2.filename     AS dependency
+          FROM file_tests ft
+          JOIN test_execution_file_fp_infos tefi2
+            ON tefi2.test_execution_id = ft.test_execution_id
+          JOIN file_fp_infos fpi2
+            ON fpi2.run_uid        = tefi2.run_uid
+           AND fpi2.fingerprint_id = tefi2.fingerprint_id
+          JOIN run r
+            ON fpi2.run_uid = r.run_uid
+          WHERE fpi2.filename <> ft.file
+        )
+        SELECT
+          filename,
+          dependency
+        FROM file_cofiles
+        ORDER BY filename, dependency;
+    """
+    cur.execute(file_deps_sql, (run_id,))
+    for row in cur.fetchall():
+        filename = row["filename"]
+        dependency = row["dependency"]
+        # Only add dependencies for files that are in this run
+        if filename in deps_map:
+            deps_map[filename].add(dependency)
+
+    conn.close()
+
+    # 3) Build final JSON in the shape the React graph expects
+    files_list = [
+        {
+            "filename": filename,
+            "dependencies": sorted(list(deps))
+        }
+        for filename, deps in sorted(deps_map.items())
+    ]
+
+    return jsonify({
+        "run_id": run_id,
+        "files": files_list
+    })
+   
 
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():

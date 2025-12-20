@@ -518,6 +518,10 @@ class TestmonSelect:
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
         always_run_files = getattr(config, "always_run_files", [])
+        print("always run files are", always_run_files)
+
+        # normalized versions (for comparison)
+        normalized_always = [f.replace("\\", "/").lower() for f in always_run_files]
 
         forced_by_file = {f: [] for f in always_run_files}
         normal_selected = []
@@ -529,12 +533,16 @@ class TestmonSelect:
             return (path, lineno, name)
 
         for item in items:
+            # full path from pytest
             item_path = str(item.fspath)
+            # normalize to forward slashes + lowercase
+            item_path_norm = item_path.replace(os.sep, "/").lower()
 
             matched_forced = None
-            for f in always_run_files:  # preserves server order
-                if item_path.endswith(f):
-                    matched_forced = f
+            # preserve server order from always_run_files
+            for original_f, norm_f in zip(always_run_files, normalized_always):
+                if item_path_norm.endswith(norm_f):
+                    matched_forced = original_f
                     break
 
             if matched_forced:
@@ -554,6 +562,8 @@ class TestmonSelect:
             forced_by_file[f].sort(key=source_order_key)
             forced.extend(forced_by_file[f])
 
+        print("Forced tests are", forced)
+
         # 2) Normal selected: duration priority (your existing testmon behavior)
         sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
 
@@ -570,7 +580,6 @@ class TestmonSelect:
             # 3) In noselect mode: also prioritize deselected by duration
             sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
-
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
         if len(self.deselected_tests) and exitstatus == ExitCode.NO_TESTS_COLLECTED:
