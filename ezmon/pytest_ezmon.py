@@ -12,6 +12,8 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
+from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync
+from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
 
@@ -138,6 +140,11 @@ def testmon_options(config):
     return result
 
 
+
+def get_testmon_file(config: Config) -> Path:
+    return Path(config.rootdir.strpath) / ".testmondata"
+
+
 def init_testmon_data(config: Config):
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
@@ -146,43 +153,15 @@ def init_testmon_data(config: Config):
 
     system_packages = get_system_packages(ignore=ignore_dependencies)
 
-    url = config.getini("tmnet_url")
-    rpc_proxy = None
-
-    if config.testmon_config.tmnet or getattr(config, "tmnet", None):
-        rpc_proxy = getattr(config, "tmnet", None)
-
-        if not url:
-            url = "https://api1.testmon.net/"
-        if not rpc_proxy:
-            tmnet_api_key = config.getini("tmnet_api_key")
-            if "TMNET_API_KEY" in os.environ:
-                if tmnet_api_key:
-                    logger.warning(
-                        "Duplicate TMNET_API_KEY (environment and ini file). \
-                         Using TMNET_API_KEY from %s",
-                        config.inipath,
-                    )
-                else:
-                    tmnet_api_key = os.getenv("TMNET_API_KEY")
-            elif tmnet_api_key is None:
-                logger.warning(
-                    "TMNET_API_KEY not set.",
-                )
-            rpc_proxy = xmlrpc.client.ServerProxy(
-                url,
-                allow_none=True,
-                headers=[("x-api-key", tmnet_api_key)],
-            )
-
+    
     testmon_data = TestmonData(
         rootdir=config.rootdir.strpath,
-        database=rpc_proxy,
+        database=None,
         environment=environment,
         system_packages=system_packages,
         readonly=get_running_as(config) == "worker",
     )
-    testmon_data.determine_stable(bool(rpc_proxy))
+    testmon_data.determine_stable(bool(None))
     config.testmon_data = testmon_data
 
 
@@ -220,6 +199,18 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
 
 
 def pytest_configure(config):
+    # Initialize default
+    config.always_run_files = []
+
+    if should_sync():
+        # 1. Fetch preferences (Always Run Tests)
+        prefs = get_test_preferences()
+        config.always_run_files = list(prefs.get("always_run_tests", []))
+        
+        # 2. Download testmon data
+        testmon_file = get_testmon_file(config)
+        downloaded = download_testmon_data(testmon_file)
+        
     coverage_stack = None
     try:
         from tmnet.testmon_core import (  # pylint: disable=import-outside-toplevel
@@ -315,9 +306,47 @@ def changed_message(
     return message
 
 
+
 def pytest_unconfigure(config):
+    # Close and commit database FIRST (flush all changes to disk)
     if hasattr(config, "testmon_data"):
-        config.testmon_data.close_connection()
+        try:
+            if hasattr(config.testmon_data, 'db') and hasattr(config.testmon_data.db, 'con'):
+                # 1. Commit changes
+                config.testmon_data.db.con.commit()
+                logger.info("💾 Database committed")
+                
+                # 2. CRITICAL: Close the connection to force WAL checkpoint
+                # This merges .testmondata-wal into .testmondata
+                config.testmon_data.db.con.close()
+                logger.info("🔒 SQLite connection closed (WAL checkpointed)")
+                
+                # Prevent double closing
+                config.testmon_data.db.con = None
+            
+            # Call the class method (even if empty)
+            config.testmon_data.close_connection()
+            
+        except Exception as e:
+            logger.warning(f"Failed to close testmon database: {e}")
+
+    # Only upload from main process (not xdist workers)
+    if get_running_as(config) not in ("single", "controller"):
+        return
+
+    # Upload if sync is enabled - AFTER database is committed and closed
+    if should_sync():
+        testmon_file = get_testmon_file(config)
+        
+        # Give file system time to flush
+        time.sleep(0.2)
+        
+        if testmon_file.exists() and testmon_file.stat().st_size > 0:
+            logger.info(f"📦 Uploading: {testmon_file.stat().st_size:,} bytes")
+            repo_name = os.getenv("GITHUB_REPOSITORY") or os.getenv("REPO_ID") or "unknown"
+            upload_testmon_data(testmon_file, repo_name)
+        else:
+            logger.info("No testmon data to upload")
 
 
 class TestmonCollect:
@@ -473,33 +502,84 @@ class TestmonSelect:
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), config.rootdir.strpath)
+        
+        # Check if this file is in the "always run" list
+        always_run_files = getattr(config, "always_run_files", [])
+
+        is_forced = any(strpath.endswith(f) for f in always_run_files)
+        
+        if is_forced:
+            return None  # Don't ignore - force collection
+        
         if strpath in self.deselected_files and self.config.testmon_config.select:
             return True
         return None
 
     @pytest.hookimpl(trylast=True)
-    def pytest_collection_modifyitems(
-        self, session, config, items
-    ):  # pylint: disable=unused-argument
-        selected = []
+    def pytest_collection_modifyitems(self, session, config, items):
+        always_run_files = getattr(config, "always_run_files", [])
+        print("always run files are", always_run_files)
+
+        # normalized versions (for comparison)
+        normalized_always = [f.replace("\\", "/").lower() for f in always_run_files]
+
+        forced_by_file = {f: [] for f in always_run_files}
+        normal_selected = []
         deselected = []
+        forced_count = 0
+
+        def source_order_key(i):
+            path, lineno, name = i.location
+            return (path, lineno, name)
+
         for item in items:
+            # full path from pytest
+            item_path = str(item.fspath)
+            # normalize to forward slashes + lowercase
+            item_path_norm = item_path.replace(os.sep, "/").lower()
+
+            matched_forced = None
+            # preserve server order from always_run_files
+            for original_f, norm_f in zip(always_run_files, normalized_always):
+                if item_path_norm.endswith(norm_f):
+                    matched_forced = original_f
+                    break
+
+            if matched_forced:
+                forced_by_file[matched_forced].append(item)
+                if item.nodeid in self.deselected_tests:
+                    forced_count += 1
+                continue
+
             if item.nodeid in self.deselected_tests:
                 deselected.append(item)
             else:
-                selected.append(item)
+                normal_selected.append(item)
 
-        sort_items_by_duration(selected, self.testmon_data.avg_durations)
+        # 1) Forced: file order + source order (DO NOT duration-sort these)
+        forced = []
+        for f in always_run_files:
+            forced_by_file[f].sort(key=source_order_key)
+            forced.extend(forced_by_file[f])
+
+        print("Forced tests are", forced)
+
+        # 2) Normal selected: duration priority (your existing testmon behavior)
+        sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
+
+        selected = forced + normal_selected
 
         if self.config.testmon_config.select:
             items[:] = selected
             session.config.hook.pytest_deselected(
                 items=([FakeItemFromTestmon(session.config)] * len(deselected))
             )
+            if forced_count > 0:
+                logger.info(f" Forced {forced_count} tests from always_run list")
         else:
+            # 3) In noselect mode: also prioritize deselected by duration
             sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
-
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
         if len(self.deselected_tests) and exitstatus == ExitCode.NO_TESTS_COLLECTED:
