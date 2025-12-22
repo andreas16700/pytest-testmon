@@ -1,12 +1,21 @@
 import React from "react";
 
 function StatCard({ title, value, label, smallValue }) {
-    return (
-        <div className="bg-gradient-to-br from-indigo-500 to-purple-600 p-6 rounded-xl text-white shadow-lg">
-            <h3 className="text-sm opacity-90 mb-2 uppercase tracking-wider">{title}</h3>
-            <div className={`font-bold mb-1 ${smallValue ? 'text-xl' : 'text-4xl'}`}>{value}</div>
-            <div className="text-sm opacity-80">{label}</div>
+  return (
+    <div className="stat-card-container">
+      <h3 className="stat-card-title">{title}</h3>
+      
+      <div className={`stat-card-value ${smallValue ? 'stat-card-value-small' : 'stat-card-value-large'}`}>
+        {value}
+      </div>
+      
+      {label && (
+        <div className="stat-card-label">
+          {label}
         </div>
-    );
+      )}
+    </div>
+  );
 }
+
 export default StatCard;

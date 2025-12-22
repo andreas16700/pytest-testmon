@@ -1,5 +1,5 @@
-import {RefreshCw} from "lucide-react";
-import React, {useState, useRef, useEffect} from "react";
+import { RefreshCw, ChevronDown } from "lucide-react";
+import React, { useState, useRef, useEffect } from "react";
 
 function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo, selectedJob, onRepoChange, onJobChange, onRunChange, onRefresh, setIsAdded, setSummary, setAllTests, setAllFiles, selectedRunId, setSelectedRunId }) {
     const [isRepoDropdownOpen, setIsRepoDropdownOpen] = useState(false);
@@ -12,192 +12,147 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
 
     useEffect(() => {
         function handleClickOutside(event) {
-            if (repoRef.current && !repoRef.current.contains(event.target)) {
-                setIsRepoDropdownOpen(false);
-            }
-            if (jobRef.current && !jobRef.current.contains(event.target)) {
-                setIsJobDropdownOpen(false);
-            }
-            if (runRef.current && !runRef.current.contains(event.target)) {
-                setIsRunDropdownOpen(false);
-            }
+            if (repoRef.current && !repoRef.current.contains(event.target)) setIsRepoDropdownOpen(false);
+            if (jobRef.current && !jobRef.current.contains(event.target)) setIsJobDropdownOpen(false);
+            if (runRef.current && !runRef.current.contains(event.target)) setIsRunDropdownOpen(false);
         }
-
         document.addEventListener('mousedown', handleClickOutside);
         return () => document.removeEventListener('mousedown', handleClickOutside);
     }, []);
 
     return (
-        <div className="bg-gray-50 p-5 border-b-2 border-gray-200 flex gap-5 items-end flex-wrap">
-            <div className="flex-1 min-w-[250px]" ref={repoRef}>
-                <label className="block font-semibold text-gray-600 mb-2 text-sm uppercase tracking-wide">
-                    Repository
-                </label>
+        <div className="selector-bar">
+            {/* Repository Selector */}
+            <div className="selector-group" ref={repoRef}>
+                <label className="selector-label">Repository</label>
+                <button
+                    type="button"
+                    className="dropdown-trigger"
+                    onClick={() => setIsRepoDropdownOpen(!isRepoDropdownOpen)}
+                    disabled={repos.length === 0}
+                >
+                    <span className="truncate">
+                        {currentRepo ? 
+                            `${currentRepo} (${repos.find(r => r.id === currentRepo)?.jobs.length || 0} jobs)` : 
+                            'Select a repository'}
+                    </span>
+                    <ChevronDown className={`dropdown-icon ${isRepoDropdownOpen ? 'rotate-180' : ''}`} />
+                </button>
 
-                <div className="relative">
-                    <button
-                        type="button"
-                        className="w-full p-3 text-base border-2 border-gray-300 rounded-lg bg-white cursor-pointer transition-all hover:border-indigo-500 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed text-left flex items-center justify-between"
-                        onClick={() => setIsRepoDropdownOpen(!isRepoDropdownOpen)}
-                        disabled={repos.length === 0}
-                    >
-                        <span className="truncate">
-                            {currentRepo ?
-                                `${currentRepo} (${repos.find(r => r.id === currentRepo)?.jobs.length || 0} jobs)` :
-                                'Select a repository'}
-                        </span>
-                        <svg
-                            className={`w-5 h-5 transition-transform flex-shrink-0 ml-2 ${isRepoDropdownOpen ? 'rotate-180' : ''}`}
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                        >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                    </button>
-
-                    {isRepoDropdownOpen && repos.length > 0 && (
-                        <div className="absolute z-10 w-full mt-1 bg-white border-2 border-gray-300 rounded-lg shadow-lg max-h-60 overflow-auto">
-                            {repos.map(repo => (
-                                <div
-                                    key={repo.id}
-                                    className={`p-3 hover:bg-indigo-50 cursor-pointer transition-colors ${currentRepo === repo.id ? 'bg-indigo-100' : ''}`}
-                                    onClick={() => {
-                                        onRepoChange(repo.id);
-                                        onJobChange(null);
-                                        onRunChange([]);
-                                        setIsRepoDropdownOpen(false);
-                                    }}
-                                >
-                                    <span className="text-base">{repo.name} ({repo.jobs.length} jobs)</span>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
+                {isRepoDropdownOpen && (
+                    <div className="dropdown-menu">
+                        {repos.map(repo => (
+                            <div
+                                key={repo.id}
+                                className={`dropdown-item ${currentRepo === repo.id ? 'dropdown-item-active' : ''}`}
+                                onClick={() => {
+                                    onRepoChange(repo.id);
+                                    onJobChange(null);
+                                    onRunChange([]);
+                                    setIsRepoDropdownOpen(false);
+                                }}
+                            >
+                                {repo.name} ({repo.jobs.length} jobs)
+                            </div>
+                        ))}
+                    </div>
+                )}
             </div>
 
-            <div className="flex-1 min-w-[250px]" ref={jobRef}>
-                <label className="block font-semibold text-gray-600 mb-2 text-sm uppercase tracking-wide">
-                    Job
-                </label>
+            {/* Job Selector */}
+            <div className="selector-group" ref={jobRef}>
+                <label className="selector-label">Job</label>
+                <button
+                    type="button"
+                    className="dropdown-trigger"
+                    onClick={() => setIsJobDropdownOpen(!isJobDropdownOpen)}
+                    disabled={!selectedRepo || selectedRepo.jobs.length === 0}
+                >
+                    <span className="truncate">
+                        {currentJob ? `${currentJob} (${selectedRepo?.jobs.find(j => j.id === currentJob)?.runs.length || 0} runs)` : 'Select a job'}
+                    </span>
+                    <ChevronDown className={`dropdown-icon ${isJobDropdownOpen ? 'rotate-180' : ''}`} />
+                </button>
 
-                <div className="relative">
-                    <button
-                        type="button"
-                        className="w-full p-3 text-base border-2 border-gray-300 rounded-lg bg-white cursor-pointer transition-all hover:border-indigo-500 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed text-left flex items-center justify-between"
-                        onClick={() => setIsJobDropdownOpen(!isJobDropdownOpen)}
-                        disabled={!selectedRepo || selectedRepo.jobs.length === 0}
-                    >
-                        <span className="truncate">
-                            {currentJob ? `${currentJob} (${selectedRepo?.jobs.find(j => j.id === currentJob)?.runs.length || 0} runs)` : 'Select a job'}
-                        </span>
-                        <svg
-                            className={`w-5 h-5 transition-transform flex-shrink-0 ml-2 ${isJobDropdownOpen ? 'rotate-180' : ''}`}
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                        >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                    </button>
-
-                    {isJobDropdownOpen && selectedRepo && (
-                        <div className="absolute z-10 w-full mt-1 bg-white border-2 border-gray-300 rounded-lg shadow-lg max-h-60 overflow-auto">
-                            {selectedRepo.jobs.map(job => (
-                                <div
-                                    key={job.id}
-                                    className={`p-3 hover:bg-indigo-50 cursor-pointer transition-colors ${currentJob === job.id ? 'bg-indigo-100' : ''}`}
-                                    onClick={() => {
-                                        onJobChange(job.id);
-                                        onRunChange([]);
-                                        setIsJobDropdownOpen(false);
-                                    }}
-                                >
-                                    <span className="text-base">{job.id} ({job.runs.length} runs)</span>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
+                {isJobDropdownOpen && selectedRepo && (
+                    <div className="dropdown-menu">
+                        {selectedRepo.jobs.map(job => (
+                            <div
+                                key={job.id}
+                                className={`dropdown-item ${currentJob === job.id ? 'dropdown-item-active' : ''}`}
+                                onClick={() => {
+                                    onJobChange(job.id);
+                                    onRunChange([]);
+                                    setIsJobDropdownOpen(false);
+                                }}
+                            >
+                                {job.id} ({job.runs.length} runs)
+                            </div>
+                        ))}
+                    </div>
+                )}
             </div>
 
-            <div className="flex-1 min-w-[250px]" ref={runRef}>
-                <label className="block font-semibold text-gray-600 mb-2 text-sm uppercase tracking-wide">
-                    Run
-                </label>
-                <div className="relative">
-                    <button
-                        type="button"
-                        className="w-full p-3 text-base border-2 border-gray-300 rounded-lg bg-white cursor-pointer transition-all hover:border-indigo-500 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 disabled:opacity-50 disabled:cursor-not-allowed text-left flex items-center justify-between"
-                        onClick={() => setIsRunDropdownOpen(!isRunDropdownOpen)}
-                        disabled={!selectedJob || selectedJob.runs.length === 0}
-                    >
-                        <span className="truncate">
-                            {currentRuns.length === 0 ? 'Select run/s' : currentRuns.length <= 2 ? currentRuns.join(', ') : `${currentRuns.length} runs selected`}
-                        </span>
-                        <svg
-                            className={`w-5 h-5 transition-transform ${isRunDropdownOpen ? 'rotate-180' : ''}`}
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                        >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                    </button>
+            {/* Run Multi-Selector */}
+            <div className="selector-group" ref={runRef}>
+                <label className="selector-label">Runs</label>
+                <button
+                    type="button"
+                    className="dropdown-trigger"
+                    onClick={() => setIsRunDropdownOpen(!isRunDropdownOpen)}
+                    disabled={!selectedJob || selectedJob.runs.length === 0}
+                >
+                    <span className="truncate">
+                        {currentRuns.length === 0 ? 'Select run(s)' : currentRuns.length <= 2 ? currentRuns.join(', ') : `${currentRuns.length} runs selected`}
+                    </span>
+                    <ChevronDown className={`dropdown-icon ${isRunDropdownOpen ? 'rotate-180' : ''}`} />
+                </button>
 
-                    {isRunDropdownOpen && selectedJob && (
-                        <div className="absolute z-10 w-full mt-1 bg-white border-2 border-gray-300 rounded-lg shadow-lg max-h-60 overflow-auto">
-                            {selectedJob.runs.map(run => (
-                                <label
-                                    key={run.id}
-                                    className="flex items-center p-3 hover:bg-indigo-50 cursor-pointer transition-colors"
-                                >
-                                    <input
-                                        type="checkbox"
-                                        className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 cursor-pointer"
-                                        checked={currentRuns?.includes(run.id)}
-                                        onChange={(e) => {
-                                            const runs = currentRuns || [];
-                                            if (e.target.checked) {
-                                                onRunChange([...runs, run.id]);
-                                                setIsAdded(true);
-                                                if (!selectedRunId) {
-                                                    setSelectedRunId(run.id);
-                                                }
-                                            } else {
-                                                const remainingRuns = currentRuns.filter(id => id != run.id);
-                                                onRunChange(remainingRuns);
-                                                setSummary(prev => prev.filter(item => item.run_id != run.id));
-                                                setAllTests(prev => prev.filter(item => item.run_id !=run.id));
-                                                setAllFiles(prev => prev.filter(item => item.run_id != run.id));
-                                                if (run.id === selectedRunId) {
-                                                    if (remainingRuns.length > 0) {
-                                                        setSelectedRunId(remainingRuns[0]);
-                                                    } else {
-                                                        setSelectedRunId(null);
-                                                    }
-                                                }
+                {isRunDropdownOpen && selectedJob && (
+                    <div className="dropdown-menu">
+                        {selectedJob.runs.map(run => (
+                            <label key={run.id} className="dropdown-item gap-3">
+                                <input
+                                    type="checkbox"
+                                    className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+                                    checked={currentRuns?.includes(run.id)}
+                                    onChange={(e) => {
+                                        const runs = currentRuns || [];
+                                        if (e.target.checked) {
+                                            onRunChange([...runs, run.id]);
+                                            setIsAdded(true);
+                                            if (!selectedRunId) setSelectedRunId(run.id);
+                                        } else {
+                                            const remaining = currentRuns.filter(id => id != run.id);
+                                            onRunChange(remaining);
+                                            setSummary(prev => prev.filter(item => item.run_id != run.id));
+                                            setAllTests(prev => prev.filter(item => item.run_id != run.id));
+                                            setAllFiles(prev => prev.filter(item => item.run_id != run.id));
+                                            if (run.id === selectedRunId) {
+                                                setSelectedRunId(remaining.length > 0 ? remaining[0] : null);
                                             }
-                                        }}
-                                    />
-                                    <span className="ml-3 text-base">{run.id} (updated: {new Date(run.last_updated).toLocaleString()})</span>
-                                </label>
-                            ))}
-                        </div>
-                    )}
-                </div>
+                                        }
+                                    }}
+                                />
+                                <div className="flex flex-col">
+                                    <span className="font-semibold">{run.id}</span>
+                                    <span className="text-[10px] text-gray-400">
+                                        {new Date(run.last_updated).toLocaleString()}
+                                    </span>
+                                </div>
+                            </label>
+                        ))}
+                    </div>
+                )}
             </div>
 
-      <button
-        className="px-6 py-3 bg-indigo-500 text-white rounded-lg cursor-pointer font-semibold transition-all hover:bg-indigo-600 hover:-translate-y-0.5 hover:shadow-lg flex items-center gap-2"
-        onClick={onRefresh}
-      >
-        <RefreshCw size={20} />
-        Refresh
-      </button>
-    </div>
-  );
+            {/* Action Button */}
+            <button className="btn-refresh" onClick={onRefresh}>
+                <RefreshCw className="w-4 h-4" />
+                Refresh
+            </button>
+        </div>
+    );
 }
 
 export default SelectorBar;

@@ -866,7 +866,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             WHERE ti.id = ?
             AND r.repo_run_id = ?
             """,
-            (test_id, run_id)  # adjust var names as needed
+            (test_id, run_id)  
         ).fetchall()
 
 
