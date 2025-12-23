@@ -110,12 +110,10 @@ function App() {
   };
 
   const showTestDetails = async (testId, run_id) => {
-    console.log("test id is" , testId)
-    console.log("run id ", run_id)
     try {
       const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/test/${testId}`, { credentials: "include" });
       const data = await resp.json();
-      console.log("data is" , data)
+     
       setModal({
         open: true,
         title: data.test.test_name,

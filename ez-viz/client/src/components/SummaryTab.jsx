@@ -19,7 +19,6 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
     const [activeTab, setActiveTab] = useState('single');
     const [compareRunA, setCompareRunA] = useState(selectedRunId);
     const [compareRunB, setCompareRunB] = useState(currentRuns.find(r => r !== selectedRunId) || currentRuns[0]);
-    console.log("summary" , summary)
     const getRunData = (runId) => {
         const runTests = allTests.find(run => run.run_id == runId) || { tests: [] };
         const runSummary = summary.find(s => s.run_id == runId) || {};
