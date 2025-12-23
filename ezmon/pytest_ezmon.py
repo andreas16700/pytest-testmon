@@ -414,7 +414,8 @@ class TestmonCollect:
                     report.nodes_files_lines, self.reports
                 )
                 self.testmon_data.save_test_execution_file_fps(
-                    test_executions_fingerprints
+                    test_executions_fingerprints,
+                    nodes_files_lines=report.nodes_files_lines,
                 )
 
     def pytest_keyboard_interrupt(self, excinfo):  # pylint: disable=unused-argument
@@ -424,7 +425,7 @@ class TestmonCollect:
             test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
                 nodes_files_lines, self.reports
             )
-            self.testmon_data.save_test_execution_file_fps(test_executions_fingerprints)
+            self.testmon_data.save_test_execution_file_fps(test_executions_fingerprints , nodes_files_lines=nodes_files_lines,)
             self.testmon.close()
 
     def pytest_sessionfinish(self, session):  # pylint: disable=unused-argument

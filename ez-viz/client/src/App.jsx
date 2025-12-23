@@ -110,13 +110,16 @@ function App() {
   };
 
   const showTestDetails = async (testId, run_id) => {
+    console.log("test id is" , testId)
+    console.log("run id ", run_id)
     try {
       const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/test/${testId}`, { credentials: "include" });
       const data = await resp.json();
+      console.log("data is" , data)
       setModal({
         open: true,
         title: data.test.test_name,
-        content: <TestDetails test={data.test} dependencies={data.dependencies} />,
+        content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies} coverage= {data.coverage} />,
       });
     } catch (err) {
       alert("Failed to load test details: " + err.message);
@@ -148,7 +151,7 @@ function App() {
 
   const selectedRepo = repos.find((r) => r.id === currentRepo);
   const selectedJob = selectedRepo && selectedRepo.jobs.find((r) => r.id === currentJob);
-
+  
   return (
     <div className="app-root-container">
       {/* Top Header */}

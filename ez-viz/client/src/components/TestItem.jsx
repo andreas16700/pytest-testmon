@@ -9,8 +9,6 @@ function TestItem({ test, runId, onClick }) {
     else return "status-skipped";
   };
 
-
-
   return (
     <div className="test-item-card" onClick={onClick}>
       <div className="test-item-header">

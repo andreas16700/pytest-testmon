@@ -5,7 +5,7 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
     const [isRepoDropdownOpen, setIsRepoDropdownOpen] = useState(false);
     const [isJobDropdownOpen, setIsJobDropdownOpen] = useState(false);
     const [isRunDropdownOpen, setIsRunDropdownOpen] = useState(false);
-
+   
     const repoRef = useRef(null);
     const jobRef = useRef(null);
     const runRef = useRef(null);
@@ -137,7 +137,7 @@ function SelectorBar({ repos, currentRepo, currentJob, currentRuns, selectedRepo
                                 <div className="flex flex-col">
                                     <span className="font-semibold">{run.id}</span>
                                     <span className="text-[10px] text-gray-400">
-                                        {new Date(run.last_updated).toLocaleString()}
+                                        {new Date(run.created).toLocaleString()}
                                     </span>
                                 </div>
                             </label>

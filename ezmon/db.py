@@ -10,7 +10,7 @@ from ezmon.process_code import blob_to_checksums, checksums_to_blob
 from ezmon.common import TestExecutions
 
 
-DATA_VERSION = 14
+DATA_VERSION = 15
 
 ChangedFileData = namedtuple(
     "ChangedFileData", "filename name method_checksums id failed"
@@ -184,6 +184,8 @@ class DB:  # pylint: disable=too-many-public-methods
         
         self.write_test_exec_file_fp_infos(run_uid)
         
+        self.increment_run_id_test_exec_coverage(run_uid)
+        
         self.increment_attributes(
             {
                 f"{attribute_prefix}time_saved": run_saved_time,
@@ -196,8 +198,6 @@ class DB:  # pylint: disable=too-many-public-methods
 
   
         
-
-
 
     def fetch_saving_stats(self, exec_id, select):
         (
@@ -392,6 +392,16 @@ class DB:  # pylint: disable=too-many-public-methods
                 """,
                 (run_uid,)
             )
+    def increment_run_id_test_exec_coverage(self, run_uid):
+        with self.con as con:
+            con.execute(
+                """
+                UPDATE test_execution_coverage
+                SET run_uid = ?
+                WHERE run_uid IS NULL
+                """,
+                (run_uid,),
+            )
 
             
     def write_file_fp_infos(self,run_uid):
@@ -442,7 +452,8 @@ class DB:  # pylint: disable=too-many-public-methods
     def create_run_uid_statement(self) ->str:
            return """CREATE TABLE IF NOT EXISTS run_uid (
             id INTEGER PRIMARY KEY,
-            repo_run_id INTEGER NULL
+            repo_run_id INTEGER NULL,
+            create_date TEXT DEFAULT (datetime('now'))
         );"""
     
     def _create_run_infos_statement(self) -> str:
@@ -568,6 +579,20 @@ class DB:  # pylint: disable=too-many-public-methods
                 );
                 CREATE UNIQUE INDEX sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
             """
+            
+    def _create_test_execution_coverage_statement(self) -> str:
+        return """
+            CREATE TABLE IF NOT EXISTS test_execution_coverage (
+                id INTEGER PRIMARY KEY,
+                test_execution_id INTEGER,
+                filename TEXT,
+                lines TEXT,          -- JSON-encoded list of line numbers
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+        """
+
+
 
     def init_tables(self):
         connection = self.con
@@ -584,6 +609,7 @@ class DB:  # pylint: disable=too-many-public-methods
             +self._create_test_infos_statement()
             + self._create__file_fp_infos_statement()
             + self._create_test_execution_file_fp_infos_statement()
+            + self._create_test_execution_coverage_statement() 
            
             
         )
@@ -626,6 +652,60 @@ class DB:  # pylint: disable=too-many-public-methods
             )
 
         return result
+    
+    
+
+    
+    def insert_coverage_lines(self, exec_id, nodes_files_lines):
+       
+        assert exec_id is not None
+
+        with self.con as con:
+            cursor = con.cursor()
+            rows = []
+
+            for test_name, files in nodes_files_lines.items():
+                # Find the corresponding test_execution row for this env + test_name
+                cursor.execute(
+                    f"""
+                    SELECT id
+                    FROM test_execution
+                    WHERE {self._test_execution_fk_column()} = ?
+                    AND test_name = ?
+                    """,
+                    (exec_id, test_name),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    # Test not recorded in test_execution (should be rare), skip
+                    continue
+
+                te_id = row[0]
+
+                for filename, lines in files.items():
+                    if not lines:
+                        continue
+                    line_list = sorted(lines)
+                    rows.append(
+                        (te_id, filename, json.dumps(line_list))
+                    )
+
+            if rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO test_execution_coverage (
+                        test_execution_id,
+                        filename,
+                        lines
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    rows,
+                )
+
+    
+    
+    
 
     def fetch_unknown_files(
         self, files_fshas, exec_id
