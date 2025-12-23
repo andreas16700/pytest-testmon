@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
-import {Github, LogOut} from "lucide-react";
+import { Github, LogOut, ChevronDown, User } from "lucide-react";
 
-function Header({user, handleLogout}) {
+function Header({ user, handleLogout }) {
     const [dropdownOpen, setDropdownOpen] = useState(false);
     const dropdownRef = useRef(null);
 
@@ -16,14 +16,14 @@ function Header({user, handleLogout}) {
     }, []);
 
     return (
-        <div className="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-4">
-            <div className="flex items-center justify-between">
+        <header className="header-bg">
+            <div className="flex items-center justify-between max-w-[1600px] mx-auto">
                 <div>
-                    <h1 className="text-2xl font-bold text-white">
+                    <h1 className="brand-title">
                         Testmon Multi-Project Visualizer
                     </h1>
-                    <p className="text-indigo-100 text-sm">
-                        Intelligent test selection across repositories and jobs
+                    <p className="brand-subtitle">
+                        Intelligent test selection & analysis
                     </p>
                 </div>
 
@@ -31,75 +31,64 @@ function Header({user, handleLogout}) {
                     <div className="relative" ref={dropdownRef}>
                         <button
                             onClick={() => setDropdownOpen(!dropdownOpen)}
-                            className="flex items-center gap-2 bg-white/10 hover:bg-white/20 rounded-lg py-2 px-3 transition-all duration-200"
+                            className="user-pill"
                         >
-                            {user.avatar_url && (
+                            {user.avatar_url ? (
                                 <img
                                     src={user.avatar_url}
                                     alt={user.login}
-                                    className="w-8 h-8 rounded-full border-2 border-white/30"
+                                    className="w-7 h-7 rounded-full border border-white/20 shadow-sm"
                                 />
+                            ) : (
+                                <div className="w-7 h-7 rounded-full bg-indigo-400 flex items-center justify-center">
+                                    <User size={14} className="text-white" />
+                                </div>
                             )}
-                            <span className="text-white text-sm font-medium">
+                            <span className="text-white text-sm font-semibold">
                                 {user.login}
                             </span>
-                            <svg
-                                className={`w-4 h-4 text-white/70 transition-transform duration-200 ${dropdownOpen ? 'rotate-180' : ''}`}
-                                fill="none"
-                                stroke="currentColor"
-                                viewBox="0 0 24 24"
-                            >
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                            </svg>
+                            <ChevronDown 
+                                size={16} 
+                                className={`text-white/70 transition-transform duration-300 ${dropdownOpen ? 'rotate-180' : ''}`} 
+                            />
                         </button>
 
                         {dropdownOpen && (
-                            <div className="absolute right-0 mt-2 w-56 bg-white rounded-lg shadow-xl border border-gray-100 py-1 z-50">
-                                <div className="px-4 py-3 border-b border-gray-100">
-                                    <div className="flex items-center gap-3">
-                                        {user.avatar_url && (
-                                            <img
-                                                src={user.avatar_url}
-                                                alt={user.login}
-                                                className="w-10 h-10 rounded-full"
-                                            />
-                                        )}
-                                        <div>
-                                            <p className="text-sm font-semibold text-gray-800">
-                                                {user.name || user.login}
-                                            </p>
-                                            <p className="text-xs text-gray-500">
-                                                @{user.login}
-                                            </p>
-                                        </div>
-                                    </div>
+                            <div className="profile-dropdown">
+                                <div className="px-4 py-4 border-b border-gray-50 bg-gray-50/50 rounded-t-2xl mb-1">
+                                    <p className="text-sm font-bold text-gray-900 leading-none">
+                                        {user.name || user.login}
+                                    </p>
+                                    <p className="text-xs text-gray-500 mt-1.5">
+                                        @{user.login}
+                                    </p>
                                 </div>
 
                                 <a
                                     href={user.html_url}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="flex items-center gap-2 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                                    className="dropdown-link"
                                 >
                                     <Github size={16} />
-                                    View GitHub Profile
+                                    <span>GitHub Profile</span>
                                 </a>
 
-                                <div className="border-t border-gray-100 my-1"></div>
+                                <div className="h-px bg-gray-100 my-1 mx-2"></div>
 
                                 <button
                                     onClick={handleLogout}
-                                    className="flex items-center gap-2 w-full px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
+                                    className="dropdown-danger w-full text-left"
                                 >
-                                    <LogOut className="w-4 h-4" />
-                                    Sign out
+                                    <LogOut size={16} />
+                                    <span>Sign out</span>
                                 </button>
                             </div>
                         )}
                     </div>
                 )}
             </div>
-        </div>
+        </header>
     );
 }
 

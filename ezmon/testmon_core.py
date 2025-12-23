@@ -389,8 +389,10 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
         return durations
 
-    def save_test_execution_file_fps(self, test_executions_fingerprints):
+    def save_test_execution_file_fps(self, test_executions_fingerprints , nodes_files_lines=None,):
         self.db.insert_test_file_fps(test_executions_fingerprints, self.exec_id)
+        if nodes_files_lines:
+            self.db.insert_coverage_lines(self.exec_id, nodes_files_lines)
 
     def fetch_saving_stats(self, select):
         return self.db.fetch_saving_stats(self.exec_id, select)

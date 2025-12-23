@@ -19,7 +19,6 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
     const [activeTab, setActiveTab] = useState('single');
     const [compareRunA, setCompareRunA] = useState(selectedRunId);
     const [compareRunB, setCompareRunB] = useState(currentRuns.find(r => r !== selectedRunId) || currentRuns[0]);
-
     const getRunData = (runId) => {
         const runTests = allTests.find(run => run.run_id == runId) || { tests: [] };
         const runSummary = summary.find(s => s.run_id == runId) || {};
@@ -57,6 +56,12 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
 
     // Data for single view
     const primaryRun = useMemo(() => getRunData(selectedRunId), [selectedRunId, allTests, summary]);
+        const { passed, failed, skipped, totalTests } = primaryRun.stats;
+
+    const passRatio   = totalTests ? (passed  / totalTests) * 100 : 0;
+    const skipRatio   = totalTests ? (skipped / totalTests) * 100 : 0;
+    const failRatio   = totalTests ? (failed  / totalTests) * 100 : 0;
+
 
     const handleTabChange = (tab) => {
         setActiveTab(tab);
@@ -277,10 +282,10 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                 value={primaryRun.summary.file_count || 0}
                                 label="monitored for changes"
                             />
-                            <StatCard
-                                title="Repository"
-                                value={currentRepo?.split('/').pop() || 'N/A'}
-                                label={currentJob}
+                          
+                               <StatCard
+                                title="Created"
+                                value={primaryRun.summary.create_date || 'N/A'}
                                 smallValue
                             />
                         </div>
@@ -304,12 +309,57 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                             </div>
                         </div>
 
-                        <div className="env-info-card">
-                            <h3 className="env-info-title">Environment Information</h3>
-                            <EnvItem label="Environment" value={primaryRun.summary.environment?.name || 'N/A'} />
-                            <EnvItem label="Python Version" value={primaryRun.summary.environment?.python_version || 'N/A'} />
-                            <EnvItem label="Packages" value={primaryRun.summary.environment?.packages || 'N/A'} />
+                                              {/* Pass / Skip / Fail Ratios */}
+                        <div className="mt-10 px-4">
+                            <h3 className="text-sm font-semibold text-gray-600 mb-3 text-center">
+                                Pass / Skip / Fail Ratios
+                            </h3>
+
+                            {/* Bar visualization */}
+                            <div className="w-full max-w-xl mx-auto h-4 rounded-full overflow-hidden bg-gray-100 shadow-inner">
+                                <div
+                                    className="h-full"
+                                    style={{
+                                        width: `${passRatio}%`,
+                                        display: "inline-block",
+                                        backgroundColor: "#22c55e" // passed (green)
+                                    }}
+                                />
+                                <div
+                                    className="h-full"
+                                    style={{
+                                        width: `${skipRatio}%`,
+                                        display: "inline-block",
+                                        backgroundColor: "#eab308" // skipped (yellow)
+                                    }}
+                                />
+                                <div
+                                    className="h-full"
+                                    style={{
+                                        width: `${failRatio}%`,
+                                        display: "inline-block",
+                                        backgroundColor: "#ef4444" // failed (red)
+                                    }}
+                                />
+                            </div>
+
+                            {/* Text summary */}
+                            <div className="mt-3 flex justify-center gap-6 text-xs text-gray-700">
+                                <div className="flex items-center gap-1">
+                                    <span className="inline-block w-3 h-3 rounded-sm" style={{ backgroundColor: "#22c55e" }} />
+                                    <span>Passed: {passed} ({passRatio.toFixed(1)}%)</span>
+                                </div>
+                                <div className="flex items-center gap-1">
+                                    <span className="inline-block w-3 h-3 rounded-sm" style={{ backgroundColor: "#eab308" }} />
+                                    <span>Skipped: {skipped} ({skipRatio.toFixed(1)}%)</span>
+                                </div>
+                                <div className="flex items-center gap-1">
+                                    <span className="inline-block w-3 h-3 rounded-sm" style={{ backgroundColor: "#ef4444" }} />
+                                    <span>Failed: {failed} ({failRatio.toFixed(1)}%)</span>
+                                </div>
+                            </div>
                         </div>
+
                     </div>
                 )}
             </div>

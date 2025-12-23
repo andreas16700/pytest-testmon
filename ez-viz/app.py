@@ -433,23 +433,30 @@ def add_run_id_to_testmon_data(db_path, run_id):
     finally:
         conn.close()
                 
-def get_run_ids(db_path):
+def get_run_infos(db_path):
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        
-        
-        cursor.execute("SELECT repo_run_id FROM run_uid")
-        rows = cursor.fetchall()  
-        
-        run_ids = [row[0] for row in rows]
-        return run_ids
+
+        # Adjust table/column names if needed
+        cursor.execute("""
+            SELECT repo_run_id, create_date
+            FROM run_uid
+            ORDER BY create_date DESC
+        """)
+        rows = cursor.fetchall()
+
+        # rows: [(12, '2025-12-22 18:01:23'), (11, '2025-12-22 17:50:01'), ...]
+        runs = [
+            {"id": row[0], "created": row[1]}
+            for row in rows
+        ]
+        return runs
 
     except Exception as e:
-        log.error("Error reading run_ids for file %s: %s", db_path, e)
+        log.error("Error reading run_infos from %s: %s", db_path, e)
         return []
-
     finally:
         if conn is not None:
             conn.close()
@@ -578,13 +585,7 @@ def list_repos():
         jobs = []
         for job_id, job_data in repo_data.get("jobs", {}).items():
             db_path = get_job_db_path(repo_id, job_id)
-            run_ids = get_run_ids(db_path)  
-           
-            runs = [
-                {"id": run_id}
-                for run_id in run_ids
-            ]
-
+            runs = get_run_infos(db_path) 
             jobs.append(
                 {
                     "id": job_id,
@@ -690,6 +691,14 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
             "SELECT run_time_all FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
             (run_id,)
         ).fetchone()
+        
+        row = cursor.execute(
+            "SELECT create_date FROM run_uid WHERE repo_run_id = ?",
+            (run_id,)
+        ).fetchone()
+
+        create_date = row[0] if row else None
+
         savings = {}
         if test_savings and test_savings[0] is not None:
             savings["tests_saved"] = test_savings[0]
@@ -711,6 +720,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
                 "repo_id": repo_id,
                 "job_id": job_id,
                 "run_id": run_id,
+                "create_date": create_date,
                 "test_count": test_count,
                 "file_count": file_count,
                 "environment": {
@@ -866,9 +876,32 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             WHERE ti.id = ?
             AND r.repo_run_id = ?
             """,
-            (test_id, run_id)  # adjust var names as needed
+            (test_id, run_id)  
+        ).fetchall()
+        coverage_rows = conn.execute(
+            """
+                SELECT filename, lines
+                FROM test_execution_coverage
+                WHERE run_uid=(
+                    Select id
+                    From run_uid
+                    Where repo_run_id=?
+                )
+                AND test_execution_id = (
+                    Select test_execution_id 
+                    From test_infos
+                    WHERE id=? 
+                )
+                
+            """,
+            (run_id,test_id)
         ).fetchall()
 
+        # lines is stored as JSON string, so decode it
+        coverage = {
+            row["filename"]: json.loads(row["lines"])
+            for row in coverage_rows
+        }
 
 
         conn.close()
@@ -876,6 +909,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
 
         dependencies = []
         for dep in deps:
+            
             checksums_arr = array.array("i")
             checksums_arr.frombytes(dep["method_checksums"])
             dependencies.append(
@@ -886,9 +920,14 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
                     "checksums": checksums_arr.tolist(),
                 }
             )
+        
 
-       # log.info("test_details_success test_id=%s deps=%s", test_id, len(dependencies))
-        return jsonify({"test": dict(test), "dependencies": dependencies})
+        return jsonify({
+            "test": dict(test),
+            "dependencies": dependencies,
+            "coverage": coverage,
+        })
+
 
     except Exception:
         log_exception("test_details_query", repo_id=repo_id, job_id=job_id, test_id=test_id)

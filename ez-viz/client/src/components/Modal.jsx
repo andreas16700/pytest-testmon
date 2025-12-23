@@ -1,28 +1,43 @@
-import {X} from "lucide-react";
-import React from "react";
+import { X } from "lucide-react";
+import React, { useEffect } from "react";
 
 function Modal({ open, title, onClose, children }) {
+    // Prevent background scrolling when modal is open
+    useEffect(() => {
+        if (open) {
+            document.body.style.overflow = 'hidden';
+        } else {
+            document.body.style.overflow = 'unset';
+        }
+        return () => { document.body.style.overflow = 'unset'; };
+    }, [open]);
+
     if (!open) return null;
 
     return (
-        <div
-            className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center animate-fadeIn"
-            onClick={onClose}
-        >
-            <div
-                className="bg-white rounded-xl max-w-3xl w-11/12 max-h-[90vh] overflow-y-auto shadow-2xl animate-slideUp"
+        <div className="modal-overlay" onClick={onClose}>
+            <div 
+                className="modal-content" 
                 onClick={(e) => e.stopPropagation()}
             >
-                <div className="bg-gradient-to-r from-indigo-500 to-purple-600 text-white p-6 flex justify-between items-center">
-                    <h2 className="text-2xl font-semibold break-all flex-1">{title}</h2>
+                {/* Header */}
+                <div className="modal-header">
+                    <h2 className="text-xl font-bold tracking-tight truncate pr-4">
+                        {title}
+                    </h2>
                     <button
-                        className="w-10 h-10 flex items-center justify-center rounded-full transition-colors hover:bg-white hover:bg-opacity-20"
+                        className="p-2 rounded-full transition-colors hover:bg-white/20 active:bg-white/30"
                         onClick={onClose}
+                        aria-label="Close modal"
                     >
-                        <X size={28} />
+                        <X size={24} />
                     </button>
                 </div>
-                <div className="p-6">{children}</div>
+
+                {/* Body */}
+                <div className="modal-body">
+                    {children}
+                </div>
             </div>
         </div>
     );

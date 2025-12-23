@@ -1,7 +1,13 @@
 import React from "react";
-import { ExternalLink, Github } from "lucide-react";
+import { ExternalLink, Github, Beaker, Fingerprint } from "lucide-react";
 
-function FileItem({currentRepo, file, runId, onClick, branch = "main"}) {
+function FileItem({ currentRepo, file, runId, onClick, branch = "main" }) {
+    
+    // Logic to split path for better styling
+    const pathParts = file.filename.split('/');
+    const fileName = pathParts.pop();
+    const directory = pathParts.join('/');
+
     const navigateToGithub = (e) => {
         e.stopPropagation();
         const cleanPath = file.filename.startsWith('./') ? file.filename.slice(2) : file.filename;
@@ -10,34 +16,42 @@ function FileItem({currentRepo, file, runId, onClick, branch = "main"}) {
     };
 
     return (
-        <>
-            <div
-                className="bg-white border-2 border-gray-300 rounded-lg p-5 cursor-pointer transition-all hover:border-indigo-500 hover:shadow-lg hover:-translate-y-0.5"
-                onClick={onClick}
-            >
-                <div className="flex items-center mb-2">
-                    <div className="flex items-center gap-2">
-                        <span className="bg-gray-100 border border-gray-200 text-gray-600 text-xs font-mono px-2 py-1 rounded-md whitespace-nowrap">
-                            <span className="text-gray-400 select-none">#</span>{runId}
-                        </span>
-                        <div className="text-lg font-semibold text-gray-700 ml-3">{file.filename}</div>
+        <div className="file-item-card" onClick={onClick}>
+            <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3 overflow-hidden">
+                    <span className="file-badge-run">
+                        RUN {runId}
+                    </span>
+                    
+                    <div className="text-base truncate">
+                        {directory && <span className="file-path-dir">{directory}/</span>}
+                        <span className="file-path-name">{fileName}</span>
                     </div>
-                    <button
-                        onClick={navigateToGithub}
-                        className="flex items-center ml-3 gap-1 text-xs font-medium text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 px-3 py-1.5 rounded-md transition-colors border border-transparent hover:border-indigo-100"
-                        title="View file on GitHub"
-                    >
-                        <Github className="w-3.5 h-3.5" />
-                        <span>View source</span>
-                        <ExternalLink className="w-3 h-3 ml-0.5 opacity-50" />
-                    </button>
                 </div>
-                <div className="flex gap-5 text-sm text-gray-600">
-                    <span>🧪 {file.test_count} tests</span>
-                    <span>🔖 {file.fingerprint_count} fingerprints</span>
+
+                <button
+                    onClick={navigateToGithub}
+                    className="btn-github-link shrink-0"
+                    title="View file on GitHub"
+                >
+                    <Github size={14} />
+                    <span>View source</span>
+                    <ExternalLink size={12} className="opacity-50" />
+                </button>
+            </div>
+
+            <div className="flex gap-6 pt-1">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+                    <Beaker size={14} className="text-indigo-500" />
+                    <span>{file.test_count} tests impacted</span>
+                </div>
+                
+                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+                    <Fingerprint size={14} className="text-purple-500" />
+                    <span>{file.fingerprint_count} fingerprints</span>
                 </div>
             </div>
-        </>
+        </div>
     );
 }
 
