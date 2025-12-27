@@ -2,9 +2,6 @@
 Testmon Multi-Project/Job Visualization Server with Extensive Logging
 """
 import secrets
-import sys
-print("PYTHON EXECUTABLE:", sys.executable, flush=True)
-print("PYTHON PREFIX:", sys.prefix, flush=True)
 from flask import (
     Flask,
     request,
@@ -16,7 +13,6 @@ from flask import (
     g,
     has_request_context,
 )
-
 import requests
 from pathlib import Path
 from flask_cors import CORS
@@ -34,9 +30,11 @@ import uuid
 from functools import wraps
 import traceback
 from urllib.parse import urlencode
-
 import array
+from openai import OpenAI
+
 EZMON_FP_DIR = Path(os.getenv("EZMON_FP_DIR", "./.ezmon-fp")).resolve()
+CURRENT_MODEL = "gpt-4o-mini"
 # -----------------------------------------------------------------------------
 # Logging helpers
 # -----------------------------------------------------------------------------
@@ -274,6 +272,51 @@ def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None
     except Exception:
         log_exception("register_repo_job", repo_id=repo_id, job_id=job_id)
 
+@app.route("/api/ask_ai", methods=["POST"])
+def leverage_ai_model():
+    data = request.get_json()
+    content = data.get("content")
+    if not content:
+        return jsonify({"error": "No content provided"}), 400
+    api_key = os.getenv("AI_GITHUB_TOKEN")
+    if not api_key:
+        print("}Error: GITHUB_TOKEN environment variable not set.")
+        return
+
+    client = OpenAI(
+        base_url="https://models.inference.ai.azure.com",
+        api_key=api_key,
+    )
+
+    print(f"--- Using {CURRENT_MODEL}")
+
+    user_prompt = (
+        "You are an expert GitHub Actions engineer. Update the following workflow file "
+        "to include a step that runs the 'testmon' plugin using the command: 'pytest --ezmon'. "
+        "Return ONLY the updated YAML content. Do not include markdown formatting (```yaml) or explanations.\n\n"
+        f"{content}"
+    )
+    print(f"\nConnecting to {CURRENT_MODEL}... \n")
+
+    try:
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": user_prompt}
+            ],
+            model=CURRENT_MODEL,
+            temperature=0.1,
+            max_tokens=4096,
+            stream=False
+        )
+
+        updated_content = response.choices[0].message.content
+        return jsonify({"content": updated_content})
+
+    except Exception as e:
+        print(f"AI Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # -----------------------------------------------------------------------------
 # SQLite with logging
 # -----------------------------------------------------------------------------
@@ -367,8 +410,6 @@ def logout():
     session.clear()
     return jsonify({"message": "Logged out"})
 
-
-
 def update_testmon_run_id(db_path, run_id):
     try:
         conn = sqlite3.connect(db_path)
@@ -399,32 +440,25 @@ def update_testmon_run_id(db_path, run_id):
 
         affected = cursor.rowcount
         conn.commit()
-
-        # ---- SUCCESS LOG ----
         log.info(f"Successfully updated run_uid for {affected} rows in file: {db_path}")
-
         return affected
 
-
     except Exception as e:
-        # ---- ERROR LOG ----
         log.error(f"Error updating testmon run_id for file {db_path}: {e}")
         return None
 
     finally:
         if 'conn' in locals():
             conn.close()
- 
- 
- 
+
 def add_run_id_to_testmon_data(db_path, run_id):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     try:
         cursor.execute(
-        "UPDATE run_uid SET repo_run_id=? WHERE repo_run_id IS NULL",
-        (run_id,)
-                     )
+            "UPDATE run_uid SET repo_run_id=? WHERE repo_run_id IS NULL",
+            (run_id,)
+        )
         conn.commit()
        
     except Exception as e:
@@ -468,7 +502,7 @@ def upload_testmon_data():
     job_id = request.form.get("job_id")
     repo_name = request.form.get("repo_name")
     run_id= request.form.get("run_id")
-    
+
     # Enrich per-request context for logging
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -492,7 +526,7 @@ def upload_testmon_data():
         # Attempt to write uploaded file
         log.info("file_write_attempt dest=%s", db_path)
         file.save(db_path)
-        add_run_id_to_testmon_data(db_path , run_id)
+        add_run_id_to_testmon_data(db_path, run_id)
         size = db_path.stat().st_size
         log.info("file_write_success dest=%s size=%s (%s)", db_path, size, human_bytes(size))
 
@@ -578,14 +612,19 @@ def _open_db_or_404(repo_id: str, job_id: str):
 
 @app.route("/api/repos", methods=["GET"])
 def list_repos():
-    
     metadata = get_metadata()
-    repos = []
+    user_repositories_dict = get_user_repositories()
+    user_repositories_set = set()
+    for repo in user_repositories_dict:
+         user_repositories_set.add(repo.get('full_name'))
+    system_repositories = []
     for repo_id, repo_data in metadata.get("repos", {}).items():
+        if not (repo_data.get('name') in user_repositories_set):
+            continue
         jobs = []
         for job_id, job_data in repo_data.get("jobs", {}).items():
             db_path = get_job_db_path(repo_id, job_id)
-            runs = get_run_infos(db_path) 
+            runs = get_run_infos(db_path)
             jobs.append(
                 {
                     "id": job_id,
@@ -595,7 +634,7 @@ def list_repos():
                 }
             )
 
-        repos.append(
+        system_repositories.append(
             {
                 "id": repo_id,
                 "name": repo_data["name"],
@@ -604,10 +643,23 @@ def list_repos():
             }
         )
 
-    log.info("repos_list_success count=%s", len(repos))
-    return jsonify({"repos": repos})
+    log.info("repos_list_success count=%s", len(system_repositories))
+    return jsonify({
+        "system_repos": system_repositories,
+        "user_repos": [{
+            "id": repo["id"],
+            "name": repo["name"],
+            "full_name": repo["full_name"],
+            "owner": repo["owner"]["login"],
+            "private": repo["private"],
+            "url": repo["html_url"],
+            "description": repo["description"],
+            "permissions": repo.get("permissions", {}),
+            "default_branch": repo["default_branch"]
+        }
+        for repo in user_repositories_dict]
+    })
 
-@app.route("/api/userRepositories")
 @login_required
 def get_user_repositories():
     """Fetch only repositories the user owns or collaborates on"""
@@ -625,7 +677,7 @@ def get_user_repositories():
             "https://api.github.com/user/repos",
             headers=headers,
             params={
-                "affiliation": "owner,collaborator",
+                "affiliation": "owner, collaborator",
                 "sort": "updated",
                 "per_page": 100,
                 "page": page
@@ -637,19 +689,91 @@ def get_user_repositories():
         all_repos.extend(repos)
         page += 1
 
-    return jsonify([
-        {
-            "id": repo["id"],
-            "name": repo["name"],
-            "full_name": repo["full_name"],
-            "owner": repo["owner"]["login"],
-            "private": repo["private"],
-            "url": repo["html_url"],
-            "description": repo["description"],
-            "permissions": repo.get("permissions", {})
-        }
-        for repo in all_repos
-    ])
+    return all_repos
+
+@app.route("/api/repos/<owner>/<repo>/actions/workflows")
+@login_required
+def get_workflow_files(owner, repo):
+    token = session["github_token"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    # 1. Get the list of all workflows
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows"
+    resp = requests.get(url, headers=headers)
+
+    if resp.status_code == 404:
+        return jsonify([])
+    if resp.status_code != 200:
+        return jsonify({"error": f"GitHub API returned {resp.status_code}"}), resp.status_code
+
+    data = resp.json()
+    all_workflows = data.get('workflows', [])
+
+    # 2. Filter workflows: Must contain 'pytest'
+    pytest_workflows = []
+
+    for wf in all_workflows:
+        # Fetch content and check
+        print(f"Checking content of: {wf['path']}")
+        if contains_pytest(owner, repo, wf['path'], token):
+            pytest_workflows.append(wf)
+
+    print(f"Found {len(pytest_workflows)} pytest workflows")
+    return jsonify(pytest_workflows)
+
+def contains_pytest(owner, repo, file_path, token):
+    """
+    Helper to fetch file content and check for 'pytest'.
+    Uses the 'raw' media type to avoid Base64 decoding.
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3.raw" # Important: Asks for raw text
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            # Check if 'pytest' is in the file content
+            return "pytest" in resp.text
+        return False
+    except Exception as e:
+        print(f"Error fetching {file_path}: {e}")
+        return False
+
+@app.route("/api/repos/<owner>/<repo>/contents")
+@login_required
+def get_file_content(owner, repo):
+    """
+    Fetch the raw content of a specific file.
+    """
+    file_path = request.args.get("path")
+    if not file_path:
+        return jsonify({"error": "Path is required"}), 400
+
+    token = session["github_token"]
+
+    # URL to fetch file content
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
+
+    # Use the 'raw' header to get the plain text (YAML) directly
+    # avoiding the need to decode Base64 manually
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3.raw"
+    }
+
+    resp = requests.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        return jsonify({"error": "Could not fetch file content"}), resp.status_code
+
+    # Return the raw text content in a JSON wrapper
+    return jsonify({"content": resp.text})
 
 @app.route('/api/data/<path:repo_id>/<job_id>/<run_id>/summary', methods=['GET'])
 def get_summary(repo_id: str, job_id: str, run_id: str):
@@ -691,7 +815,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
             "SELECT run_time_all FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
             (run_id,)
         ).fetchone()
-        
+
         row = cursor.execute(
             "SELECT create_date FROM run_uid WHERE repo_run_id = ?",
             (run_id,)
@@ -876,7 +1000,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             WHERE ti.id = ?
             AND r.repo_run_id = ?
             """,
-            (test_id, run_id)  
+            (test_id, run_id)
         ).fetchall()
         coverage_rows = conn.execute(
             """
@@ -906,10 +1030,9 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
 
         conn.close()
 
-
         dependencies = []
         for dep in deps:
-            
+
             checksums_arr = array.array("i")
             checksums_arr.frombytes(dep["method_checksums"])
             dependencies.append(
@@ -920,7 +1043,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
                     "checksums": checksums_arr.tolist(),
                 }
             )
-        
+
 
         return jsonify({
             "test": dict(test),
@@ -963,6 +1086,7 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
             """,
             (run_id,)
         ).fetchall()
+
         conn.close()
         log.info("files_list_success count=%s", len(files))
 
@@ -1012,11 +1136,11 @@ def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
     except Exception:
         log_exception("files_query", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read files"}), 500
-    
-    
+
+
 @app.route("/api/data/<path:repo_id>/<job_id>/<int:run_id>/fileDependencies", methods=["GET"])
 def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
-   
+
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
@@ -1105,7 +1229,7 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
         "run_id": run_id,
         "files": files_list
     })
-   
+
 
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():
@@ -1236,7 +1360,7 @@ def get_pytest_report_path(repo_id: str, job_id: str, run_id: str) -> Path:
         )
         job_path.mkdir(parents=True, exist_ok=True)
         log.info("job_dir_create_success path=%s", job_path)
-    
+
     # Store as pytest_report_{run_id}.json in the job folder
     return job_path / f"pytest_report_{safe_run_id}.json"
 
@@ -1246,25 +1370,25 @@ def get_pytest_report_path(repo_id: str, job_id: str, run_id: str) -> Path:
 def upload_pytest_report():
     """Store pytest JSON report from CI/CD"""
     data = request.get_json()
-    
+
     if not data:
         log.warning("pytest_report_missing_data")
         return jsonify({"error": "No JSON data provided"}), 400
-    
+
     repo_id = request.args.get("repo_id") or data.get("repo_id")
     job_id = request.args.get("job_id") or data.get("job_id")
     run_id = request.args.get("run_id") or data.get("run_id")
     
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
-    
+
     if not repo_id or not job_id or not run_id:
         log.warning("pytest_report_missing_params")
         return jsonify({"error": "repo_id, job_id, and run_id are required"}), 400
-    
+
     try:
         # Register repo/job in metadata
         register_repo_job(repo_id, job_id)
-        
+
         # Save the pytest report
         report_path = get_pytest_report_path(repo_id, job_id, run_id)
         
@@ -1273,7 +1397,7 @@ def upload_pytest_report():
             json.dump(data, f, indent=2)
         
         size = report_path.stat().st_size
-        log.info("pytest_report_write_success dest=%s size=%s (%s)", 
+        log.info("pytest_report_write_success dest=%s size=%s (%s)",
                  report_path, size, human_bytes(size))
         
         # Update metadata with run info
@@ -1290,7 +1414,7 @@ def upload_pytest_report():
             }
             job_meta["last_updated"] = now_iso()
             save_metadata(metadata)
-        
+
         return jsonify({
             "success": True,
             "repo_id": repo_id,
@@ -1298,7 +1422,7 @@ def upload_pytest_report():
             "run_id": run_id,
             "tests_stored": len(data.get("tests", [])),
         })
-    
+
     except Exception:
         log_exception("pytest_report_upload", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to store pytest report"}), 500
@@ -1312,17 +1436,17 @@ def get_pytest_report():
     run_id = request.args.get("run_id")
     
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
-    
+
     if not repo_id or not job_id or not run_id:
         log.warning("pytest_report_get_missing_params")
         return jsonify({"error": "repo_id, job_id, and run_id are required"}), 400
-    
+
     report_path = get_pytest_report_path(repo_id, job_id, run_id)
-    
+
     if not report_path.exists():
         log.warning("pytest_report_not_found path=%s", report_path)
         return jsonify({"error": "Report not found"}), 404
-    
+
     try:
         with open(report_path, "r") as f:
             data = json.load(f)
@@ -1337,20 +1461,20 @@ def get_pytest_report():
 def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
     """Get summary of pytest run from stored JSON report"""
     g.repo_id, g.job_id = repo_id, job_id
-    
+
     report_path = get_pytest_report_path(repo_id, job_id, run_id)
-    
+
     if not report_path.exists():
         log.warning("pytest_summary_not_found path=%s", report_path)
         return jsonify({"error": "Report not found"}), 404
-    
+
     try:
         with open(report_path, "r") as f:
             data = json.load(f)
-        
+
         summary = data.get("summary", {})
         tests = data.get("tests", [])
-        
+
         # Calculate additional metrics
         total_duration = sum(
             t.get("setup", {}).get("duration", 0) +
@@ -1358,7 +1482,7 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
             t.get("teardown", {}).get("duration", 0)
             for t in tests
         )
-        
+
         # Group tests by file
         test_files = {}
         for test in tests:
@@ -1371,7 +1495,7 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
                 test_files[file_name]["passed"] += 1
             elif test.get("outcome") == "failed":
                 test_files[file_name]["failed"] += 1
-        
+
         # Get failed test details
         failed_tests = [
             {
@@ -1382,7 +1506,7 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
             }
             for t in tests if t.get("outcome") == "failed"
         ]
-        
+
         result = {
             "repo_id": repo_id,
             "job_id": job_id,
@@ -1402,10 +1526,10 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
             "file_count": len(test_files),
             "failed_tests": failed_tests,
         }
-        
+
         log.info("pytest_summary_success repo=%s job=%s run=%s", repo_id, job_id, run_id)
         return jsonify(result)
-    
+
     except Exception:
         log_exception("pytest_summary_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to read pytest summary"}), 500
@@ -1415,17 +1539,17 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
 def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
     """Get all tests from pytest JSON report"""
     g.repo_id, g.job_id = repo_id, job_id
-    
+
     report_path = get_pytest_report_path(repo_id, job_id, run_id)
-    
+
     if not report_path.exists():
         log.warning("pytest_tests_not_found path=%s", report_path)
         return jsonify({"error": "Report not found"}), 404
-    
+
     try:
         with open(report_path, "r") as f:
             data = json.load(f)
-        
+
         tests = []
         for t in data.get("tests", []):
             test_duration = (
@@ -1442,7 +1566,7 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
                 "failed": t.get("outcome") == "failed",
                 "error_message": t.get("call", {}).get("crash", {}).get("message") if t.get("outcome") == "failed" else None,
             })
-        
+
         log.info("pytest_tests_success count=%s", len(tests))
         return jsonify({
             "repo_id": repo_id,
@@ -1450,7 +1574,7 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
             "run_id": run_id,
             "tests": tests,
         })
-    
+
     except Exception:
         log_exception("pytest_tests_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to read pytest tests"}), 500
@@ -1460,19 +1584,19 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
 def list_runs(repo_id: str, job_id: str):
     """List all runs for a specific repo/job"""
     g.repo_id, g.job_id = repo_id, job_id
-    
+
     try:
         metadata = get_metadata()
-        
+
         if repo_id not in metadata.get("repos", {}):
             return jsonify({"error": "Repository not found"}), 404
-        
+
         if job_id not in metadata["repos"][repo_id].get("jobs", {}):
             return jsonify({"error": "Job not found"}), 404
-        
+
         job_meta = metadata["repos"][repo_id]["jobs"][job_id]
         runs = []
-        
+
         for run_id, run_data in job_meta.get("runs", {}).items():
             runs.append({
                 "run_id": run_id,
@@ -1481,17 +1605,17 @@ def list_runs(repo_id: str, job_id: str):
                 "duration": run_data.get("duration"),
                 "exitcode": run_data.get("exitcode"),
             })
-        
+
         # Sort by created date, newest first
         runs.sort(key=lambda x: x.get("created", ""), reverse=True)
-        
+
         log.info("list_runs_success repo=%s job=%s count=%s", repo_id, job_id, len(runs))
         return jsonify({
             "repo_id": repo_id,
             "job_id": job_id,
             "runs": runs,
         })
-    
+
     except Exception:
         log_exception("list_runs", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to list runs"}), 500
@@ -1575,9 +1699,7 @@ def serve_ezmon_fp(subpath: str):
     log.info("ezmon_fp_serve path=%s size=%s", fp_path, size)
     return send_from_directory(EZMON_FP_DIR, subpath, as_attachment=False)
 
-# -----------------------------------------------------------------------------
-# Entrypoint
-# -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     log.info("server_start data_dir=%s", BASE_DATA_DIR.absolute())
     print("Starting Testmon Multi-Project Server")

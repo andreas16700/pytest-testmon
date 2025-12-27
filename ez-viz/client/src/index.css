@@ -107,6 +107,21 @@
     @apply text-xs text-gray-500;
 }
 
+.sidebar-toggle-btn {
+    @apply absolute top-1/2 -translate-y-1/2 bg-white border border-gray-200 rounded-full shadow-md z-50 cursor-pointer flex items-center justify-center;
+    width: 24px;
+    height: 24px;
+
+    left: 344px;
+    transform: translate(-50%, -50%);
+    transition: left 0.4s ease-in-out, transform 0.4s ease-in-out;
+}
+
+.sidebar-toggle-btn:hover {
+    @apply bg-indigo-50 border-indigo-200 scale-110;
+    transition: all 0.2s ease;
+}
+
 /* Main Content Area */
 .app-content-area {
     @apply flex-1 bg-white rounded-xl shadow-2xl overflow-hidden flex flex-col;
@@ -776,7 +791,7 @@
 }
 /* Selector Bar Layout */
 .selector-bar {
-    @apply bg-gray-50 p-5 border-b-2 border-gray-200 flex gap-5 items-end flex-wrap;
+    @apply bg-gray-50 p-5 border-b-2 border-gray-200 flex gap-3 items-end flex-wrap;
 }
 
 .selector-group {
