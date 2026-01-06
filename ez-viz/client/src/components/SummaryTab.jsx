@@ -31,7 +31,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         const passed= totalTests - skipped - failed
         const [runtimeSpent, runtimeSaved] = currentTests.reduce(
             (acc, test) => {
-                if (test.forced === 0) {
+                if (test.forced !== null ) {
                     acc[0] += test.duration;
                 } else {
                     acc[1] += test.duration;
@@ -78,8 +78,8 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         datasets: [
             {
                 data: [primaryRun.stats.ran, primaryRun.stats.skipped],
-                backgroundColor: ["#3B82F6", "#10B981"],
-                borderColor: ["#2563EB", "#059669"],
+                backgroundColor: ["#10B981", "#eab308"],
+                borderColor: ["#059669", "#ca8a04"],
                 borderWidth: 2,
             },
         ],
@@ -89,8 +89,8 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         labels: ['Runtime Spent', 'Runtime Saved'],
         datasets: [{
             data: [primaryRun.stats.runtimeSpent, primaryRun.stats.runtimeSaved],
-            backgroundColor: ['#F59E0B', '#10B981'],
-            borderColor: ['#D97706', '#059669'],
+            backgroundColor: ['#ef4444', '#3B82F6'],
+            borderColor: ['#dc2626', '#2563EB'],
             borderWidth: 2,
         }],
     };
@@ -102,12 +102,36 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
             {
                 label: `Run ${runAData.id}`,
                 data: [runAData.stats.totalTests, runAData.stats.ran, runAData.stats.skipped, runAData.stats.failed],
-                backgroundColor: 'rgba(59, 130, 246, 0.7)',
+                backgroundColor: [
+                    'rgba(59, 130, 246, 0.7)',  // Total - blue
+                    'rgba(16, 185, 129, 0.7)',  // Executed - green
+                    'rgba(234, 179, 8, 0.7)',   // Skipped - yellow
+                    'rgba(239, 68, 68, 0.7)'    // Failed - red
+                ],
+                borderColor: [
+                    'rgba(59, 130, 246, 1)',
+                    'rgba(16, 185, 129, 1)',
+                    'rgba(234, 179, 8, 1)',
+                    'rgba(239, 68, 68, 1)'
+                ],
+                borderWidth: 1
             },
             {
                 label: `Run ${runBData.id}`,
                 data: [runBData.stats.totalTests, runBData.stats.ran, runBData.stats.skipped, runBData.stats.failed],
-                backgroundColor: 'rgba(16, 185, 129, 0.7)',
+                backgroundColor: [
+                    'rgba(59, 130, 246, 0.5)',  // Total - blue (lighter)
+                    'rgba(16, 185, 129, 0.5)',  // Executed - green (lighter)
+                    'rgba(234, 179, 8, 0.5)',   // Skipped - yellow (lighter)
+                    'rgba(239, 68, 68, 0.5)'    // Failed - red (lighter)
+                ],
+                borderColor: [
+                    'rgba(59, 130, 246, 1)',
+                    'rgba(16, 185, 129, 1)',
+                    'rgba(234, 179, 8, 1)',
+                    'rgba(239, 68, 68, 1)'
+                ],
+                borderWidth: 1
             },
         ],
     } : null;
@@ -239,8 +263,42 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                             {/* Comparison Chart */}
                             <div className="comparison-section">
                                 <h4 className="comparison-section-title">Visual Comparison</h4>
-                                <div className="comparison-chart-container">
-                                    <Bar data={comparisonChartData} options={{...chartOptions, maintainAspectRatio: false}} />
+                                <div className="comparison-chart-container" style={{ height: '400px', maxWidth: '900px', margin: '0 auto' }}>
+                                    <Bar 
+                                        data={comparisonChartData} 
+                                        options={{
+                                            ...chartOptions, 
+                                            maintainAspectRatio: false,
+                                            scales: {
+                                                y: {
+                                                    beginAtZero: true,
+                                                    ticks: {
+                                                        font: { size: 12 }
+                                                    }
+                                                },
+                                                x: {
+                                                    ticks: {
+                                                        font: { size: 12 }
+                                                    }
+                                                }
+                                            },
+                                            plugins: {
+                                                legend: { 
+                                                    position: 'top',
+                                                    labels: {
+                                                        font: { size: 13 },
+                                                        padding: 15
+                                                    }
+                                                },
+                                                tooltip: {
+                                                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                                    padding: 12,
+                                                    titleFont: { size: 14 },
+                                                    bodyFont: { size: 13 }
+                                                }
+                                            }
+                                        }} 
+                                    />
                                 </div>
                             </div>
                         </div>
@@ -255,7 +313,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                     return (
                                         <div
                                             key={index}
-                                            className={`run-card ${isSelected ? 'run-card-selected' : 'run-card-unselected'}`}
+                                           s className={`run-card ${isSelected ? 'run-card-selected' : 'run-card-unselected'}`}
                                             onClick={() => setSelectedRunId(runId)}
                                         >
                                             <div className="run-card-header">
@@ -271,7 +329,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                             </div>
                         </div>
 
-                        <div className="stats-grid">
+                        <div className="stats-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', maxWidth: '900px', margin: '0 auto' }}>
                             <StatCard
                                 title="Tests"
                                 value={primaryRun.summary.test_count || 0}

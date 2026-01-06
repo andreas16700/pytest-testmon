@@ -117,10 +117,10 @@ def download_testmon_data(testmon_file: Path) -> bool:
 def get_test_preferences() -> dict:
     """
     Download test_preferences.json from server.
-    Returns dict with 'always_run_tests' list.
+    Returns dict with 'always_run_tests' and 'prioritized_tests' lists.
     """
     if not should_sync():
-        return {"always_run_tests": []}
+        return {"always_run_tests": [], "prioritized_tests": []}
 
     env_vars = get_env_vars()
     server_url = env_vars["server_url"]
@@ -137,12 +137,14 @@ def get_test_preferences() -> dict:
         with urllib.request.urlopen(req, timeout=5) as response:
             if response.status == 200:
                 data = json.loads(response.read().decode())
-                logger.info(f"✅ Loaded preferences. Always run: {len(data.get('always_run_tests', []))} files")
-                return data
+                always_run = data.get('always_run_tests', [])
+                prioritized = data.get('prioritized_tests', [])
+                logger.info(f"✅ Loaded preferences. Always run: {len(always_run)} files, Prioritized: {len(prioritized)} files")
+                return {"always_run_tests": always_run, "prioritized_tests": prioritized}
     except Exception as e:
         logger.warning(f" Could not fetch preferences: {e}")
     
-    return {"always_run_tests": []}
+    return {"always_run_tests": [], "prioritized_tests": []}
 
 def upload_testmon_data(testmon_file: Path, repo_name: Optional[str] = None) -> bool:
     """
