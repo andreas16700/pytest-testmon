@@ -4,6 +4,7 @@ import SearchBox from "./SearchBox.jsx";
 
 function TestsTab({ allTests, search, setSearch, showTestDetails }) {
   const [sortByStatus, setSortByStatus] = useState(false);
+  const [sortByRuntime, setSortByRuntime] = useState(false);
 
   const [statusFilter, setStatusFilter] = useState({
     failed: true,
@@ -43,6 +44,14 @@ function TestsTab({ allTests, search, setSearch, showTestDetails }) {
     }));
   };
 
+  const handleSortByStatus = () => {
+    setSortByStatus((prev) => !prev);
+  };
+
+  const handleSortByRuntime = () => {
+    setSortByRuntime((prev) => !prev);
+  };
+
   const tests = useMemo(() => {
     let flat = allTests.flatMap((runData) =>
       runData.tests.map((test) => ({
@@ -57,12 +66,21 @@ function TestsTab({ allTests, search, setSearch, showTestDetails }) {
 
     flat = flat.filter((t) => statusFilter[getStatusKey(t)]);
 
-    if (sortByStatus) {
+    if (sortByStatus && sortByRuntime) {
+      // Sort by status first, then by runtime within each status group
+      flat = [...flat].sort((a, b) => {
+        const statusDiff = getStatusOrder(a) - getStatusOrder(b);
+        if (statusDiff !== 0) return statusDiff;
+        return (b.duration || 0) - (a.duration || 0);
+      });
+    } else if (sortByStatus) {
       flat = [...flat].sort((a, b) => getStatusOrder(a) - getStatusOrder(b));
+    } else if (sortByRuntime) {
+      flat = [...flat].sort((a, b) => (b.duration || 0) - (a.duration || 0));
     }
 
     return flat;
-  }, [allTests, search, sortByStatus, statusFilter]);
+  }, [allTests, search, sortByStatus, sortByRuntime, statusFilter]);
 
   return (
     <div className="tests-tab-container">
@@ -82,10 +100,20 @@ function TestsTab({ allTests, search, setSearch, showTestDetails }) {
           <input
             type="checkbox"
             checked={sortByStatus}
-            onChange={() => setSortByStatus((prev) => !prev)}
+            onChange={handleSortByStatus}
             className="sort-checkbox-input"
           />
           <span className="sort-label-text">Order by status</span>
+        </label>
+
+        <label className="sort-control-label">
+          <input
+            type="checkbox"
+            checked={sortByRuntime}
+            onChange={handleSortByRuntime}
+            className="sort-checkbox-input"
+          />
+          <span className="sort-label-text">Order by runtime</span>
         </label>
 
         {/* Status Filters Panel */}

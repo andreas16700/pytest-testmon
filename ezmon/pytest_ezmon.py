@@ -199,13 +199,15 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
 
 
 def pytest_configure(config):
-    # Initialize default
+    # Initialize defaults
     config.always_run_files = []
+    config.prioritized_files = []
 
     if should_sync():
-        # 1. Fetch preferences (Always Run Tests)
+        # 1. Fetch preferences (Always Run Tests and Prioritized Tests)
         prefs = get_test_preferences()
         config.always_run_files = list(prefs.get("always_run_tests", []))
+        config.prioritized_files = list(prefs.get("prioritized_tests", []))
         
         # 2. Download testmon data
         testmon_file = get_testmon_file(config)
@@ -519,12 +521,16 @@ class TestmonSelect:
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
         always_run_files = getattr(config, "always_run_files", [])
+        prioritized_files = getattr(config, "prioritized_files", [])
         print("always run files are", always_run_files)
+        print("prioritized files are", prioritized_files)
 
         # normalized versions (for comparison)
         normalized_always = [f.replace("\\", "/").lower() for f in always_run_files]
+        normalized_prioritized = [f.replace("\\", "/").lower() for f in prioritized_files]
 
         forced_by_file = {f: [] for f in always_run_files}
+        prioritized_by_file = {f: [] for f in prioritized_files}
         normal_selected = []
         deselected = []
         forced_count = 0
@@ -539,8 +545,8 @@ class TestmonSelect:
             # normalize to forward slashes + lowercase
             item_path_norm = item_path.replace(os.sep, "/").lower()
 
+            # Check if it's in always_run list first
             matched_forced = None
-            # preserve server order from always_run_files
             for original_f, norm_f in zip(always_run_files, normalized_always):
                 if item_path_norm.endswith(norm_f):
                     matched_forced = original_f
@@ -552,6 +558,19 @@ class TestmonSelect:
                     forced_count += 1
                 continue
 
+            # Check if it's in prioritized list (but not forced)
+            matched_prioritized = None
+            for original_f, norm_f in zip(prioritized_files, normalized_prioritized):
+                if item_path_norm.endswith(norm_f):
+                    matched_prioritized = original_f
+                    break
+
+            if matched_prioritized and item.nodeid not in self.deselected_tests:
+                # Only prioritize if testmon would run it anyway
+                prioritized_by_file[matched_prioritized].append(item)
+                continue
+
+            # Neither forced nor prioritized
             if item.nodeid in self.deselected_tests:
                 deselected.append(item)
             else:
@@ -565,10 +584,20 @@ class TestmonSelect:
 
         print("Forced tests are", forced)
 
-        # 2) Normal selected: duration priority (your existing testmon behavior)
+        # 2) Prioritized: user's order + source order (NOT duration-sorted)
+        prioritized = []
+        for f in prioritized_files:
+            prioritized_by_file[f].sort(key=source_order_key)
+            prioritized.extend(prioritized_by_file[f])
+
+        print("Prioritized tests are", prioritized)
+
+        # 3) Normal selected: duration priority (your existing testmon behavior)
         sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
 
-        selected = forced + normal_selected
+        selected = forced + prioritized + normal_selected
+
+
 
         if self.config.testmon_config.select:
             items[:] = selected
@@ -577,6 +606,8 @@ class TestmonSelect:
             )
             if forced_count > 0:
                 logger.info(f" Forced {forced_count} tests from always_run list")
+            if prioritized:
+                logger.info(f" Prioritized {len(prioritized)} tests from priority list")
         else:
             # 3) In noselect mode: also prioritize deselected by duration
             sort_items_by_duration(deselected, self.testmon_data.avg_durations)
