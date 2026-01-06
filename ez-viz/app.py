@@ -350,7 +350,7 @@ def login_required(f):
 
 @app.route("/auth/github/login")
 def github_login():
-    print(" INSIDEEEE GITHIB LOGIN !!!!!!!!!!!!")
+    
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
     params = {
