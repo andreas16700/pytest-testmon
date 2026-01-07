@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Save, ChevronDown, GripVertical, Info } from "lucide-react";
+import { Save, ChevronDown, GripVertical, Info, RotateCcw } from "lucide-react";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 
 const API_BASE = "/api";
@@ -31,13 +31,7 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
         ? prev.filter((filename) => filename !== testName)
         : [...prev, testName]
     );
-    setPrioritizedTests((prev) => {
-      if (!prev.includes(testName)) {
-        return [...prev, testName];
-      } else {
-        return prev;
-      }
-    });
+    // Don't automatically add to prioritized - user controls that separately
   };
 
   const handleFileClick = (fileName) => {
@@ -46,6 +40,11 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
 
   const handleSave = async () => {
     try {
+      // Order alwaysRunTests according to prioritizedTests order
+      const orderedAlwaysRunTests = prioritizedTests.filter(test => 
+        alwaysRunTests.includes(test)
+      );
+      
       const response = await fetch("/api/client/testPreferences", {
         method: "POST",
         headers: {
@@ -54,8 +53,8 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
         body: JSON.stringify({
           repo_id: currentRepo,
           job_id: currentJob,
-          alwaysRunTests: alwaysRunTests,
-          prioritizedLists: prioritizedTests,
+          alwaysRunTests: orderedAlwaysRunTests,
+          prioritizedTests: prioritizedTests,
         }),
       });
       if (response.ok) {
@@ -66,6 +65,36 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
     } catch (error) {
       console.error("Error saving preferences:", error);
       alert("Error saving test preferences");
+    }
+  };
+
+  const handleReset = async () => {
+    setAlwaysRunTests([]);
+    setPrioritizedTests([]);
+    setSearchTerm("");
+    setExpandedFile(null);
+
+    try {
+      const response = await fetch("/api/client/testPreferences", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          repo_id: currentRepo,
+          job_id: currentJob,
+          alwaysRunTests: [],
+          prioritizedTests: [],
+        }),
+      });
+      if (response.ok) {
+        alert("Selections reset and saved");
+      } else {
+        alert("Failed to reset preferences");
+      }
+    } catch (error) {
+      console.error("Error resetting preferences:", error);
+      alert("Error resetting preferences");
     }
   };
 
@@ -87,11 +116,29 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
 
     if (latestRun) {
       loadTestFileList(latestRun.id);
+      loadTestPreferences();
     }
   }, [repos]);
 
+  const loadTestPreferences = async () => {
+    try {
+      const response = await fetch(
+        `${API_BASE}/client/testPreferences?repo_id=${currentRepo}&job_id=${currentJob}`
+      );
+      const data = await response.json();
+
+      if (data.always_run_tests && data.always_run_tests.length > 0) {
+        setAlwaysRunTests(data.always_run_tests);
+      }
+      if (data.prioritized_tests && data.prioritized_tests.length > 0) {
+        setPrioritizedTests(data.prioritized_tests);
+      }
+    } catch (err) {
+      console.error("Failed to load test preferences:", err);
+    }
+  };
+
   const loadTestFileList = async (run_id) => {
-  
     try {
       const response = await fetch(
         `${API_BASE}/data/${currentRepo}/${currentJob}/${run_id}/test_files`
@@ -139,13 +186,7 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
         const [moved] = available.splice(source.index, 1);
         prioritized.splice(destination.index, 0, moved);
       } else {
-        const itemToMove = prioritized[source.index];
-
-        if (alwaysRunTests.includes(itemToMove.file_name)) {
-          setFailedAttemptId(itemToMove.file_name);
-          return;
-        }
-
+        // Moving from prioritized to available
         const [moved] = prioritized.splice(source.index, 1);
         available.splice(destination.index, 0, moved);
       }
@@ -298,16 +339,16 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
                                     handleFileClick(test.file_name)
                                   }
                                   className={`draggable-item 
-                                                                                ${
-                                                                                  snapshot.isDragging
-                                                                                    ? "draggable-item-dragging"
-                                                                                    : "draggable-item-static"
-                                                                                } 
-                                                                                ${
-                                                                                  isExpanded
-                                                                                    ? "draggable-item-expanded"
-                                                                                    : "draggable-item-collapsed"
-                                                                                }`}
+                                  ${
+                                    snapshot.isDragging
+                                      ? "draggable-item-dragging"
+                                      : "draggable-item-static"
+                                  } 
+                                  ${
+                                    isExpanded
+                                      ? "draggable-item-expanded"
+                                      : "draggable-item-collapsed"
+                                  }`}
                                 >
                                   <div className="draggable-content">
                                     <GripVertical
@@ -445,9 +486,8 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
                                 </li>
                                 {failedAttemptId === test.file_name && (
                                   <div className="failed-attempt-message">
-                                    Since this was selected to always run, it is
-                                    prioritized by default. To remove it, first
-                                    uncheck the box in the above component.
+                                    This test is in the priority list. It will run in priority order IF testmon selects it.
+                                    Check the box above to FORCE it to always run.
                                   </div>
                                 )}
                                 {isExpanded && (
@@ -482,17 +522,29 @@ function TestManagementTab({ repos, currentRepo, currentJob, currentRuns }) {
         </DragDropContext>
       </div>
 
-      <div className="save-button-container">
+      <div
+        className="save-button-container"
+        style={{ display: "flex", gap: "1rem", justifyContent: "center" }}
+      >
         <button onClick={handleSave} className="save-button">
           <Save size={20} />
           Save Choices
         </button>
+        <button
+          onClick={handleReset}
+          className="save-button"
+          style={{ backgroundColor: "#ef4444", borderColor: "#dc2626" }}
+        >
+          <RotateCcw size={20} />
+          Reset Selections
+        </button>
       </div>
       <div className="tip-box">
         <p className="tip-text">
-          <strong>Tip:</strong> You can search and select tests to always run
-          AND/OR you can prioritize test runs. Save your configuration for your
-          CI pipeline.
+          <strong>Tip:</strong> 
+          <br />• <strong>Checked tests (Always Run):</strong> Will ALWAYS be forced to run in your priority order
+          <br />• <strong>Prioritized but unchecked:</strong> Only run IF testmon selects them (due to changes), but in your priority order instead of duration order
+          <br />• Save your configuration for your CI pipeline.
         </p>
       </div>
     </div>

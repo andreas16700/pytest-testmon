@@ -350,6 +350,7 @@ def login_required(f):
 
 @app.route("/auth/github/login")
 def github_login():
+    
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
     params = {
@@ -1306,16 +1307,18 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
 
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():
-    """Store user's test preferences (which tests to always run)"""
+    """Store user's test preferences (which tests to always run and which to prioritize)"""
     
     # Get data from request body (JSON)
     data = request.get_json()
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
     
-    selected_test_files = data.get("alwaysRunTests", [])  # Array of test file names
+    always_run_tests = data.get("alwaysRunTests", [])  # Array of test file names
+    prioritized_tests = data.get("prioritizedTests", [])  # Array of test file names
     
-    log.info("Selected test files !!!!!!!!"  ,selected_test_files)
+    log.info("Always run tests", always_run_tests)
+    log.info("Prioritized tests", prioritized_tests)
     # Enrich per-request context for logging
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -1323,9 +1326,9 @@ def upload_test_preferences():
         log.warning("preferences_missing_params")
         return jsonify({"error": "repo_id and job_id are required"}), 400
 
-    if not isinstance(selected_test_files, list):
+    if not isinstance(always_run_tests, list) or not isinstance(prioritized_tests, list):
         log.warning("preferences_invalid_format")
-        return jsonify({"error": "selectedTests must be an array"}), 400
+        return jsonify({"error": "alwaysRunTests and prioritizedTests must be arrays"}), 400
 
     try:
         # Create preferences file path
@@ -1333,16 +1336,18 @@ def upload_test_preferences():
         preferences_path = job_path / "test_preferences.json"
         
         log.info(
-            "preferences_write_attempt path=%s test_count=%s", 
+            "preferences_write_attempt path=%s always_run=%s prioritized=%s", 
             preferences_path, 
-            len(selected_test_files)
+            len(always_run_tests),
+            len(prioritized_tests)
         )
         
         # Store preferences as JSON
         preferences_data = {
             "repo_id": repo_id,
             "job_id": job_id,
-            "always_run_tests": selected_test_files,
+            "always_run_tests": always_run_tests,
+            "prioritized_tests": prioritized_tests,
             "updated_at": now_iso(),
         }
         
@@ -1351,17 +1356,19 @@ def upload_test_preferences():
         
         size = preferences_path.stat().st_size
         log.info(
-            "preferences_write_success path=%s size=%s (%s) test_count=%s",
+            "preferences_write_success path=%s size=%s (%s) always_run=%s prioritized=%s",
             preferences_path,
             size,
             human_bytes(size),
-            len(selected_test_files)
+            len(always_run_tests),
+            len(prioritized_tests)
         )
 
         return jsonify({
             "success": True,
             "message": f"Test preferences saved for {repo_id}/{job_id}",
-            "test_count": len(selected_test_files),
+            "always_run_count": len(always_run_tests),
+            "prioritized_count": len(prioritized_tests),
         }), 200
 
     except Exception:
@@ -1393,11 +1400,18 @@ def get_test_preferences():
                 "repo_id": repo_id,
                 "job_id": job_id,
                 "always_run_tests": [],
+                "prioritized_tests": [],
                 "updated_at": None,
             }), 200
         
         with open(preferences_path, "r") as f:
             preferences_data = json.load(f)
+        
+        # Ensure both fields exist for backward compatibility
+        if "prioritized_tests" not in preferences_data:
+            preferences_data["prioritized_tests"] = []
+        if "always_run_tests" not in preferences_data:
+            preferences_data["always_run_tests"] = []
         
         size = preferences_path.stat().st_size
         log.info(
