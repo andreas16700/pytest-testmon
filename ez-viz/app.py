@@ -581,6 +581,62 @@ def download_testmon_data():
         log_exception("download_send_file", path=str(db_path))
         return jsonify({"error": "Failed to send file"}), 500
 
+@app.route("/api/client/upload_graph", methods=["POST"])
+def upload_dependency_graph():
+    file = request.files.get("file")
+    repo_id = request.form.get("repo_id")
+    job_id = request.form.get("job_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not file:
+        log.warning("upload_graph_missing_file")
+        return jsonify({"error": "No file provided"}), 400
+
+    log.info(
+        "upload_graph_received filename=%s", getattr(file, "filename", None)
+    )
+
+    if not repo_id or not job_id:
+        log.warning("upload_graph_missing_params")
+        return jsonify({"error": "repo_id and job_id are required"}), 400
+
+    try:
+        # 1. Determine Path
+        # We get the standard DB path, then swap the filename
+        db_path = get_job_db_path(repo_id, job_id)
+        graph_path = db_path.with_name("dependency_graph.html")
+
+        # 2. Write File
+        log.info("graph_write_attempt dest=%s", graph_path)
+        file.save(graph_path)
+
+        size = graph_path.stat().st_size
+        log.info("graph_write_success dest=%s size=%s (%s)", graph_path, size, human_bytes(size))
+
+        # 3. Update Metadata
+        metadata = get_metadata()
+        job_meta = metadata["repos"][repo_id]["jobs"][job_id]
+
+        job_meta["last_updated"] = now_iso()
+        # Add a flag or timestamp specifically for the graph so the UI knows to show the button
+        job_meta["last_graph_upload"] = now_iso()
+
+        save_metadata(metadata)
+        log.info("upload_graph_metadata_updated")
+
+        return jsonify(
+            {
+                "success": True,
+                "message": f"Dependency graph uploaded for {repo_id}/{job_id}",
+                "graph_path": str(graph_path.relative_to(BASE_DATA_DIR)),
+            }
+        ), 200
+
+    except Exception:
+        log_exception("upload_graph_handler", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Graph upload failed"}), 500
+
 @app.route("/api/client/exists", methods=["GET"])
 def check_testmon_data_exists():
     repo_id = request.args.get("repo_id")
@@ -609,6 +665,23 @@ def _open_db_or_404(repo_id: str, job_id: str):
         log.warning("db_missing path=%s", db_path)
         return None, jsonify({"error": "No data found"}), 404
     return db_path, None, None
+
+@app.route("/api/dependencyGraph/<path:repo_id>/<job_id>", methods=["GET"])
+def retrieve_dependency_graph(repo_id: str, job_id: str):
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        job_path = db_path.parent
+        dependency_graph_path = job_path / "dependency_graph.html"
+
+        if not dependency_graph_path.exists():
+            log.error(f"GRAPH NOT FOUND!")
+            log.error(f"Looking at: {dependency_graph_path}")
+            log.error(f"Resolved absolute path: {dependency_graph_path.resolve()}")
+            return {"error": "Graph not found"}, 404
+        else:
+            return send_file(dependency_graph_path)
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 @app.route("/api/repos", methods=["GET"])
 def list_repos():

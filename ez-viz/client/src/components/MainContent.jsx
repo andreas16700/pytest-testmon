@@ -26,7 +26,7 @@ function MainContent({
                          setSelectedRunId,
                          repos
                      }) {
-    // 1. Loading State
+
     if (loading) {
         return (
             <div className="state-container">
@@ -38,7 +38,6 @@ function MainContent({
         );
     }
 
-    // 2. Error State
     if (error) {
         return (
             <div className="state-container">
@@ -49,7 +48,6 @@ function MainContent({
         );
     }
 
-    // 3. Empty State (No Data selected)
     if (summary.length === 0) {
         return (
             <div className="state-container">
@@ -66,7 +64,6 @@ function MainContent({
         );
     }
 
-    // 4. Main Tabbed Content
     const totalTests = allTests.reduce((total, run) => total + (run.tests?.length || 0), 0);
     const totalFiles = allFiles.reduce((total, run) => total + (run.files?.length || 0), 0);
 
@@ -104,12 +101,11 @@ function MainContent({
                 {activeTab === "files" && (
                     <FilesTab
                         currentRepo={currentRepo}
+                        currentJob={currentJob}
                         allFiles={allFiles}
                         search={fileSearch}
                         setSearch={setFileSearch}
                         showFileDetails={showFileDetails}
-                        currentRuns={currentRuns}
-                        currentJob={currentJob}
                     />
                 )}
 

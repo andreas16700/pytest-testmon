@@ -112,8 +112,6 @@ def download_testmon_data(testmon_file: Path) -> bool:
         return False
 
 
-
-
 def get_test_preferences() -> dict:
     """
     Download test_preferences.json from server.
@@ -198,4 +196,51 @@ def upload_testmon_data(testmon_file: Path, repo_name: Optional[str] = None) -> 
         logger.warning(f"⚠️  Upload failed: {e}")
         logger.exception("Full error traceback:")
         logger.info("   Next run won't have optimization data")
+        return False
+
+def upload_dependency_graph(graph_file: Path) -> bool:
+    """
+    Upload dependency graph HTML to server after test run.
+    Returns true if upload successful, false otherwise
+    """
+    if not should_sync():
+        logger.debug("Server sync disabled (missing env vars)")
+        return False
+
+    if not graph_file.exists():
+        logger.debug(f"No dependency graph found at {graph_file} to upload.")
+        return False
+
+    env_vars = get_env_vars()
+    server_url = env_vars["server_url"]
+    repo_id = env_vars["repo_id"]
+
+    url = f"{server_url}/api/client/upload_graph"
+
+    logger.info(f"Uploading dependency graph: repo={repo_id}, size={graph_file.stat().st_size:,} bytes")
+
+    try:
+        with open(graph_file, 'rb') as f:
+            files = {
+                'file': ('dependency_graph.html', f, 'text/html')
+            }
+            data = {
+                'repo_id': repo_id,
+                'job_id': env_vars["job_id"],
+                'run_id': env_vars["run_id"],
+                'type': 'graph'
+            }
+
+            response = requests.post(url, files=files, data=data, timeout=30)
+
+            if response.status_code == 200:
+                logger.info("Graph upload successful")
+                return True
+            else:
+                logger.warning(f"Graph upload failed (HTTP {response.status_code})")
+                logger.debug(f"Response: {response.text}")
+                return False
+
+    except Exception as e:
+        logger.warning(f"Graph upload exception: {e}")
         return False

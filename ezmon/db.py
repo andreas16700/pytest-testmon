@@ -157,8 +157,7 @@ class DB:  # pylint: disable=too-many-public-methods
         run_saved_time,
         exec_id=exec_id
         )
-        
-        
+
         self.write_increment_run_id_attribute()
         with self.con as con:
             cursor = con.cursor()
@@ -175,9 +174,7 @@ class DB:  # pylint: disable=too-many-public-methods
             run_all_tests=run_all_tests,
             run_uid=run_uid
         )
-        
-        
-        
+
         self.write_test_info_attribute(run_uid)
         
         self.write_file_fp_infos(run_uid)
@@ -195,9 +192,6 @@ class DB:  # pylint: disable=too-many-public-methods
             },
             exec_id=None,
         )
-
-  
-        
 
     def fetch_saving_stats(self, exec_id, select):
         (
@@ -592,8 +586,6 @@ class DB:  # pylint: disable=too-many-public-methods
             );
         """
 
-
-
     def init_tables(self):
         connection = self.con
 
@@ -604,14 +596,12 @@ class DB:  # pylint: disable=too-many-public-methods
             + self._create_temp_tables_statement()
             + self._create_file_fp_statement()
             + self._create_test_execution_ffp_statement() 
-            +self.create_run_uid_statement()
+            + self.create_run_uid_statement()
             + self._create_run_infos_statement()
-            +self._create_test_infos_statement()
+            + self._create_test_infos_statement()
             + self._create__file_fp_infos_statement()
             + self._create_test_execution_file_fp_infos_statement()
-            + self._create_test_execution_coverage_statement() 
-           
-            
+            + self._create_test_execution_coverage_statement()
         )
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
@@ -652,9 +642,6 @@ class DB:  # pylint: disable=too-many-public-methods
             )
 
         return result
-    
-    
-
     
     def insert_coverage_lines(self, exec_id, nodes_files_lines):
        
@@ -702,10 +689,6 @@ class DB:  # pylint: disable=too-many-public-methods
                     """,
                     rows,
                 )
-
-    
-    
-    
 
     def fetch_unknown_files(
         self, files_fshas, exec_id

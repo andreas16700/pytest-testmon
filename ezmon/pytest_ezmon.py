@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
-from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync
+from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync, upload_dependency_graph
 from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
@@ -31,6 +31,7 @@ from ezmon.testmon_core import (
 )
 from ezmon import configure
 from ezmon.common import get_logger, get_system_packages
+from ezmon import graph as ezmon_graph
 
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
@@ -115,6 +116,13 @@ def pytest_addoption(parser):
         help=(
             "This is used for internal beta. Please don't use. You can go to https://www.testmon.net/ to register."
         ),
+    )
+
+    group.addoption(
+        "--ezmon-graph",
+        action="store_true",
+        dest="ezmon_graph",
+        help="Generate an interactive dependency graph (dependency_graph.html) of the project."
     )
 
     parser.addini("environment_expression", "environment expression", default="")
@@ -235,7 +243,6 @@ def pytest_configure(config):
         except TestmonException as error:
             pytest.exit(str(error))
 
-
 def pytest_report_header(config):
     tm_conf = config.testmon_config
 
@@ -305,8 +312,6 @@ def changed_message(
         message += f"environment: {environment}"
     return message
 
-
-
 def pytest_unconfigure(config):
     # Close and commit database FIRST (flush all changes to disk)
     if hasattr(config, "testmon_data"):
@@ -337,7 +342,7 @@ def pytest_unconfigure(config):
     # Upload if sync is enabled - AFTER database is committed and closed
     if should_sync():
         testmon_file = get_testmon_file(config)
-        
+        graph_file = testmon_file.parent / "dependency_graph.html"
         # Give file system time to flush
         time.sleep(0.2)
         
@@ -347,6 +352,13 @@ def pytest_unconfigure(config):
             upload_testmon_data(testmon_file, repo_name)
         else:
             logger.info("No testmon data to upload")
+
+        if config.getoption("--ezmon-graph"):
+            if graph_file.exists() and graph_file.stat().st_size > 0:
+                logger.info(f"Uploading Graph: {graph_file.stat().st_size:,} bytes")
+                upload_dependency_graph(graph_file)
+            else:
+                logger.warning(f"--ezmon-graph was set, but {graph_file.name} was not found or is empty.")
 
 
 class TestmonCollect:
@@ -585,6 +597,11 @@ class TestmonSelect:
     def pytest_sessionfinish(self, session, exitstatus):
         if len(self.deselected_tests) and exitstatus == ExitCode.NO_TESTS_COLLECTED:
             session.exitstatus = ExitCode.OK
+
+        if self.config.getoption("ezmon_graph"):
+            root_dir = self.config.rootdir.strpath
+            logger.info("Generating dependency graph...")
+            ezmon_graph.generate_graph(root_dir)
 
     @pytest.hookimpl(trylast=True)
     def pytest_terminal_summary(self):
