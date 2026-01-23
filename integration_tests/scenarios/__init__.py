@@ -435,3 +435,94 @@ register(Scenario(
     expected_selected=["tests/test_cache_manager.py::TestCacheManagerContext::test_context_manager_enter"],
     expected_deselected=[],
 ))
+
+
+# =============================================================================
+# LIMITATION DEMONSTRATION SCENARIOS
+# These scenarios demonstrate known limitations of the ezmon approach
+# =============================================================================
+
+# test_config_reader.py tests
+TEST_CONFIG_LOAD = "tests/test_config_reader.py::TestLoadConfig::test_load_config_returns_dict"
+TEST_CONFIG_THRESHOLD = "tests/test_config_reader.py::TestLoadConfig::test_load_config_has_threshold"
+TEST_CONFIG_SETTING = "tests/test_config_reader.py::TestGetSetting::test_get_setting_returns_value"
+TEST_CONFIG_DEFAULT = "tests/test_config_reader.py::TestGetSetting::test_get_setting_default"
+TEST_CONFIG_VALUE = "tests/test_config_reader.py::TestGetSetting::test_get_value_from_config"
+TEST_CONFIG_DARK_MODE = "tests/test_config_reader.py::TestFeatureFlags::test_feature_enabled_dark_mode"
+TEST_CONFIG_NOTIFICATIONS = "tests/test_config_reader.py::TestFeatureFlags::test_feature_disabled_notifications"
+TEST_CONFIG_UNKNOWN = "tests/test_config_reader.py::TestFeatureFlags::test_feature_unknown_returns_false"
+TEST_CONFIG_GET_THRESHOLD = "tests/test_config_reader.py::TestThreshold::test_get_threshold"
+TEST_CONFIG_PROCESS = "tests/test_config_reader.py::TestThreshold::test_process_with_config_filters"
+TEST_CONFIG_EMPTY = "tests/test_config_reader.py::TestThreshold::test_process_with_config_empty"
+
+ALL_CONFIG_TESTS = [
+    TEST_CONFIG_LOAD, TEST_CONFIG_THRESHOLD, TEST_CONFIG_SETTING,
+    TEST_CONFIG_DEFAULT, TEST_CONFIG_VALUE, TEST_CONFIG_DARK_MODE,
+    TEST_CONFIG_NOTIFICATIONS, TEST_CONFIG_UNKNOWN, TEST_CONFIG_GET_THRESHOLD,
+    TEST_CONFIG_PROCESS, TEST_CONFIG_EMPTY
+]
+
+# test_import_only.py tests
+TEST_IMPORT_CONSTANT = "tests/test_import_only.py::TestModuleLevelCode::test_uses_constant"
+TEST_IMPORT_DERIVED = "tests/test_import_only.py::TestModuleLevelCode::test_uses_derived_constant"
+TEST_IMPORT_CLASS_ATTR = "tests/test_import_only.py::TestClassLevelCode::test_uses_class_attribute"
+TEST_IMPORT_INSTANTIATE = "tests/test_import_only.py::TestClassLevelCode::test_instantiates_class_only"
+TEST_IMPORT_CALLS_METHOD = "tests/test_import_only.py::TestMethodExecution::test_calls_method"
+TEST_IMPORT_CALLS_ANOTHER = "tests/test_import_only.py::TestMethodExecution::test_calls_another_method"
+TEST_IMPORT_CALLS_FUNC = "tests/test_import_only.py::TestFunctionExecution::test_calls_imported_function"
+TEST_IMPORT_CALLS_HELPER = "tests/test_import_only.py::TestFunctionExecution::test_calls_helper_function"
+TEST_IMPORT_NOT_CALLS = "tests/test_import_only.py::TestFunctionExecution::test_imports_but_not_calls_function"
+
+ALL_IMPORT_TESTS = [
+    TEST_IMPORT_CONSTANT, TEST_IMPORT_DERIVED, TEST_IMPORT_CLASS_ATTR,
+    TEST_IMPORT_INSTANTIATE, TEST_IMPORT_CALLS_METHOD, TEST_IMPORT_CALLS_ANOTHER,
+    TEST_IMPORT_CALLS_FUNC, TEST_IMPORT_CALLS_HELPER, TEST_IMPORT_NOT_CALLS
+]
+
+
+# -----------------------------------------------------------------------------
+# LIMITATION: File dependency not tracked
+# Changes to config.json should trigger tests but currently won't
+# This test should FAIL until file dependency tracking is implemented
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_config_file",
+    description="LIMITATION: Change config.json - tests that read it should run",
+    modifications=[
+        Modification(
+            file="config.json",
+            action="replace",
+            target='"threshold": 50',
+            content='"threshold": 75',
+        )
+    ],
+    # IDEAL behavior: Tests that depend on config.json should be selected
+    # This scenario will FAIL until file dependency tracking is implemented
+    expected_selected=[TEST_CONFIG_PROCESS, TEST_CONFIG_GET_THRESHOLD],
+    expected_deselected=[],
+))
+
+
+# -----------------------------------------------------------------------------
+# LIMITATION: Import without execution
+# Changing a function that's imported but not called should affect test
+# if the test imports that module (even without calling the function)
+# This test should FAIL until import tracking is implemented
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_uncalled_method",
+    description="LIMITATION: Change imported function - all tests importing it should run",
+    modifications=[
+        Modification(
+            file="src/import_only.py",
+            action="replace",
+            target='def helper_function(x):\n    """Helper function that might be imported but not used."""\n    return x * 2',
+            content='def helper_function(x):\n    """Helper function that might be imported but not used."""\n    multiplied = x * 2\n    return multiplied',
+        )
+    ],
+    # IDEAL behavior: Both tests should be selected because they both import
+    # the module, even if one doesn't call the function
+    # This scenario will FAIL until import tracking is implemented
+    expected_selected=[TEST_IMPORT_CALLS_HELPER, TEST_IMPORT_NOT_CALLS],
+    expected_deselected=[],
+))

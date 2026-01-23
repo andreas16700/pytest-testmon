@@ -300,6 +300,57 @@ This affects both:
 
 This is a known limitation of the coverage.py context tracking approach used by ezmon (and upstream testmon).
 
+## Known Limitations
+
+### 1. File Dependencies Not Tracked
+
+Ezmon only tracks Python source file dependencies. If a test reads data from a JSON, YAML, CSV, or other non-Python file, changes to that file will **not** trigger test re-runs.
+
+```python
+# src/config_reader.py
+def load_config():
+    with open("config.json") as f:
+        return json.load(f)
+
+# tests/test_config.py
+def test_config_value():
+    config = load_config()
+    assert config["threshold"] == 50  # Value from config.json
+```
+
+If `config.json` changes, the test will **not** be re-run.
+
+**Potential solution**: Track file reads via `open()` monkey-patching or import hooks.
+
+### 2. External Package Dependencies (Coarse Granularity)
+
+Ezmon tracks all external packages in a single `system_packages` hash. When **any** package changes, **all** tests are marked as affected.
+
+- Test A uses `requests`
+- Test B uses `numpy`
+- Update `requests` → Both tests re-run (should only be Test A)
+
+**Potential solution**: Track which packages each test imports and create per-test package fingerprints.
+
+### 3. Import Without Execution
+
+When a module is imported but specific functions are not called during test execution, those functions are **not** tracked in the test's fingerprint.
+
+```python
+from mymodule import helper_function  # Imported but not called
+
+def test_something():
+    assert callable(helper_function)  # Never executes helper_function body
+```
+
+If `helper_function()` body changes, this test will **not** be re-run.
+
+**Note**: This is by design - ezmon tracks executed code, not imported code. If the function body isn't executed, there's no dependency.
+
+### 4. Coverage Context Limitation (see above)
+
+Only the first test to execute a code path gets the dependency recorded. This is a fundamental limitation of coverage.py's dynamic context tracking.
+
 ## Command Line Options
 
 | Option | Description |
@@ -378,7 +429,7 @@ tests/
 integration_tests/          # Scenario-based integration tests
 ├── run_integration_tests.py    # Main test runner with version verification
 ├── test_all_versions.py        # Multi-version testing (Python 3.7-3.13)
-├── scenarios/__init__.py       # Declarative scenario definitions (8 scenarios)
+├── scenarios/__init__.py       # Declarative scenario definitions (15 scenarios)
 ├── sample_project/             # Example project with clear dependencies
 └── README.md
 ```
@@ -435,10 +486,18 @@ The integration tests use declarative scenarios that modify code and verify indi
 | `modify_decorator` | Change memoize() | Decorators and closures |
 | `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
 
+**Limitation Demonstration Scenarios (intentionally fail until fixes implemented):**
+
+| Scenario | Description | Status |
+|----------|-------------|--------|
+| `modify_config_file` | Change config.json | **FAILS** - expects tests to run |
+| `modify_uncalled_method` | Change imported but uncalled function | **FAILS** - expects all importing tests to run |
+
 ### Sample Project Structure
 
 ```
 sample_project/
+├── config.json            # Config file (for limitation tests)
 ├── src/
 │   ├── math_utils.py      # Basic functions (add, subtract, etc.)
 │   ├── string_utils.py    # String manipulation (uppercase, lowercase)
@@ -447,7 +506,10 @@ sample_project/
 │   ├── data_processor.py  # Complex patterns: inheritance, nested classes,
 │   │                      # static/class methods, properties
 │   ├── cache_manager.py   # Decorators, context managers, closures
-│   └── generators.py      # Generators, iterators, pipelines
+│   ├── generators.py      # Generators, iterators, pipelines
+│   ├── config_reader.py   # File dependency demonstration
+│   ├── external_deps.py   # External package dependency demo
+│   └── import_only.py     # Import without execution demo
 └── tests/
     ├── test_math_utils.py
     ├── test_string_utils.py
@@ -455,7 +517,10 @@ sample_project/
     ├── test_formatter.py
     ├── test_data_processor.py   # 21 tests for complex class patterns
     ├── test_cache_manager.py    # 22 tests for decorators/context managers
-    └── test_generators.py       # 31 tests for generators/iterators
+    ├── test_generators.py       # 31 tests for generators/iterators
+    ├── test_config_reader.py    # 11 tests (file dependency limitation)
+    ├── test_external_deps.py    # 9 tests (external deps limitation)
+    └── test_import_only.py      # 9 tests (import tracking)
 ```
 
 This verifies:
@@ -468,3 +533,5 @@ This verifies:
 - **Generators**: Generator functions with `yield` are tracked correctly
 - **Decorators**: Decorator functions and closures are tracked correctly
 - **Context managers**: `__enter__`/`__exit__` methods are tracked correctly
+- **File dependency limitation**: Non-Python file changes don't trigger re-runs
+- **Import without execution**: Imported but uncalled functions don't create dependencies

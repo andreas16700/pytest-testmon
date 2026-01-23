@@ -9,8 +9,9 @@ integration_tests/
 ├── run_integration_tests.py  # Test runner script
 ├── test_all_versions.py      # Multi-version test script
 ├── scenarios/
-│   └── __init__.py           # Scenario definitions (13 scenarios)
+│   └── __init__.py           # Scenario definitions (15 scenarios)
 └── sample_project/           # Example project with various code patterns
+    ├── config.json            # Config file (for limitation tests)
     ├── src/
     │   ├── math_utils.py      # Basic functions (add, subtract, etc.)
     │   ├── string_utils.py    # String manipulation functions
@@ -19,7 +20,10 @@ integration_tests/
     │   ├── data_processor.py  # Complex: inheritance, nested classes,
     │   │                      # static/class methods, properties
     │   ├── cache_manager.py   # Decorators, context managers, closures
-    │   └── generators.py      # Generators, iterators, pipelines
+    │   ├── generators.py      # Generators, iterators, pipelines
+    │   ├── config_reader.py   # File dependency demonstration
+    │   ├── external_deps.py   # External package dependency demo
+    │   └── import_only.py     # Import without execution demo
     └── tests/
         ├── test_math_utils.py       # 10 tests
         ├── test_string_utils.py     # 6 tests
@@ -27,7 +31,10 @@ integration_tests/
         ├── test_formatter.py        # 6 tests
         ├── test_data_processor.py   # 21 tests
         ├── test_cache_manager.py    # 22 tests
-        └── test_generators.py       # 31 tests (104 total)
+        ├── test_generators.py       # 31 tests
+        ├── test_config_reader.py    # 11 tests (file dependency)
+        ├── test_external_deps.py    # 9 tests (external deps)
+        └── test_import_only.py      # 9 tests (import tracking)
 ```
 
 ## Method-Level Fingerprinting
@@ -164,6 +171,64 @@ These scenarios test fingerprinting with advanced Python constructs:
 | `modify_generator` | Change fibonacci() | Generator functions (yield) |
 | `modify_decorator` | Change memoize() | Decorators and closures |
 | `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
+
+### Limitation Demonstration Scenarios
+
+These scenarios **intentionally fail** to demonstrate known limitations. They will pass once the corresponding fixes are implemented.
+
+| Scenario | Description | Current Status |
+|----------|-------------|----------------|
+| `modify_config_file` | Change config.json | **FAILS** - expects tests to run, but none do |
+| `modify_uncalled_method` | Change imported but uncalled function | **FAILS** - expects all importing tests to run |
+
+## Known Limitations
+
+### 1. File Dependencies Not Tracked
+
+Ezmon only tracks Python source file dependencies. If a test reads data from a JSON, YAML, CSV, or other non-Python file, changes to that file will **not** trigger test re-runs.
+
+**Example:**
+```python
+# src/config_reader.py
+def load_config():
+    with open("config.json") as f:
+        return json.load(f)
+
+# tests/test_config.py
+def test_config_value():
+    config = load_config()
+    assert config["threshold"] == 50  # This value comes from config.json
+```
+
+If `config.json` changes from `{"threshold": 50}` to `{"threshold": 75}`, the test will **not** be re-run even though it would now fail.
+
+### 2. External Package Dependencies
+
+Ezmon tracks all external packages in a single hash (`system_packages`). When **any** package changes (added, removed, or updated), **all** tests are marked as affected.
+
+There's no granular tracking of which tests use which external packages.
+
+**Example:**
+- Test A uses only `requests`
+- Test B uses only `numpy`
+- Test C uses neither
+
+If you update `requests`, ideally only Test A should re-run. But currently, all tests will be marked as affected.
+
+### 3. Import Without Execution
+
+When a module is imported but specific functions are not called during test execution, those functions are **not** in the test's fingerprint.
+
+**Example:**
+```python
+from mymodule import helper_function  # Imported but not called
+
+def test_something():
+    assert callable(helper_function)  # Only checks it exists
+    # Does NOT actually call helper_function()
+```
+
+If `helper_function()` body changes, this test will **not** be re-run because it never executed that code path.
 
 ## How It Works
 

@@ -1,0 +1,10 @@
+{
+    "setting": "production",
+    "value": 42,
+    "threshold": 50,
+    "features": {
+        "dark_mode": true,
+        "notifications": false,
+        "beta_features": true
+    }
+}
