@@ -329,27 +329,32 @@ class IntegrationTestRunner:
             file_path.unlink()
             self.log(f"Deleted: {mod.file}", "debug")
 
-        # Force filesystem sync
+        # Force filesystem sync and wait for mtime to update
         os.sync()
+        import time
+        time.sleep(0.1)  # Ensure filesystem mtime is updated
 
     def parse_test_results(self, stdout: str) -> Tuple[Set[str], int]:
         """
-        Parse pytest output to determine which tests were selected/deselected.
-        Returns (selected_files, deselected_count).
+        Parse pytest output to determine which individual tests were selected/deselected.
+        Returns (selected_tests, deselected_count).
+
+        Ezmon tracks at the method level, so we verify individual test selection.
         """
-        selected_files = set()
+        selected_tests = set()
         deselected_count = 0
 
         # Match test results like "tests/test_math_utils.py::TestAdd::test_positive_numbers PASSED"
-        for match in re.finditer(r'tests/(test_\w+\.py)::\S+\s+(PASSED|FAILED|ERROR|SKIPPED)', stdout):
-            selected_files.add(match.group(1))
+        # Capture the full test path
+        for match in re.finditer(r'(tests/test_\w+\.py::\S+)\s+(PASSED|FAILED|ERROR|SKIPPED)', stdout):
+            selected_tests.add(match.group(1))
 
         # Match deselected count: "X deselected"
         deselect_match = re.search(r'(\d+) deselected', stdout)
         if deselect_match:
             deselected_count = int(deselect_match.group(1))
 
-        return selected_files, deselected_count
+        return selected_tests, deselected_count
 
     def run_scenario(self, scenario: Scenario) -> Tuple[bool, str]:
         """
@@ -385,34 +390,36 @@ class IntegrationTestRunner:
             self.log("Running pytest --ezmon after modifications...", "debug")
             returncode, stdout, stderr = self.run_pytest_ezmon(workspace, python_venv)
 
-            # Parse results
-            selected_files, deselected_count = self.parse_test_results(stdout)
+            # Parse results - returns individual test names
+            selected_tests, deselected_count = self.parse_test_results(stdout)
 
             # Verify expectations
             errors = []
 
-            # Check expected selected
+            # Check expected selected tests
             for expected in scenario.expected_selected:
-                if expected not in selected_files:
+                if expected not in selected_tests:
                     errors.append(f"Expected {expected} to be SELECTED but it wasn't")
 
             if errors:
-                self.log(f"Selected: {', '.join(sorted(selected_files)) or 'none'}", "debug")
+                self.log(f"Selected: {', '.join(sorted(selected_tests)) or 'none'}", "debug")
 
-            # Check expected deselected
+            # Check expected deselected tests
             for expected in scenario.expected_deselected:
-                if expected in selected_files:
+                if expected in selected_tests:
                     errors.append(f"Expected {expected} to be DESELECTED but it was selected")
 
             # Special case: no changes scenario
             if not scenario.modifications and not scenario.expected_selected:
-                if selected_files:
-                    errors.append(f"Expected no tests to run but got: {selected_files}")
+                if selected_tests:
+                    errors.append(f"Expected no tests to run but got: {selected_tests}")
 
             if errors:
                 return False, "; ".join(errors)
 
-            return True, f"Selected: {sorted(selected_files) or 'none'}, Deselected: {deselected_count}"
+            # Format summary: show just test names (without full path) for readability
+            selected_names = [t.split("::")[-1] for t in sorted(selected_tests)]
+            return True, f"Selected: {selected_names or 'none'}, Deselected: {deselected_count}"
 
         finally:
             self.cleanup_workspace()

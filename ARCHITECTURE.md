@@ -25,7 +25,34 @@ This distinction exists because of Python's dynamic nature. When the interpreter
 
 ### Fingerprints
 
-A **fingerprint** is a collection of CRC32 checksums representing the code blocks that a test depends on. When any of these checksums change, the test is marked as "affected" and needs to re-run.
+Each test has a **fingerprint per Python module** it used during execution. A fingerprint is a collection of CRC32 checksums representing the code blocks within that module that the test depends on.
+
+**Fingerprint structure (per test, per module):**
+```
+Test → Module Fingerprint = [checksum1, checksum2, ...]
+  where checksums include:
+  - Module-level checksum: The entire file with function/method bodies stripped
+    (imports, class definitions, module-level statements, function signatures)
+  - Method/function body checksums: One for each function/method the test executed
+    (as reported by coverage.py)
+```
+
+**Example:** `test_calculator.py::TestCalculator::test_add` might have:
+```
+Fingerprints:
+  src/calculator.py: [3477891697, 2557190835, 2213528436]
+    └─ 3477891697 = module-level (class Calculator definition, imports)
+    └─ 2557190835 = Calculator.__init__() body
+    └─ 2213528436 = Calculator.calculate() body
+
+  src/math_utils.py: [86328506, 377580465]
+    └─ 86328506 = module-level (function definitions)
+    └─ 377580465 = add() body
+
+  tests/test_calculator.py: [291892047, 3281913381]
+    └─ 291892047 = module-level (imports, class TestCalculator)
+    └─ 3281913381 = test_add() body
+```
 
 **Fingerprint creation process:**
 ```
@@ -223,6 +250,56 @@ This approach:
 - **Allows additions**: New code blocks don't invalidate existing fingerprints
 - **Ignores comments**: Comment-only changes don't trigger re-runs
 
+## Method-Level Fingerprinting
+
+Ezmon tracks dependencies at the **method level**, not just file level. Each test has a fingerprint **per module** containing:
+1. The module-level checksum (file with function bodies stripped)
+2. Checksums for each function/method body the test executed
+
+When you modify a function, only tests that have that function's checksum in their fingerprint will be re-run.
+
+**Example:**
+```
+# test_add has fingerprint for math_utils.py: [module_checksum, add_checksum]
+# test_subtract has fingerprint for math_utils.py: [module_checksum, subtract_checksum]
+
+# Modify math_utils.add()
+# → add_checksum changes
+# → Only test_add re-runs (it has add_checksum in its fingerprint)
+# → test_subtract is NOT affected (it only has subtract_checksum)
+
+# Modify calculator.clear_history()
+# → Only test_clear_history re-runs (it's the only test with clear_history checksum)
+```
+
+## Coverage Context Limitation
+
+**Important**: Due to a fundamental limitation in coverage.py's dynamic context tracking, only the **first test to execute a code path** gets recorded as depending on that code. Subsequent tests calling the same code (under different contexts) don't get the dependency recorded.
+
+This affects both:
+1. **Tests across different files**: First file to import gets the dependency
+2. **Tests within the same file**: First test to call a function gets the dependency
+
+**Example:**
+```
+# Test order: test_calculator.py → test_math_utils.py (alphabetical)
+
+# test_calculator.py::TestCalculator::test_add runs first, calls math_utils.add()
+# → Gets dependency on math_utils.add() ✓
+
+# test_calculator.py::TestCalculatorHistory::test_history_recording runs later
+# → Also calls add() but it's already traced, no dependency recorded ✗
+
+# test_math_utils.py runs later, imports same math_utils
+# → math_utils.py already traced, no dependencies recorded ✗
+```
+
+**Implications:**
+- Changes to `math_utils.add()` will only trigger `test_calculator.py::TestCalculator::test_add` to re-run
+- `test_history_recording` and `test_math_utils.py` tests won't re-run even though they use add()
+
+This is a known limitation of the coverage.py context tracking approach used by ezmon (and upstream testmon).
+
 ## Command Line Options
 
 | Option | Description |
@@ -331,33 +408,54 @@ python integration_tests/test_all_versions.py --list-versions
 
 ### Integration Test Scenarios
 
-The integration tests use declarative scenarios that modify code and verify selection:
+The integration tests use declarative scenarios that modify code and verify individual test selection. This verifies method-level fingerprinting is working correctly.
 
-| Scenario | Description | Expected Selected | Expected Deselected |
-|----------|-------------|-------------------|---------------------|
-| `modify_math_utils` | Change math_utils.add() | test_math_utils, test_calculator | test_string_utils, test_formatter |
-| `modify_string_utils` | Change string_utils.uppercase() | test_string_utils, test_formatter | test_math_utils, test_calculator |
-| `modify_calculator_only` | Change calculator.clear_history() | test_calculator | test_math_utils, test_string_utils, test_formatter |
-| `modify_formatter_only` | Change formatter.set_style() | test_formatter | test_math_utils, test_string_utils, test_calculator |
-| `modify_test_only` | Change only test_math_utils.py | test_math_utils | test_calculator, test_string_utils, test_formatter |
-| `no_changes` | No modifications | (none) | (all tests) |
-| `add_new_test` | Add a new test file | test_new | (all existing tests) |
-| `multiple_modifications` | Change both math_utils and string_utils | (all tests) | (none) |
+**Note**: Due to the coverage context limitation (see above), only the first test to execute each function gets the dependency recorded.
+
+**Basic Scenarios:**
+
+| Scenario | Description | Expected Selected Test |
+|----------|-------------|----------------------|
+| `modify_math_utils` | Change math_utils.add() | `TestCalculator::test_add` |
+| `modify_string_utils` | Change string_utils.uppercase() | `TestFormatter::test_upper_style` |
+| `modify_calculator_only` | Change Calculator.clear_history() | `TestCalculatorHistory::test_clear_history` |
+| `modify_formatter_only` | Change Formatter.set_style() | `TestFormatterStyleChange::test_change_style` |
+| `modify_test_only` | Change test_math_utils::TestAdd::test_positive_numbers | `TestAdd::test_positive_numbers` |
+| `no_changes` | No modifications | (none) |
+| `add_new_test` | Add a new test file | `test_new_feature`, `test_another_new` |
+| `multiple_modifications` | Change subtract() and lowercase() | `test_subtract`, `test_lower_style` |
+
+**Complex Code Pattern Scenarios:**
+
+| Scenario | Description | Pattern Tested |
+|----------|-------------|----------------|
+| `modify_nested_class_method` | Change Statistics.mean() | Nested class methods |
+| `modify_static_method` | Change BaseProcessor.validate_data() | Static methods |
+| `modify_generator` | Change fibonacci() | Generator functions (yield) |
+| `modify_decorator` | Change memoize() | Decorators and closures |
+| `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
 
 ### Sample Project Structure
 
 ```
 sample_project/
 ├── src/
-│   ├── math_utils.py     # No dependencies
-│   ├── string_utils.py   # No dependencies
-│   ├── calculator.py     # Depends on math_utils
-│   └── formatter.py      # Depends on string_utils
+│   ├── math_utils.py      # Basic functions (add, subtract, etc.)
+│   ├── string_utils.py    # String manipulation (uppercase, lowercase)
+│   ├── calculator.py      # Class using math_utils
+│   ├── formatter.py       # Class using string_utils
+│   ├── data_processor.py  # Complex patterns: inheritance, nested classes,
+│   │                      # static/class methods, properties
+│   ├── cache_manager.py   # Decorators, context managers, closures
+│   └── generators.py      # Generators, iterators, pipelines
 └── tests/
     ├── test_math_utils.py
     ├── test_string_utils.py
     ├── test_calculator.py
-    └── test_formatter.py
+    ├── test_formatter.py
+    ├── test_data_processor.py   # 21 tests for complex class patterns
+    ├── test_cache_manager.py    # 22 tests for decorators/context managers
+    └── test_generators.py       # 31 tests for generators/iterators
 ```
 
 This verifies:
@@ -365,3 +463,8 @@ This verifies:
 - **Module isolation**: Modify `string_utils` → only string tests run
 - **Indirect deps**: `Calculator` uses `math_utils` → changes propagate
 - **Comment immunity**: Comment-only changes don't trigger re-runs (AST-based)
+- **Nested classes**: Modifications to nested class methods correctly trigger dependent tests
+- **Static/class methods**: Static and class methods are tracked independently
+- **Generators**: Generator functions with `yield` are tracked correctly
+- **Decorators**: Decorator functions and closures are tracked correctly
+- **Context managers**: `__enter__`/`__exit__` methods are tracked correctly

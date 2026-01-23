@@ -9,36 +9,76 @@ integration_tests/
 ├── run_integration_tests.py  # Test runner script
 ├── test_all_versions.py      # Multi-version test script
 ├── scenarios/
-│   └── __init__.py           # Scenario definitions
-└── sample_project/           # Example project with clear dependencies
+│   └── __init__.py           # Scenario definitions (13 scenarios)
+└── sample_project/           # Example project with various code patterns
     ├── src/
-    │   ├── math_utils.py     # No dependencies
-    │   ├── string_utils.py   # No dependencies
-    │   ├── calculator.py     # Depends on math_utils
-    │   └── formatter.py      # Depends on string_utils
+    │   ├── math_utils.py      # Basic functions (add, subtract, etc.)
+    │   ├── string_utils.py    # String manipulation functions
+    │   ├── calculator.py      # Class using math_utils
+    │   ├── formatter.py       # Class using string_utils
+    │   ├── data_processor.py  # Complex: inheritance, nested classes,
+    │   │                      # static/class methods, properties
+    │   ├── cache_manager.py   # Decorators, context managers, closures
+    │   └── generators.py      # Generators, iterators, pipelines
     └── tests/
-        ├── test_math_utils.py
-        ├── test_string_utils.py
-        ├── test_calculator.py
-        └── test_formatter.py
+        ├── test_math_utils.py       # 10 tests
+        ├── test_string_utils.py     # 6 tests
+        ├── test_calculator.py       # 8 tests
+        ├── test_formatter.py        # 6 tests
+        ├── test_data_processor.py   # 21 tests
+        ├── test_cache_manager.py    # 22 tests
+        └── test_generators.py       # 31 tests (104 total)
 ```
 
-## Dependency Graph
+## Method-Level Fingerprinting
+
+Ezmon tracks dependencies at the **method level**, not just file level. Each test has a fingerprint **per Python module** it used, containing:
+1. The module-level checksum (file with function/method bodies stripped)
+2. Checksums for each function/method body the test actually executed (as reported by coverage.py)
+
+When you modify a specific function, only tests that have that function's checksum in their fingerprint will be re-run.
+
+For example:
+- Modify `math_utils.add()` → Only `TestCalculator::test_add` runs (it has add() checksum)
+- Modify `calculator.clear_history()` → Only `TestCalculatorHistory::test_clear_history` runs
+
+## Coverage Limitation
+
+**Important**: Due to a fundamental limitation in coverage.py's dynamic context tracking, only the **first test to execute a code path** gets recorded as depending on that code. Subsequent tests calling the same code (under different contexts) don't get the dependency recorded.
+
+This affects both:
+1. **Tests across different files**: First file to import gets the dependency
+2. **Tests within the same file**: First test to call a function gets the dependency
+
+For example:
+- `test_calculator.py` imports `math_utils` **first** → Gets math_utils dependencies
+- `test_math_utils.py` runs **later** → Does NOT get math_utils dependency recorded
+
+## Individual Test Dependencies
+
+Due to the coverage limitation, here's what each test depends on (based on execution order):
 
 ```
-math_utils.py ──> calculator.py
-                        │
-                        ▼
-              test_calculator.py (also tests math_utils indirectly)
+test_calculator.py (runs first, gets math_utils dependency):
+  TestCalculator::test_add         → add()
+  TestCalculator::test_subtract    → subtract()
+  TestCalculator::test_multiply    → multiply()
+  TestCalculator::test_divide      → divide()
+  TestCalculator::test_divide_by_zero → divide()
+  TestCalculator::test_unknown_operator → (no math function)
+  TestCalculatorHistory::test_history_recording → (add already traced, no dep)
+  TestCalculatorHistory::test_clear_history → clear_history()
 
-math_utils.py ──> test_math_utils.py
+test_formatter.py (runs second, gets string_utils dependency):
+  TestFormatter::test_upper_style  → uppercase()
+  TestFormatter::test_lower_style  → lowercase()
+  TestFormatter::test_title_style  → capitalize()
+  TestFormatter::test_default_style → (uppercase already traced, no dep)
+  TestFormatter::test_unknown_style → (no string function)
+  TestFormatterStyleChange::test_change_style → set_style()
 
-string_utils.py ──> formatter.py
-                        │
-                        ▼
-              test_formatter.py (also tests string_utils indirectly)
-
-string_utils.py ──> test_string_utils.py
+test_math_utils.py / test_string_utils.py:
+  → Only depend on themselves (source deps already traced by earlier tests)
 ```
 
 ## Running Integration Tests
@@ -100,16 +140,30 @@ python integration_tests/test_all_versions.py --scenario modify_math_utils
 
 ## Available Scenarios
 
-| Scenario | Description | Expected Selected | Expected Deselected |
-|----------|-------------|-------------------|---------------------|
-| `modify_math_utils` | Change math_utils.add() | test_math_utils, test_calculator | test_string_utils, test_formatter |
-| `modify_string_utils` | Change string_utils.uppercase() | test_string_utils, test_formatter | test_math_utils, test_calculator |
-| `modify_calculator_only` | Change calculator.clear_history() | test_calculator | test_math_utils, test_string_utils, test_formatter |
-| `modify_formatter_only` | Change formatter.set_style() | test_formatter | test_math_utils, test_string_utils, test_calculator |
-| `modify_test_only` | Change only test_math_utils.py | test_math_utils | test_calculator, test_string_utils, test_formatter |
-| `no_changes` | No modifications | (none) | (all tests) |
-| `add_new_test` | Add a new test file | test_new | (all existing tests) |
-| `multiple_modifications` | Change both math_utils and string_utils | (all tests) | (none) |
+### Basic Scenarios
+
+| Scenario | Description | Expected Selected Test |
+|----------|-------------|----------------------|
+| `modify_math_utils` | Change math_utils.add() | `TestCalculator::test_add` |
+| `modify_string_utils` | Change string_utils.uppercase() | `TestFormatter::test_upper_style` |
+| `modify_calculator_only` | Change Calculator.clear_history() | `TestCalculatorHistory::test_clear_history` |
+| `modify_formatter_only` | Change Formatter.set_style() | `TestFormatterStyleChange::test_change_style` |
+| `modify_test_only` | Change test_math_utils.py::TestAdd::test_positive_numbers | `TestAdd::test_positive_numbers` |
+| `no_changes` | No modifications | (none) |
+| `add_new_test` | Add a new test file | `test_new_feature`, `test_another_new` |
+| `multiple_modifications` | Change subtract() and lowercase() | `test_subtract`, `test_lower_style` |
+
+### Complex Code Pattern Scenarios
+
+These scenarios test fingerprinting with advanced Python constructs:
+
+| Scenario | Description | Pattern Tested |
+|----------|-------------|----------------|
+| `modify_nested_class_method` | Change Statistics.mean() | Nested class methods |
+| `modify_static_method` | Change BaseProcessor.validate_data() | Static methods |
+| `modify_generator` | Change fibonacci() | Generator functions (yield) |
+| `modify_decorator` | Change memoize() | Decorators and closures |
+| `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
 
 ## How It Works
 
@@ -120,7 +174,7 @@ python integration_tests/test_all_versions.py --scenario modify_math_utils
 5. **Baseline run**: Runs `pytest --ezmon` to build the dependency database
 6. **Apply modifications**: Makes the code changes defined in the scenario
 7. **Test run**: Runs `pytest --ezmon` again
-8. **Verify**: Parses output to verify expected tests were selected/deselected
+8. **Verify**: Parses output to verify expected individual tests were selected/deselected
 
 ## Version Verification
 
@@ -147,12 +201,14 @@ register(Scenario(
             content="new code",
         )
     ],
-    expected_selected=["test_file.py"],
-    expected_deselected=["other_test.py"],
+    expected_selected=["tests/test_file.py::TestClass::test_method"],
+    expected_deselected=["tests/other_test.py::TestClass::test_other"],
 ))
 ```
 
-**Important**: Ezmon uses AST-based fingerprinting, so modifications must change actual code structure, not just comments!
+**Important**:
+- Ezmon uses AST-based fingerprinting, so modifications must change actual code structure, not just comments!
+- Use full test paths like `tests/test_file.py::TestClass::test_method` for expected_selected/deselected
 
 ## Supported Python Versions
 
