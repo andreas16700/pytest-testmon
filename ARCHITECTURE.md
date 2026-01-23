@@ -1,6 +1,6 @@
 # pytest-ezmon Architecture Documentation
 
-**Version:** 2.1.4-a1
+**Version:** 2.1.4-a2
 **Fork of:** [pytest-testmon](https://github.com/tarpas/pytest-testmon)
 **Python Support:** 3.7+ (we maintain compatibility with Python 3.7, unlike upstream which requires 3.10+)
 
@@ -288,53 +288,80 @@ The following bug fixes from upstream testmon have been merged (as of v2.1.4-a2)
 
 ## Test Suite
 
-The project includes a comprehensive test suite in `tests/`:
+The project includes a comprehensive test suite with unit tests and scenario-based integration tests:
+
+### Structure
+
+```
+tests/
+├── conftest.py             # Shared fixtures
+├── test_process_code.py    # Unit tests for fingerprint generation (24 tests)
+└── README.md
+
+integration_tests/          # Scenario-based integration tests
+├── run_integration_tests.py    # Main test runner with version verification
+├── test_all_versions.py        # Multi-version testing (Python 3.7-3.13)
+├── scenarios/__init__.py       # Declarative scenario definitions (8 scenarios)
+├── sample_project/             # Example project with clear dependencies
+└── README.md
+```
 
 ### Running Tests
 
 ```bash
-# Quick: Run all tests
+# Unit tests
 pytest tests/ -v
-
-# With coverage
 pytest tests/ -v --cov=ezmon --cov-report=term-missing
 
-# Multi-version testing with tox
-tox                    # All environments
-tox -e py37            # Python 3.7
-tox -e py310-pytest9   # Python 3.10 + pytest 9
+# Integration tests - all scenarios
+python integration_tests/run_integration_tests.py
+
+# Integration tests - specific scenario
+python integration_tests/run_integration_tests.py --scenario modify_math_utils
+
+# Integration tests - with specific Python version
+python integration_tests/run_integration_tests.py --python python3.7 --expect-version 3.7
+
+# Multi-version testing (all available Python versions)
+python integration_tests/test_all_versions.py
+
+# List available versions
+python integration_tests/test_all_versions.py --list-versions
 ```
 
-### Test Categories
+### Integration Test Scenarios
 
-| File | Description |
-|------|-------------|
-| `test_ezmon_selection.py` | Integration tests verifying selection/deselection behavior |
-| `test_process_code.py` | Unit tests for fingerprint generation |
+The integration tests use declarative scenarios that modify code and verify selection:
 
-### Integration Test Structure
+| Scenario | Description | Expected Selected | Expected Deselected |
+|----------|-------------|-------------------|---------------------|
+| `modify_math_utils` | Change math_utils.add() | test_math_utils, test_calculator | test_string_utils, test_formatter |
+| `modify_string_utils` | Change string_utils.uppercase() | test_string_utils, test_formatter | test_math_utils, test_calculator |
+| `modify_calculator_only` | Change calculator.clear_history() | test_calculator | test_math_utils, test_string_utils, test_formatter |
+| `modify_formatter_only` | Change formatter.set_style() | test_formatter | test_math_utils, test_string_utils, test_calculator |
+| `modify_test_only` | Change only test_math_utils.py | test_math_utils | test_calculator, test_string_utils, test_formatter |
+| `no_changes` | No modifications | (none) | (all tests) |
+| `add_new_test` | Add a new test file | test_new | (all existing tests) |
+| `multiple_modifications` | Change both math_utils and string_utils | (all tests) | (none) |
 
-The `example_project` fixture creates a minimal project to test selection granularity:
+### Sample Project Structure
 
 ```
-src/
-├── math_utils.py       # add, subtract, multiply, divide + MODULE_CONSTANT
-├── string_utils.py     # uppercase, lowercase, reverse
-└── calculator.py       # Calculator class using add/subtract
-
-tests/
-├── test_math_add.py        # Tests only add()
-├── test_math_subtract.py   # Tests only subtract()
-├── test_math_multiply.py   # Tests only multiply()
-├── test_math_all.py        # Tests all math functions
-├── test_strings.py         # Tests string_utils
-├── test_calculator.py      # Tests Calculator (indirect)
-└── test_import_only.py     # Imports module, uses constant only
+sample_project/
+├── src/
+│   ├── math_utils.py     # No dependencies
+│   ├── string_utils.py   # No dependencies
+│   ├── calculator.py     # Depends on math_utils
+│   └── formatter.py      # Depends on string_utils
+└── tests/
+    ├── test_math_utils.py
+    ├── test_string_utils.py
+    ├── test_calculator.py
+    └── test_formatter.py
 ```
 
 This verifies:
 - **Function isolation**: Modify `add()` → only tests using `add()` run
 - **Module isolation**: Modify `string_utils` → only string tests run
-- **Constant tracking**: Modify `MODULE_CONSTANT` → `test_import_only` runs
-- **Indirect deps**: `Calculator` uses `add`/`subtract` → changes propagate
-- **Comment immunity**: Comment-only changes don't trigger re-runs
+- **Indirect deps**: `Calculator` uses `math_utils` → changes propagate
+- **Comment immunity**: Comment-only changes don't trigger re-runs (AST-based)

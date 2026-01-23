@@ -1,122 +1,82 @@
 # pytest-ezmon Test Suite
 
-This directory contains the test suite for pytest-ezmon, verifying that the plugin correctly selects and deselects tests based on code changes.
+This directory contains unit tests for pytest-ezmon, verifying the core fingerprinting and code processing logic.
 
 ## Test Structure
 
 ```
 tests/
-├── conftest.py                 # Shared fixtures including example_project
-├── test_ezmon_selection.py     # Integration tests for selection behavior
-├── test_process_code.py        # Unit tests for fingerprint generation
-└── README.md                   # This file
+├── conftest.py             # Shared fixtures
+├── test_process_code.py    # Unit tests for fingerprint generation (24 tests)
+└── README.md               # This file
+
+integration_tests/          # Separate directory for integration tests
+├── run_integration_tests.py    # Main integration test runner
+├── test_all_versions.py        # Multi-version test script
+├── scenarios/                  # Declarative test scenarios
+│   └── __init__.py
+├── sample_project/             # Example project with clear dependencies
+└── README.md                   # Integration test documentation
 ```
 
-## Running Tests
+## Running Unit Tests
 
 ### Quick Start
 
 ```bash
-# Run all tests
+# Run all unit tests
 pytest tests/ -v
 
 # Run with coverage
 pytest tests/ -v --cov=ezmon --cov-report=term-missing
 ```
 
-### Using tox (Multi-Version Testing)
+### Specific Tests
 
 ```bash
-# Install tox
-pip install tox
+# Run fingerprint tests only
+pytest tests/test_process_code.py -v
 
-# Run all environments
-tox
-
-# Run specific Python version
-tox -e py37
-tox -e py310
-
-# Run specific pytest version
-tox -e py310-pytest7
-tox -e py310-pytest8
-tox -e py310-pytest9
-
-# Run linting
-tox -e lint
+# Run a specific test
+pytest tests/test_process_code.py::test_module_blocks -v
 ```
 
-### Specific Test Categories
-
-```bash
-# Run only baseline collection tests
-pytest tests/test_ezmon_selection.py::TestBaselineCollection -v
-
-# Run function-level granularity tests
-pytest tests/test_ezmon_selection.py::TestFunctionLevelGranularity -v
-
-# Run module-level change tests
-pytest tests/test_ezmon_selection.py::TestModuleLevelChanges -v
-
-# Run comment-only change tests
-pytest tests/test_ezmon_selection.py::TestCommentOnlyChanges -v
-```
-
-## Test Categories
-
-### Integration Tests (test_ezmon_selection.py)
-
-These tests use pytest's `pytester` fixture to create temporary projects and verify ezmon's selection behavior:
-
-| Category | Description |
-|----------|-------------|
-| `TestBaselineCollection` | First run executes all, second run deselects all |
-| `TestFunctionLevelGranularity` | Modifying function X only selects tests using X |
-| `TestModuleLevelChanges` | Module-level changes (constants) properly detected |
-| `TestIndirectDependencies` | Indirect dependencies (A→B→C) handled correctly |
-| `TestNewAndDeletedTests` | New tests always run, deleted tests handled gracefully |
-| `TestCommentOnlyChanges` | Comments don't trigger test selection |
-| `TestFailingTests` | Failing tests re-run until fixed |
-| `TestNoSelectMode` | `--ezmon-noselect` runs all but still collects |
-| `TestMultipleChanges` | Multiple simultaneous file changes |
-
-### Unit Tests (test_process_code.py)
+## Unit Tests (test_process_code.py)
 
 These tests verify the core fingerprinting logic:
 
 | Test | Description |
 |------|-------------|
-| `test_module_fingerprint` | Module creates correct fingerprint |
+| `test_module_blocks` | Module creates correct block structure |
 | `test_function_blocks` | Function bodies extracted as separate blocks |
+| `test_class_method_blocks` | Class methods tracked correctly |
+| `test_nested_function_blocks` | Nested functions handled properly |
 | `test_comment_stripping` | Comments stripped before checksum |
 | `test_fingerprint_matching` | Fingerprints match/mismatch correctly |
+| `test_changed_function_body` | Function body changes detected |
+| `test_changed_module_level` | Module-level changes detected |
+| `test_added_function` | New functions don't break existing fingerprints |
+| `test_removed_function` | Removed functions properly invalidate fingerprints |
 
-## Example Project Structure
+## Integration Tests
 
-The `example_project` fixture creates this test structure:
+For integration tests that verify end-to-end selection behavior, see `integration_tests/README.md`.
 
+Integration tests use:
+- A sample project with clear dependency chains
+- Declarative scenarios that modify code and verify selection
+- Multi-version Python testing (3.7-3.13)
+
+```bash
+# Run all integration scenarios
+python integration_tests/run_integration_tests.py
+
+# Run across all Python versions
+python integration_tests/test_all_versions.py
+
+# List available scenarios
+python integration_tests/run_integration_tests.py --list
 ```
-src/
-├── __init__.py
-├── math_utils.py       # add, subtract, multiply, divide + MODULE_CONSTANT
-├── string_utils.py     # uppercase, lowercase, reverse, join_strings
-└── calculator.py       # Calculator class using add/subtract
-
-tests/
-├── test_math_add.py        # Tests only add() - 3 tests
-├── test_math_subtract.py   # Tests only subtract() - 2 tests
-├── test_math_multiply.py   # Tests only multiply() - 2 tests
-├── test_math_all.py        # Tests all math functions - 2 tests
-├── test_strings.py         # Tests string_utils - 3 tests
-├── test_calculator.py      # Tests Calculator (indirect) - 3 tests
-└── test_import_only.py     # Imports module, uses constant - 2 tests
-```
-
-This structure allows testing:
-- **Function isolation**: Modify `add()` → only `test_math_add` and `test_calculator` run
-- **Module isolation**: Modify `string_utils` → only `test_strings` runs
-- **Constant tracking**: Modify `MODULE_CONSTANT` → `test_import_only` runs
-- **Indirect deps**: `Calculator` uses `add`/`subtract` → changes propagate
 
 ## Python Version Compatibility
 
