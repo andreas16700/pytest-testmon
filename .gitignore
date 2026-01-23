@@ -53,6 +53,4 @@ nosetests.xml
 # Any hidden files
 /htmlcov/
 /tags
-/tests/
-/tox.ini
 tmserver

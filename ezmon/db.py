@@ -525,7 +525,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 duration FLOAT,
                 failed BIT,
                 forced BIT,
-                FOREIGN KEY({self._test_execution_fk_column()}) REFERENCES {self._test_execution_fk_table()}(id));
+                FOREIGN KEY({self._test_execution_fk_column()}) REFERENCES {self._test_execution_fk_table()}(id) ON DELETE CASCADE);
                 CREATE INDEX test_execution_fk_name ON test_execution ({self._test_execution_fk_column()}, test_name);
             """
 
@@ -560,7 +560,7 @@ class DB:  # pylint: disable=too-many-public-methods
             CREATE TABLE test_execution_file_fp (
                 test_execution_id INTEGER,
                 fingerprint_id INTEGER,
-                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id),
+                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
                 FOREIGN KEY(fingerprint_id) REFERENCES file_fp(id)
             );
             CREATE INDEX test_execution_file_fp_both ON test_execution_file_fp (test_execution_id, fingerprint_id);
@@ -569,7 +569,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 suite_execution_id INTEGER,
                 filename TEXT,
                 fsha text,
-                FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id)
+                FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id) ON DELETE CASCADE
                 );
                 CREATE UNIQUE INDEX sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
             """
@@ -887,6 +887,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 id, environment_name, system_packages, python_version
                 FROM environment
                 WHERE environment_name = ?
+                ORDER BY id DESC
                 """,
                 (environment_name,),
             ).fetchone()
@@ -899,7 +900,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 )
             else:
                 packages_changed = False
-            if not environment or packages_changed:
+            if not environment:
                 try:
                     cursor.execute(
                         """
@@ -924,6 +925,21 @@ class DB:  # pylint: disable=too-many-public-methods
                         (environment_name,),
                     ).fetchone()
                     environment_id = environment["id"]
+            elif packages_changed:
+                # Fix #255: Create new environment, then delete old one
+                # ON DELETE CASCADE will clean up related test data
+                cursor.execute(
+                    """
+                    INSERT INTO environment (environment_name, system_packages, python_version)
+                    VALUES (?, ?, ?)
+                    """,
+                    (environment_name, system_packages, python_version),
+                )
+                new_environment_id = cursor.lastrowid
+                cursor.execute(
+                    "DELETE FROM environment WHERE id = ?", (environment_id,)
+                )
+                environment_id = new_environment_id
 
             return environment_id, packages_changed
 

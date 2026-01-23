@@ -11,7 +11,7 @@ dynamic =  ["version"]
 
 description = "selects tests affected by changed files and methods"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.7"  # ezmon maintains Python 3.7+ support (upstream testmon requires 3.10+)
 keywords = ["testing", "pytest", "plugin"]
 license = { text = "MIT" }
 classifiers = [
@@ -27,8 +27,9 @@ classifiers = [
     "Framework :: Pytest",
 ]
 dependencies = [
-    "pytest>=5,<9",
+    "pytest>=5,<10",
     "coverage>=6,<8",
+    "typing_extensions>=3.7; python_version < '3.8'",
 ]
 
 # specify ezmon and tmserver as packages of this project

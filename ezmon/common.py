@@ -25,7 +25,14 @@ except ImportError:
 
 from pathlib import Path
 
-from typing import TypedDict, List, Dict
+import sys
+from typing import List, Dict
+
+# TypedDict was added to typing in Python 3.8
+if sys.version_info >= (3, 8):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
 
 
 class FileFp(TypedDict):
