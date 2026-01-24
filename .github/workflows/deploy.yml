@@ -44,13 +44,14 @@ jobs:
 
           # Patterns that affect backend runtime
           # - python, gunicorn/pm2/ecosystem/configs, templates/static for Flask
+          # Note: requirements.txt is at ez-viz/requirements.txt, not repo root
           CHANGED_FILES=""
           if [[ -z "$LAST_SUCCESS" ]]; then
             echo "No previous successful deploy; treating as changed."
             CHANGED_FILES="(first deploy)"
           else
             CHANGED_FILES=$(git diff --name-only "$LAST_SUCCESS" "$CURRENT_COMMIT" | \
-              grep -E '\.(py)$|^requirements\.txt$|^ecosystem\.config\.(cjs|js)$|^app\.py$|^templates/|^static/' || true)
+              grep -E '\.(py)$|requirements\.txt$|^ecosystem\.config\.(cjs|js)$|^app\.py$|^templates/|^static/' || true)
           fi
 
           if [[ -n "$CHANGED_FILES" ]]; then
@@ -62,11 +63,11 @@ jobs:
             echo "📊 No backend changes since last successful deployment"
           fi
 
-          # Did requirements.txt change?
+          # Did requirements.txt change? (file is at ez-viz/requirements.txt)
           if [[ -z "$LAST_SUCCESS" ]]; then
             echo "deps=true" >> "$GITHUB_OUTPUT"
           else
-            if git diff --name-only "$LAST_SUCCESS" "$CURRENT_COMMIT" | grep -q '^requirements\.txt$'; then
+            if git diff --name-only "$LAST_SUCCESS" "$CURRENT_COMMIT" | grep -q 'requirements\.txt$'; then
               echo "deps=true" >> "$GITHUB_OUTPUT"
             else
               echo "deps=false" >> "$GITHUB_OUTPUT"
