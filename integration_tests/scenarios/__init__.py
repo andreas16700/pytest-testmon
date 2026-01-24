@@ -165,11 +165,11 @@ def register(scenario: Scenario) -> Scenario:
 # Tests that call add() are selected via method-level tracking.
 # Tests that call OTHER math functions (subtract, multiply, divide) have
 # method-level tracking for those specific functions, so they're NOT selected.
-# This demonstrates precise method-level tracking.
+# Tests with ONLY module-level deps (no method calls) ARE selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_math_utils",
-    description="Change math_utils.add() - only tests calling add() are selected",
+    description="Change math_utils.add() - tests calling add() + module-level deps selected",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -178,19 +178,22 @@ register(Scenario(
             content="result = a + b\n    return result",
         )
     ],
-    # Selected: only tests that call add() directly
+    # Selected: tests that call add(), OR have module-level dep only
     expected_selected=[
-        TEST_CALC_ADD,      # calls add() via calculator
-        TEST_MATH_ADD_POS,  # calls add() directly
-        TEST_MATH_ADD_NEG,  # calls add() directly
-        TEST_MATH_ADD_MIX,  # calls add() directly
+        TEST_CALC_ADD,       # calls add() via calculator
+        TEST_CALC_HISTORY,   # calls add() via calc.calculate(2, '+', 3)
+        TEST_CALC_CLEAR,     # calls add() via calc.calculate(2, '+', 3)
+        TEST_CALC_UNKNOWN_OP,# doesn't call any math func -> module-level dep
+        TEST_MATH_ADD_POS,   # calls add() directly
+        TEST_MATH_ADD_NEG,   # calls add() directly
+        TEST_MATH_ADD_MIX,   # calls add() directly
     ],
-    # Deselected: tests that have method-level tracking for OTHER math functions
+    # Deselected: tests that have method-level tracking for OTHER math functions only
     expected_deselected=[
-        TEST_CALC_SUBTRACT,    # has method-level tracking for subtract()
-        TEST_CALC_MULTIPLY,    # has method-level tracking for multiply()
-        TEST_CALC_DIVIDE,      # has method-level tracking for divide()
-        TEST_CALC_DIVIDE_ZERO, # has method-level tracking for divide()
+        TEST_CALC_SUBTRACT,    # only calls subtract()
+        TEST_CALC_MULTIPLY,    # only calls multiply()
+        TEST_CALC_DIVIDE,      # only calls divide()
+        TEST_CALC_DIVIDE_ZERO, # only calls divide()
     ],
 ))
 
@@ -199,11 +202,11 @@ register(Scenario(
 # Scenario: Modify string_utils.uppercase()
 # Tests that call uppercase() are selected via method-level tracking.
 # Tests that call OTHER string functions have method-level tracking for those,
-# so they're NOT selected. This demonstrates precise method-level tracking.
+# so they're NOT selected. Tests with ONLY module-level deps ARE selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_string_utils",
-    description="Change string_utils.uppercase() - only tests calling uppercase() are selected",
+    description="Change string_utils.uppercase() - tests calling uppercase() + module-level deps selected",
     modifications=[
         Modification(
             file="src/string_utils.py",
@@ -212,16 +215,19 @@ register(Scenario(
             content="upper_result = s.upper()\n    return upper_result",
         )
     ],
-    # Selected: only tests that call uppercase() directly
+    # Selected: tests that call uppercase(), OR have module-level dep only
     expected_selected=[
         TEST_FMT_UPPER,      # calls uppercase() via formatter
+        TEST_FMT_DEFAULT,    # default style is "upper", calls uppercase()
+        TEST_FMT_CHANGE,     # calls both uppercase() and lowercase()
+        TEST_FMT_UNKNOWN,    # doesn't call any string func -> module-level dep
         TEST_STR_UPPER_LOW,  # calls uppercase() directly
         TEST_STR_UPPER_MIX,  # calls uppercase() directly
     ],
-    # Deselected: tests that have method-level tracking for OTHER string functions
+    # Deselected: tests that have method-level tracking for OTHER string functions only
     expected_deselected=[
-        TEST_FMT_LOWER,   # has method-level tracking for lowercase()
-        TEST_FMT_TITLE,   # has method-level tracking for capitalize()
+        TEST_FMT_LOWER,   # only calls lowercase()
+        TEST_FMT_TITLE,   # only calls capitalize()
     ],
 ))
 
@@ -338,12 +344,12 @@ def test_another_new():
 
 # -----------------------------------------------------------------------------
 # Scenario: Multiple modifications
-# Modify subtract() and lowercase() - only tests calling these are selected
+# Modify subtract() and lowercase() - tests calling these + module-level deps selected
 # This demonstrates precise method-level tracking with multiple changes.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="multiple_modifications",
-    description="Change subtract() and lowercase() - only tests calling these are selected",
+    description="Change subtract() and lowercase() - tests calling these + module-level deps selected",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -358,24 +364,29 @@ register(Scenario(
             content="lower_result = s.lower()\n    return lower_result",
         ),
     ],
-    # Selected: only tests that call subtract() or lowercase()
+    # Selected: tests calling subtract() or lowercase(), OR module-level deps only
     expected_selected=[
         # Tests calling subtract()
         TEST_CALC_SUBTRACT,
         TEST_MATH_SUB_POS,
         TEST_MATH_SUB_NEG,
+        # Tests with module-level dep on math_utils (no math function calls)
+        TEST_CALC_UNKNOWN_OP,
         # Tests calling lowercase()
         TEST_FMT_LOWER,
+        TEST_FMT_CHANGE,  # calls both uppercase() and lowercase()
         TEST_STR_LOWER_UP,
         TEST_STR_LOWER_MIX,
+        # Tests with module-level dep on string_utils (no string function calls)
+        TEST_FMT_UNKNOWN,
     ],
-    # Deselected: tests with method-level tracking for OTHER functions
+    # Deselected: tests with method-level tracking for OTHER functions only
     expected_deselected=[
-        TEST_CALC_ADD,        # has method-level for add()
-        TEST_CALC_MULTIPLY,   # has method-level for multiply()
-        TEST_CALC_DIVIDE,     # has method-level for divide()
-        TEST_FMT_UPPER,       # has method-level for uppercase()
-        TEST_FMT_TITLE,       # has method-level for capitalize()
+        TEST_CALC_ADD,        # only calls add()
+        TEST_CALC_MULTIPLY,   # only calls multiply()
+        TEST_CALC_DIVIDE,     # only calls divide()
+        TEST_FMT_UPPER,       # only calls uppercase()
+        TEST_FMT_TITLE,       # only calls capitalize()
     ],
 ))
 
