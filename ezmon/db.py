@@ -10,7 +10,7 @@ from ezmon.process_code import blob_to_checksums, checksums_to_blob
 from ezmon.common import TestExecutions
 
 
-DATA_VERSION = 15
+DATA_VERSION = 16  # Incremented for file_dependency table
 
 ChangedFileData = namedtuple(
     "ChangedFileData", "filename name method_checksums id failed"
@@ -256,6 +256,29 @@ class DB:  # pylint: disable=too-many-public-methods
 
         return fingerprint_id
 
+    @lru_cache(1000)
+    def fetch_or_create_file_dependency(self, filename, sha):
+        """Fetch or create a file dependency record."""
+        cursor = self.con.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO file_dependency (filename, sha)
+                VALUES (?, ?)
+                """,
+                (filename, sha),
+            )
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            row = cursor.execute(
+                """
+                SELECT id FROM file_dependency
+                WHERE filename = ? AND sha = ?
+                """,
+                (filename, sha),
+            ).fetchone()
+            return row[0] if row else None
+
     def _insert_test_execution(  # pylint: disable=too-many-arguments
         self,
         con,
@@ -294,12 +317,30 @@ class DB:  # pylint: disable=too-many-public-methods
                 [(exec_id, test_name) for test_name in tests_deps_n_outcomes],
             )
 
+            # Also delete file dependencies and external dependencies
+            cursor.executemany(
+                f"DELETE FROM test_execution_file_dependency "
+                f"WHERE test_execution_id in "
+                f"      (SELECT id FROM test_execution WHERE {self._test_execution_fk_column()}=? AND test_name=?)",
+                [(exec_id, test_name) for test_name in tests_deps_n_outcomes],
+            )
+
+            cursor.executemany(
+                f"DELETE FROM test_external_dependency "
+                f"WHERE test_execution_id in "
+                f"      (SELECT id FROM test_execution WHERE {self._test_execution_fk_column()}=? AND test_name=?)",
+                [(exec_id, test_name) for test_name in tests_deps_n_outcomes],
+            )
+
             cursor.executemany(
                 f"DELETE FROM test_execution WHERE {self._test_execution_fk_column()}=? AND test_name=?",
                 [(exec_id, test_name) for test_name in tests_deps_n_outcomes],
             )
 
             test_execution_file_fps = []
+            test_execution_file_deps = []
+            test_external_deps = []
+
             for test_name, deps_n_outcomes in tests_deps_n_outcomes.items():
                 te_id = self._insert_test_execution(
                     con,
@@ -309,7 +350,9 @@ class DB:  # pylint: disable=too-many-public-methods
                     deps_n_outcomes.get("failed", None),
                     deps_n_outcomes.get("forced", None),
                 )
-                fingerprints = deps_n_outcomes["deps"]
+
+                # Handle Python file dependencies (fingerprints)
+                fingerprints = deps_n_outcomes.get("deps", [])
                 files_fshas = set()
                 for record in fingerprints:
                     fingerprint_id = self.fetch_or_create_file_fp(
@@ -320,6 +363,22 @@ class DB:  # pylint: disable=too-many-public-methods
 
                     test_execution_file_fps.append((te_id, fingerprint_id))
                     files_fshas.add((record["filename"], record["fsha"]))
+
+                # Handle non-Python file dependencies
+                file_deps = deps_n_outcomes.get("file_deps", [])
+                for file_dep in file_deps:
+                    fd_id = self.fetch_or_create_file_dependency(
+                        file_dep["filename"],
+                        file_dep["sha"],
+                    )
+                    if fd_id:
+                        test_execution_file_deps.append((te_id, fd_id))
+
+                # Handle external package dependencies
+                external_deps = deps_n_outcomes.get("external_deps", [])
+                for pkg_name in external_deps:
+                    test_external_deps.append((te_id, pkg_name))
+
             if test_execution_file_fps:
                 cursor.executemany(
                     "INSERT INTO test_execution_file_fp VALUES (?, ?)",
@@ -327,6 +386,19 @@ class DB:  # pylint: disable=too-many-public-methods
                 )
                 self.fetch_or_create_file_fp.cache_clear()
                 self.insert_into_suite_files_fshas(con, exec_id, files_fshas)
+
+            if test_execution_file_deps:
+                cursor.executemany(
+                    "INSERT INTO test_execution_file_dependency VALUES (?, ?)",
+                    test_execution_file_deps,
+                )
+                self.fetch_or_create_file_dependency.cache_clear()
+
+            if test_external_deps:
+                cursor.executemany(
+                    "INSERT INTO test_external_dependency (test_execution_id, package_name) VALUES (?, ?)",
+                    test_external_deps,
+                )
 
     def insert_into_suite_files_fshas(self, con, exec_id, files_fshas):
         pass
@@ -586,6 +658,36 @@ class DB:  # pylint: disable=too-many-public-methods
             );
         """
 
+    def _create_file_dependency_statement(self) -> str:
+        """Table for tracking non-Python file dependencies (JSON, YAML, etc.)."""
+        return """
+            CREATE TABLE IF NOT EXISTS file_dependency (
+                id INTEGER PRIMARY KEY,
+                filename TEXT NOT NULL,
+                sha TEXT NOT NULL,
+                UNIQUE (filename, sha)
+            );
+            CREATE TABLE IF NOT EXISTS test_execution_file_dependency (
+                test_execution_id INTEGER,
+                file_dependency_id INTEGER,
+                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
+                FOREIGN KEY(file_dependency_id) REFERENCES file_dependency(id)
+            );
+            CREATE INDEX IF NOT EXISTS tefd_both ON test_execution_file_dependency (test_execution_id, file_dependency_id);
+        """
+
+    def _create_external_dependency_statement(self) -> str:
+        """Table for tracking external package dependencies per test."""
+        return """
+            CREATE TABLE IF NOT EXISTS test_external_dependency (
+                id INTEGER PRIMARY KEY,
+                test_execution_id INTEGER,
+                package_name TEXT NOT NULL,
+                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS ted_te_id ON test_external_dependency (test_execution_id);
+        """
+
     def init_tables(self):
         connection = self.con
 
@@ -595,13 +697,15 @@ class DB:  # pylint: disable=too-many-public-methods
             + self._create_test_execution_statement()
             + self._create_temp_tables_statement()
             + self._create_file_fp_statement()
-            + self._create_test_execution_ffp_statement() 
+            + self._create_test_execution_ffp_statement()
             + self.create_run_uid_statement()
             + self._create_run_infos_statement()
             + self._create_test_infos_statement()
             + self._create__file_fp_infos_statement()
             + self._create_test_execution_file_fp_infos_statement()
             + self._create_test_execution_coverage_statement()
+            + self._create_file_dependency_statement()
+            + self._create_external_dependency_statement()
         )
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
@@ -724,7 +828,18 @@ class DB:  # pylint: disable=too-many-public-methods
     def delete_filenames(self, con):
         con.execute("DELETE FROM changed_files_mhashes")
 
-    def determine_tests(self, exec_id, files_mhashes):
+    def determine_tests(self, exec_id, files_mhashes, file_deps_shas=None):
+        """
+        Determine which tests are affected by code changes.
+
+        Args:
+            exec_id: The execution/environment ID
+            files_mhashes: Dict of {filename: method_checksums} for Python files
+            file_deps_shas: Dict of {filename: sha} for non-Python file dependencies
+        """
+        if file_deps_shas is None:
+            file_deps_shas = {}
+
         with self.con as con:
             if not self._readonly:
                 con.execute(
@@ -772,6 +887,13 @@ class DB:  # pylint: disable=too-many-public-methods
                 if not check_fingerprint_db(files_mhashes, result[0], result[2]):
                     method_misses.append(result[1])
 
+            # Check file dependency changes
+            file_dep_affected = self._check_file_dependency_changes(exec_id, file_deps_shas)
+            method_misses.extend(file_dep_affected)
+
+            # Deduplicate
+            method_misses = list(set(method_misses))
+
             failing_tests = [
                 row["test_name"]
                 for row in self.con.execute(
@@ -788,6 +910,57 @@ class DB:  # pylint: disable=too-many-public-methods
             ]
 
             return {"affected": method_misses, "failing": failing_tests}
+
+    def _check_file_dependency_changes(self, exec_id, file_deps_shas):
+        """
+        Check which tests are affected by changed file dependencies.
+
+        Returns list of test names whose file dependencies have changed.
+        """
+        affected_tests = []
+
+        # Get all file dependencies for this environment
+        cursor = self.con.execute(
+            f"""
+            SELECT
+                te.test_name,
+                fd.filename,
+                fd.sha
+            FROM test_execution te
+            JOIN test_execution_file_dependency tefd ON te.id = tefd.test_execution_id
+            JOIN file_dependency fd ON tefd.file_dependency_id = fd.id
+            WHERE te.{self._test_execution_fk_column()} = ?
+            """,
+            (exec_id,),
+        )
+
+        for row in cursor:
+            test_name = row["test_name"]
+            filename = row["filename"]
+            stored_sha = row["sha"]
+
+            # Get current SHA from file_deps_shas (computed from disk)
+            current_sha = file_deps_shas.get(filename)
+
+            # If file doesn't exist anymore or SHA changed, test is affected
+            if current_sha is None or current_sha != stored_sha:
+                affected_tests.append(test_name)
+
+        return affected_tests
+
+    def get_file_dependency_filenames(self, exec_id):
+        """Get all file dependency filenames for an environment."""
+        cursor = self.con.execute(
+            f"""
+            SELECT DISTINCT fd.filename
+            FROM file_dependency fd
+            JOIN test_execution_file_dependency tefd ON fd.id = tefd.file_dependency_id
+            JOIN test_execution te ON tefd.test_execution_id = te.id
+            WHERE te.{self._test_execution_fk_column()} = ?
+            """,
+            (exec_id,),
+        )
+        return [row["filename"] for row in cursor]
 
     def delete_test_executions(self, test_names, exec_id):
         self.con.executemany(

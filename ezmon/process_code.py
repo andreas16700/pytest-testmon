@@ -302,6 +302,17 @@ def create_fingerprint_source(source_code, lines, ext="py"):
 def create_fingerprint(module, covered_lines) -> [int]:
     blocks: [Block] = module.blocks
     method_reprs = []
+
+    # Special case: line 0 means "module was imported but no code executed"
+    # This happens when a test imports a module that was already loaded.
+    # In this case, include ALL blocks because the test depends on the entire module.
+    # Any change to any function in the module should trigger the test.
+    if covered_lines == {0} and blocks:
+        for block in blocks:
+            method_reprs.append(block.code)
+        return methods_to_checksums(method_reprs)
+
+    # Normal case: find blocks that contain covered lines
     line_index = 0
     sorted_lines = sorted(covered_lines)
 

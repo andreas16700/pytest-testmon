@@ -37,6 +37,7 @@ from ezmon.process_code import (
 )
 
 from ezmon.common import DepsNOutcomes, TestExecutions
+from ezmon.dependency_tracker import DependencyTracker, file_sha_to_checksum
 
 T = TypeVar("T")
 
@@ -240,20 +241,36 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     def get_tests_fingerprints(self, nodes_files_lines, reports) -> TestExecutions:
         test_executions_fingerprints = {}
         for context in nodes_files_lines:
-            deps_n_outcomes: DepsNOutcomes = {"deps": []}
+            deps_n_outcomes: DepsNOutcomes = {"deps": [], "file_deps": [], "external_deps": []}
 
             for filename, covered in nodes_files_lines[context].items():
+                # Handle special keys for file and external dependencies
+                if filename.startswith("__file_deps__"):
+                    # covered is actually a set of TrackedFile namedtuples
+                    for tracked_file in covered:
+                        deps_n_outcomes["file_deps"].append({
+                            "filename": tracked_file.path,
+                            "sha": tracked_file.sha,
+                        })
+                    continue
+                elif filename.startswith("__external_deps__"):
+                    # covered is a set of package names
+                    deps_n_outcomes["external_deps"] = list(covered)
+                    continue
+
+                # Regular Python file dependency
                 if os.path.exists(os.path.join(self.rootdir, filename)):
                     module = self.source_tree.get_file(filename)
-                    fingerprint = create_fingerprint(module, covered)
-                    deps_n_outcomes["deps"].append(
-                        {
-                            "filename": filename,
-                            "mtime": module.mtime,
-                            "fsha": module.fs_fsha,
-                            "method_checksums": fingerprint,
-                        }
-                    )
+                    if module:
+                        fingerprint = create_fingerprint(module, covered)
+                        deps_n_outcomes["deps"].append(
+                            {
+                                "filename": filename,
+                                "mtime": module.mtime,
+                                "fsha": module.fs_fsha,
+                                "method_checksums": fingerprint,
+                            }
+                        )
 
             deps_n_outcomes.update(process_result(reports[context]))
             deps_n_outcomes["forced"] = context in self.stable_test_names and (
@@ -301,7 +318,10 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         # Get the mhashes for the files from above
         files_mhashes = collect_mhashes(self.source_tree, new_changed_file_data)
 
-        tests = self.db.determine_tests(self.exec_id, files_mhashes)
+        # Get file dependency SHAs from disk
+        file_deps_shas = self._compute_file_dependency_shas()
+
+        tests = self.db.determine_tests(self.exec_id, files_mhashes, file_deps_shas)
         affected_tests, self.failing_tests = tests["affected"], tests["failing"]
 
         if assert_old:
@@ -317,6 +337,26 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
         self.stable_test_names = set(self.all_tests) - self.unstable_test_names
         self.stable_files = set(self.all_files) - self.unstable_files
+
+    def _compute_file_dependency_shas(self):
+        """Compute SHA hashes for all tracked file dependencies."""
+        file_deps_shas = {}
+
+        # Get list of file dependencies from database
+        file_dep_filenames = self.db.get_file_dependency_filenames(self.exec_id)
+
+        for filename in file_dep_filenames:
+            filepath = os.path.join(self.rootdir, filename)
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'rb') as f:
+                        content = f.read()
+                    file_deps_shas[filename] = hashlib.sha1(content).hexdigest()
+                except (OSError, IOError):
+                    # File can't be read, mark as changed
+                    pass
+
+        return file_deps_shas
 
     def assert_old_determin_stable(self, new_fingerprint_misses):
         filenames_fingerprints = self.db.filenames_fingerprints(self.exec_id)
@@ -455,6 +495,11 @@ class TestmonCollector:
         self.is_started = False
         self._interrupted_at = None
 
+        # Dependency tracker for file and import tracking
+        self.dependency_tracker = DependencyTracker(rootdir)
+        # Store tracked dependencies per test for batch processing
+        self._tracked_deps = {}  # {test_name: (files, local_imports, external_imports)}
+
     def start_cov(self):
         if not self.cov._started:
             TestmonCollector.coverage_stack.append(self.cov)
@@ -526,6 +571,11 @@ class TestmonCollector:
         self.cov.switch_context(test_name)
         self.check_stack = TestmonCollector.coverage_stack.copy()
 
+        # Start dependency tracking for this test
+        # Extract test file from nodeid (format: "tests/test_foo.py::TestClass::test_method")
+        test_file = test_name.split("::")[0] if "::" in test_name else None
+        self.dependency_tracker.start(test_name, test_file=test_file)
+
     def discard_current(self):
         self._interrupted_at = self._test_name
 
@@ -540,6 +590,10 @@ class TestmonCollector:
                 returncode=3,
             )
 
+        # Stop dependency tracking and collect tracked dependencies
+        files, local_imports, external_imports, test_file = self.dependency_tracker.stop()
+        self._tracked_deps[self._test_name] = (files, local_imports, external_imports, test_file)
+
         nodes_files_lines = {}
 
         if self.cov and (
@@ -551,6 +605,9 @@ class TestmonCollector:
             nodes_files_lines, lines_data = self.get_nodes_files_lines(
                 dont_include=self._interrupted_at
             )
+
+            # Merge tracked dependencies into nodes_files_lines
+            nodes_files_lines = self._merge_tracked_deps(nodes_files_lines)
 
             if (
                 len(TestmonCollector.coverage_stack) > 1
@@ -568,6 +625,64 @@ class TestmonCollector:
             self.cov.erase()
             self.cov.start()
             self.batched_test_names = set()
+            self._tracked_deps = {}  # Clear after processing batch
+        return nodes_files_lines
+
+    def _merge_tracked_deps(self, nodes_files_lines):
+        """Merge tracked file and import dependencies into coverage data."""
+        for test_name, (files, local_imports, external_imports, test_file) in self._tracked_deps.items():
+            if test_name not in nodes_files_lines:
+                nodes_files_lines[test_name] = {}
+
+            # Add local imports that were captured during runtime
+            # These are imports that happened DURING the test execution
+            for local_import in local_imports:
+                if local_import not in nodes_files_lines[test_name]:
+                    nodes_files_lines[test_name][local_import] = {0}
+
+            # Track transitive module-level imports
+            #
+            # IMPORTANT: When Python imports a module, it executes that module's
+            # top-level code, which includes any import statements in that module.
+            # This means if test T imports module M1, and M1 imports M2, then
+            # Python executes M2's module-level code as part of loading M1.
+            #
+            # Therefore, T depends on M2's module-level code even if T never
+            # calls any functions from M2. Changes to M2's module-level code
+            # (imports, constants, class definitions, etc.) could affect T.
+            #
+            # We track this by:
+            # 1. Getting direct imports from the test file
+            # 2. For each direct import, getting its transitive imports
+            # 3. Adding module-level fingerprints (line 0) for any modules
+            #    that coverage.py didn't track (because no code was called)
+            if test_file:
+                # Get direct imports from the test file using AST parsing
+                test_file_imports = self.dependency_tracker.get_test_file_imports(test_file)
+
+                for imported_module in test_file_imports:
+                    # Add the directly imported module if not already tracked
+                    if imported_module not in nodes_files_lines[test_name]:
+                        nodes_files_lines[test_name][imported_module] = {0}
+
+                    # Get transitive imports (modules that imported_module imports)
+                    transitive_imports = self.dependency_tracker.get_module_imports(imported_module)
+                    for transitive_import in transitive_imports:
+                        # Add if NOT already tracked by coverage
+                        if transitive_import not in nodes_files_lines[test_name]:
+                            nodes_files_lines[test_name][transitive_import] = {0}
+
+            # Store file dependencies in a special key
+            # These will be handled specially in get_tests_fingerprints
+            if files:
+                file_deps_key = f"__file_deps__{test_name}"
+                nodes_files_lines[test_name][file_deps_key] = files
+
+            # Store external imports for future granular tracking
+            if external_imports:
+                ext_deps_key = f"__external_deps__{test_name}"
+                nodes_files_lines[test_name][ext_deps_key] = external_imports
+
         return nodes_files_lines
 
     def get_nodes_files_lines(self, dont_include):
@@ -595,6 +710,9 @@ class TestmonCollector:
         return nodes_files_lines, files_lines
 
     def close(self):
+        # Close dependency tracker
+        self.dependency_tracker.close()
+
         if self.cov is None:
             return
         assert self.cov in TestmonCollector.coverage_stack

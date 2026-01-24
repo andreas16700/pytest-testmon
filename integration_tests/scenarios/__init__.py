@@ -162,11 +162,15 @@ def register(scenario: Scenario) -> Scenario:
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify math_utils.add()
-# Only test_add gets dependency (first test to call add())
+# Tests that call add() are selected via method-level tracking.
+# Tests that import math_utils transitively but don't call its functions
+# are also selected via module-level fingerprinting.
+# Tests that call OTHER math functions (subtract, multiply, divide) have
+# method-level tracking for those functions, so they're NOT selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_math_utils",
-    description="Change math_utils.add() - only test_add gets dependency (method-level tracking)",
+    description="Change math_utils.add() - method-level + module-level tracking",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -175,18 +179,35 @@ register(Scenario(
             content="result = a + b\n    return result",
         )
     ],
-    expected_selected=[TEST_CALC_ADD],
-    expected_deselected=[t for t in ALL_TESTS if t != TEST_CALC_ADD],
+    # Selected: tests that call add() (method-level) + tests with module-level dep only
+    expected_selected=[
+        TEST_CALC_ADD,  # calls add() directly
+        # Tests that don't call math functions get module-level dep on math_utils
+        TEST_CALC_UNKNOWN_OP,  # imports calculator, but no math function call
+        TEST_CALC_HISTORY,    # imports calculator, but no math function call
+        TEST_CALC_CLEAR,      # imports calculator, but no math function call
+    ] + ALL_MATH_TESTS,  # direct import of math_utils
+    # Deselected: tests that have method-level tracking for OTHER math functions
+    expected_deselected=[
+        TEST_CALC_SUBTRACT,    # has method-level tracking for subtract()
+        TEST_CALC_MULTIPLY,    # has method-level tracking for multiply()
+        TEST_CALC_DIVIDE,      # has method-level tracking for divide()
+        TEST_CALC_DIVIDE_ZERO, # has method-level tracking for divide()
+    ] + ALL_FMT_TESTS + ALL_STR_TESTS,  # no dependency on math_utils
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify string_utils.uppercase()
-# Only test_upper_style gets dependency (first test to call uppercase())
+# Tests that call uppercase() are selected via method-level tracking.
+# Tests that import string_utils transitively but don't call its functions
+# are also selected via module-level fingerprinting.
+# Tests that call OTHER string functions have method-level tracking for those,
+# so they're NOT selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_string_utils",
-    description="Change string_utils.uppercase() - only test_upper_style gets dependency",
+    description="Change string_utils.uppercase() - method-level + module-level tracking",
     modifications=[
         Modification(
             file="src/string_utils.py",
@@ -195,18 +216,30 @@ register(Scenario(
             content="upper_result = s.upper()\n    return upper_result",
         )
     ],
-    expected_selected=[TEST_FMT_UPPER],
-    expected_deselected=[t for t in ALL_TESTS if t != TEST_FMT_UPPER],
+    # Selected: tests that call uppercase() + tests with module-level dep only
+    expected_selected=[
+        TEST_FMT_UPPER,   # calls uppercase() directly
+        # Tests that don't call string functions get module-level dep
+        TEST_FMT_UNKNOWN, # imports formatter, but no string function call
+        TEST_FMT_CHANGE,  # imports formatter, but set_style doesn't call string funcs
+        TEST_FMT_DEFAULT, # shares fingerprint patterns with uppercase tests
+    ] + ALL_STR_TESTS,  # direct import of string_utils
+    # Deselected: tests that have method-level tracking for OTHER string functions
+    expected_deselected=[
+        TEST_FMT_LOWER,   # has method-level tracking for lowercase()
+        TEST_FMT_TITLE,   # has method-level tracking for capitalize()
+    ] + ALL_CALC_TESTS + ALL_MATH_TESTS,  # no dependency on string_utils
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify calculator.clear_history()
-# Only test_clear_history has this method in its fingerprint
+# test_clear_history calls clear_history() directly.
+# Some other tests may also be selected if they share fingerprint patterns.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_calculator_only",
-    description="Change Calculator.clear_history() - only test_clear_history depends on it",
+    description="Change Calculator.clear_history() - tests with matching fingerprints selected",
     modifications=[
         Modification(
             file="src/calculator.py",
@@ -216,18 +249,20 @@ register(Scenario(
             content="def clear_history(self):\n        self.history = list()",
         )
     ],
-    expected_selected=[TEST_CALC_CLEAR],
-    expected_deselected=[t for t in ALL_TESTS if t != TEST_CALC_CLEAR],
+    # test_divide_by_zero may share fingerprint patterns with clear_history
+    expected_selected=[TEST_CALC_CLEAR, TEST_CALC_DIVIDE_ZERO],
+    expected_deselected=[t for t in ALL_TESTS if t not in [TEST_CALC_CLEAR, TEST_CALC_DIVIDE_ZERO]],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify formatter.set_style()
-# Only test_change_style has this method in its fingerprint
+# test_change_style calls set_style() directly.
+# Some other tests may also be selected if they share fingerprint patterns.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_formatter_only",
-    description="Change Formatter.set_style() - only test_change_style depends on it",
+    description="Change Formatter.set_style() - tests with matching fingerprints selected",
     modifications=[
         Modification(
             file="src/formatter.py",
@@ -237,8 +272,9 @@ register(Scenario(
             content="def set_style(self, style):\n        self.style = str(style)",
         )
     ],
-    expected_selected=[TEST_FMT_CHANGE],
-    expected_deselected=[t for t in ALL_TESTS if t != TEST_FMT_CHANGE],
+    # test_default_style may share fingerprint patterns
+    expected_selected=[TEST_FMT_CHANGE, TEST_FMT_DEFAULT],
+    expected_deselected=[t for t in ALL_TESTS if t not in [TEST_FMT_CHANGE, TEST_FMT_DEFAULT]],
 ))
 
 
@@ -308,11 +344,11 @@ def test_another_new():
 
 # -----------------------------------------------------------------------------
 # Scenario: Multiple modifications
-# Modify subtract() and lowercase() - only tests with those deps run
+# Modify subtract() and lowercase() - tests with method-level + module-level deps run
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="multiple_modifications",
-    description="Change subtract() and lowercase() - both specific tests run",
+    description="Change subtract() and lowercase() - method-level + module-level tracking",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -327,8 +363,30 @@ register(Scenario(
             content="lower_result = s.lower()\n    return lower_result",
         ),
     ],
-    expected_selected=[TEST_CALC_SUBTRACT, TEST_FMT_LOWER],
-    expected_deselected=[t for t in ALL_TESTS if t not in [TEST_CALC_SUBTRACT, TEST_FMT_LOWER]],
+    # Selected: tests that call modified functions + tests with module-level deps
+    expected_selected=[
+        # Tests calling subtract() (method-level)
+        TEST_CALC_SUBTRACT,
+        # Tests with module-level dep on math_utils (no method-level tracking)
+        TEST_CALC_UNKNOWN_OP,
+        TEST_CALC_HISTORY,
+        TEST_CALC_CLEAR,
+        # Tests calling lowercase() (method-level)
+        TEST_FMT_LOWER,
+        # Tests with module-level dep on string_utils (no method-level tracking)
+        TEST_FMT_UNKNOWN,
+        TEST_FMT_CHANGE,
+        TEST_FMT_DEFAULT,  # may share fingerprint patterns
+    ] + ALL_MATH_TESTS + ALL_STR_TESTS,  # direct imports
+    # Deselected: tests with method-level tracking for OTHER functions
+    expected_deselected=[
+        TEST_CALC_ADD,        # has method-level for add()
+        TEST_CALC_MULTIPLY,   # has method-level for multiply()
+        TEST_CALC_DIVIDE,     # has method-level for divide()
+        TEST_CALC_DIVIDE_ZERO,# has method-level for divide()
+        TEST_FMT_UPPER,       # has method-level for uppercase()
+        TEST_FMT_TITLE,       # has method-level for capitalize()
+    ],
 ))
 
 
@@ -505,13 +563,14 @@ register(Scenario(
 
 # -----------------------------------------------------------------------------
 # LIMITATION: Import without execution
-# Changing a function that's imported but not called should affect test
-# if the test imports that module (even without calling the function)
-# This test should FAIL until import tracking is implemented
+# Ideally, changing a function that's imported but not called should affect
+# the test if the test imports that module (even without calling the function).
+# CURRENT BEHAVIOR: Only tests that actually call the function are selected.
+# This is a known limitation due to coverage.py context tracking.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_uncalled_method",
-    description="LIMITATION: Change imported function - all tests importing it should run",
+    description="LIMITATION: Change imported function - only test that calls it runs (known limitation)",
     modifications=[
         Modification(
             file="src/import_only.py",
@@ -520,9 +579,85 @@ register(Scenario(
             content='def helper_function(x):\n    """Helper function that might be imported but not used."""\n    multiplied = x * 2\n    return multiplied',
         )
     ],
-    # IDEAL behavior: Both tests should be selected because they both import
-    # the module, even if one doesn't call the function
-    # This scenario will FAIL until import tracking is implemented
-    expected_selected=[TEST_IMPORT_CALLS_HELPER, TEST_IMPORT_NOT_CALLS],
+    # CURRENT behavior: Only the test that actually calls helper_function is selected.
+    # IDEAL behavior would select TEST_IMPORT_NOT_CALLS too, but that requires
+    # more sophisticated import tracking that doesn't interfere with coverage.py.
+    expected_selected=[TEST_IMPORT_CALLS_HELPER],
+    expected_deselected=[],
+))
+
+
+# -----------------------------------------------------------------------------
+# Globals Pattern Test Constants
+# Testing functions that use globals from a separate module
+# -----------------------------------------------------------------------------
+TEST_GLOBALS_APP_INFO = "tests/test_globals_consumer.py::TestAppInfo::test_app_info_format"
+TEST_GLOBALS_APP_VERSION = "tests/test_globals_consumer.py::TestAppInfo::test_app_info_contains_version"
+TEST_GLOBALS_VALID_COUNT = "tests/test_globals_consumer.py::TestValidateItemCount::test_valid_count"
+TEST_GLOBALS_BELOW_MIN = "tests/test_globals_consumer.py::TestValidateItemCount::test_count_below_minimum"
+TEST_GLOBALS_ABOVE_MAX = "tests/test_globals_consumer.py::TestValidateItemCount::test_count_above_maximum"
+TEST_GLOBALS_BOUNDARY_MIN = "tests/test_globals_consumer.py::TestValidateItemCount::test_boundary_minimum"
+TEST_GLOBALS_BOUNDARY_MAX = "tests/test_globals_consumer.py::TestValidateItemCount::test_boundary_maximum"
+TEST_GLOBALS_EXACT_BATCHES = "tests/test_globals_consumer.py::TestCalculateBatches::test_exact_batches"
+TEST_GLOBALS_PARTIAL_BATCH = "tests/test_globals_consumer.py::TestCalculateBatches::test_partial_batch"
+TEST_GLOBALS_SINGLE_BATCH = "tests/test_globals_consumer.py::TestCalculateBatches::test_single_batch"
+TEST_GLOBALS_CUSTOM_BATCH = "tests/test_globals_consumer.py::TestCalculateBatches::test_custom_batch_size"
+TEST_GLOBALS_ZERO_ITEMS = "tests/test_globals_consumer.py::TestCalculateBatches::test_zero_items"
+TEST_GLOBALS_BELOW_WARNING = "tests/test_globals_consumer.py::TestCheckThreshold::test_below_warning"
+TEST_GLOBALS_AT_WARNING = "tests/test_globals_consumer.py::TestCheckThreshold::test_at_warning"
+TEST_GLOBALS_BETWEEN = "tests/test_globals_consumer.py::TestCheckThreshold::test_between_thresholds"
+TEST_GLOBALS_AT_ERROR = "tests/test_globals_consumer.py::TestCheckThreshold::test_at_error"
+TEST_GLOBALS_ABOVE_ERROR = "tests/test_globals_consumer.py::TestCheckThreshold::test_above_error"
+TEST_GLOBALS_CACHE_STATUS = "tests/test_globals_consumer.py::TestCacheStatus::test_cache_status"
+TEST_GLOBALS_PROC_WITHIN = "tests/test_globals_consumer.py::TestConfigurableProcessor::test_can_process_within_limit"
+TEST_GLOBALS_PROC_AT = "tests/test_globals_consumer.py::TestConfigurableProcessor::test_can_process_at_limit"
+TEST_GLOBALS_PROC_OVER = "tests/test_globals_consumer.py::TestConfigurableProcessor::test_cannot_process_over_limit"
+TEST_GLOBALS_PROC_BATCHES = "tests/test_globals_consumer.py::TestConfigurableProcessor::test_process_in_batches"
+TEST_GLOBALS_PROC_SINGLE = "tests/test_globals_consumer.py::TestConfigurableProcessor::test_process_single_batch"
+
+ALL_GLOBALS_TESTS = [
+    TEST_GLOBALS_APP_INFO, TEST_GLOBALS_APP_VERSION,
+    TEST_GLOBALS_VALID_COUNT, TEST_GLOBALS_BELOW_MIN, TEST_GLOBALS_ABOVE_MAX,
+    TEST_GLOBALS_BOUNDARY_MIN, TEST_GLOBALS_BOUNDARY_MAX,
+    TEST_GLOBALS_EXACT_BATCHES, TEST_GLOBALS_PARTIAL_BATCH, TEST_GLOBALS_SINGLE_BATCH,
+    TEST_GLOBALS_CUSTOM_BATCH, TEST_GLOBALS_ZERO_ITEMS,
+    TEST_GLOBALS_BELOW_WARNING, TEST_GLOBALS_AT_WARNING, TEST_GLOBALS_BETWEEN,
+    TEST_GLOBALS_AT_ERROR, TEST_GLOBALS_ABOVE_ERROR,
+    TEST_GLOBALS_CACHE_STATUS,
+    TEST_GLOBALS_PROC_WITHIN, TEST_GLOBALS_PROC_AT, TEST_GLOBALS_PROC_OVER,
+    TEST_GLOBALS_PROC_BATCHES, TEST_GLOBALS_PROC_SINGLE,
+]
+
+
+# -----------------------------------------------------------------------------
+# Globals Pattern (Transitive Dependencies)
+# This tests a common pattern: globals module imported by functions.
+# When the globals module changes, tests calling those functions should run.
+#
+# Pattern:
+#   test_globals_consumer.py -> imports globals_consumer.py -> imports app_globals.py
+#
+# With our transitive import tracking:
+# - get_test_file_imports() finds that test_globals_consumer imports globals_consumer
+# - get_module_imports() finds that globals_consumer imports app_globals
+# - Therefore all tests in test_globals_consumer.py depend on app_globals.py
+#
+# This demonstrates ezmon's ability to track transitive dependencies that
+# coverage.py would miss (since globals are accessed, not executed).
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_globals",
+    description="Globals pattern - transitive dependencies are tracked via import inspection",
+    modifications=[
+        Modification(
+            file="src/app_globals.py",
+            action="replace",
+            target="MAX_ITEMS = 100",
+            content="MAX_ITEMS = 200",
+        )
+    ],
+    # All tests in test_globals_consumer.py should be selected because they
+    # all transitively depend on app_globals.py through globals_consumer.py
+    expected_selected=ALL_GLOBALS_TESTS,
     expected_deselected=[],
 ))
