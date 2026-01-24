@@ -102,6 +102,64 @@ def drop_patch_version(system_packages):
     )
 
 
+def parse_system_packages(packages_str: str) -> Dict[str, str]:
+    """
+    Parse system_packages string into a dict of {package_name: version}.
+
+    Example: "numpy 1.21, requests 2.28" -> {"numpy": "1.21", "requests": "2.28"}
+    """
+    if not packages_str:
+        return {}
+
+    packages = {}
+    for item in packages_str.split(", "):
+        item = item.strip()
+        if not item:
+            continue
+        # Split on last space to handle packages with spaces in names
+        parts = item.rsplit(" ", 1)
+        if len(parts) == 2:
+            packages[parts[0]] = parts[1]
+        elif len(parts) == 1:
+            packages[parts[0]] = ""
+    return packages
+
+
+def compute_changed_packages(old_packages_str: str, new_packages_str: str) -> set:
+    """
+    Compute which packages changed between two package strings.
+
+    Returns a set of package names that were:
+    - Added (in new but not old)
+    - Removed (in old but not new)
+    - Updated (version changed)
+
+    This enables granular external dependency tracking - only tests that
+    used a changed package need to be re-run.
+    """
+    old_pkgs = parse_system_packages(old_packages_str)
+    new_pkgs = parse_system_packages(new_packages_str)
+
+    changed = set()
+
+    # Added packages
+    for pkg in new_pkgs:
+        if pkg not in old_pkgs:
+            changed.add(pkg)
+
+    # Removed packages
+    for pkg in old_pkgs:
+        if pkg not in new_pkgs:
+            changed.add(pkg)
+
+    # Updated packages (version changed)
+    for pkg in old_pkgs:
+        if pkg in new_pkgs and old_pkgs[pkg] != new_pkgs[pkg]:
+            changed.add(pkg)
+
+    return changed
+
+
 #
 # .git utilities
 #

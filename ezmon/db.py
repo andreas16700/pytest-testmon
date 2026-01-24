@@ -677,15 +677,22 @@ class DB:  # pylint: disable=too-many-public-methods
         """
 
     def _create_external_dependency_statement(self) -> str:
-        """Table for tracking external package dependencies per test."""
+        """Table for tracking external package dependencies per test.
+
+        Stores which external packages each test uses, enabling granular
+        invalidation when specific packages change (instead of re-running
+        all tests when any package changes).
+        """
         return """
             CREATE TABLE IF NOT EXISTS test_external_dependency (
                 id INTEGER PRIMARY KEY,
                 test_execution_id INTEGER,
                 package_name TEXT NOT NULL,
+                package_version TEXT,
                 FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS ted_te_id ON test_external_dependency (test_execution_id);
+            CREATE INDEX IF NOT EXISTS ted_pkg_name ON test_external_dependency (package_name);
         """
 
     def init_tables(self):
@@ -828,7 +835,7 @@ class DB:  # pylint: disable=too-many-public-methods
     def delete_filenames(self, con):
         con.execute("DELETE FROM changed_files_mhashes")
 
-    def determine_tests(self, exec_id, files_mhashes, file_deps_shas=None):
+    def determine_tests(self, exec_id, files_mhashes, file_deps_shas=None, changed_packages=None):
         """
         Determine which tests are affected by code changes.
 
@@ -836,9 +843,12 @@ class DB:  # pylint: disable=too-many-public-methods
             exec_id: The execution/environment ID
             files_mhashes: Dict of {filename: method_checksums} for Python files
             file_deps_shas: Dict of {filename: sha} for non-Python file dependencies
+            changed_packages: Set of package names that changed (for granular external dep tracking)
         """
         if file_deps_shas is None:
             file_deps_shas = {}
+        if changed_packages is None:
+            changed_packages = set()
 
         with self.con as con:
             if not self._readonly:
@@ -891,6 +901,11 @@ class DB:  # pylint: disable=too-many-public-methods
             file_dep_affected = self._check_file_dependency_changes(exec_id, file_deps_shas)
             method_misses.extend(file_dep_affected)
 
+            # Check external package dependency changes (granular tracking)
+            if changed_packages:
+                ext_dep_affected = self._check_external_dependency_changes(exec_id, changed_packages)
+                method_misses.extend(ext_dep_affected)
+
             # Deduplicate
             method_misses = list(set(method_misses))
 
@@ -910,6 +925,51 @@ class DB:  # pylint: disable=too-many-public-methods
             ]
 
             return {"affected": method_misses, "failing": failing_tests}
+
+    def _check_external_dependency_changes(self, exec_id, changed_packages):
+        """
+        Check which tests are affected by changed external packages.
+
+        Uses granular tracking: only tests that actually imported the changed
+        packages are invalidated, not all tests.
+
+        Args:
+            exec_id: The execution/environment ID
+            changed_packages: Set of package names that changed
+
+        Returns:
+            List of test names affected by the changed packages
+        """
+        if not changed_packages:
+            return []
+
+        # Special case: Python version changed - all tests must re-run
+        if "__python_version_changed__" in changed_packages:
+            # Get all test names for this environment
+            cursor = self.con.execute(
+                f"""
+                SELECT DISTINCT te.test_name
+                FROM test_execution te
+                WHERE te.{self._test_execution_fk_column()} = ?
+                """,
+                [exec_id],
+            )
+            return [row["test_name"] for row in cursor]
+
+        # Build query for tests using any of the changed packages
+        placeholders = ", ".join("?" * len(changed_packages))
+        cursor = self.con.execute(
+            f"""
+            SELECT DISTINCT te.test_name
+            FROM test_execution te
+            JOIN test_external_dependency ted ON te.id = ted.test_execution_id
+            WHERE
+                te.{self._test_execution_fk_column()} = ? AND
+                ted.package_name IN ({placeholders})
+            """,
+            [exec_id] + list(changed_packages),
+        )
+        return [row["test_name"] for row in cursor]
 
     def _check_file_dependency_changes(self, exec_id, file_deps_shas):
         """
@@ -1051,6 +1111,21 @@ class DB:  # pylint: disable=too-many-public-methods
     def fetch_or_create_environment(
         self, environment_name, system_packages, python_version
     ):
+        """
+        Fetch or create an environment, with granular package change tracking.
+
+        Instead of deleting all test data when packages change (old behavior),
+        we now:
+        1. Track which specific packages changed
+        2. Update the environment record in-place
+        3. Return the set of changed packages for selective invalidation
+
+        Returns:
+            (environment_id, changed_packages) where changed_packages is a set
+            of package names that changed (added, removed, or updated).
+        """
+        from ezmon.common import compute_changed_packages
+
         with self.con as con:
             con.execute("BEGIN IMMEDIATE TRANSACTION")
             cursor = con.cursor()
@@ -1065,26 +1140,17 @@ class DB:  # pylint: disable=too-many-public-methods
                 (environment_name,),
             ).fetchone()
 
-            if environment:
-                environment_id = environment["id"]
-                packages_changed = (
-                    environment["system_packages"] != system_packages
-                    or environment["python_version"] != python_version
-                )
-            else:
-                packages_changed = False
+            changed_packages = set()
+
             if not environment:
+                # New environment - no packages changed (first run)
                 try:
                     cursor.execute(
                         """
                         INSERT INTO environment (environment_name, system_packages, python_version)
                         VALUES (?, ?, ?)
                         """,
-                        (
-                            environment_name,
-                            system_packages,
-                            python_version,
-                        ),
+                        (environment_name, system_packages, python_version),
                     )
                     environment_id = cursor.lastrowid
                 except sqlite3.IntegrityError:
@@ -1098,23 +1164,31 @@ class DB:  # pylint: disable=too-many-public-methods
                         (environment_name,),
                     ).fetchone()
                     environment_id = environment["id"]
-            elif packages_changed:
-                # Fix #255: Create new environment, then delete old one
-                # ON DELETE CASCADE will clean up related test data
-                cursor.execute(
-                    """
-                    INSERT INTO environment (environment_name, system_packages, python_version)
-                    VALUES (?, ?, ?)
-                    """,
-                    (environment_name, system_packages, python_version),
-                )
-                new_environment_id = cursor.lastrowid
-                cursor.execute(
-                    "DELETE FROM environment WHERE id = ?", (environment_id,)
-                )
-                environment_id = new_environment_id
+            else:
+                environment_id = environment["id"]
+                old_packages = environment["system_packages"] or ""
+                old_python = environment["python_version"] or ""
 
-            return environment_id, packages_changed
+                # Python version change still requires full re-run
+                if old_python != python_version:
+                    # Return special marker indicating all tests affected
+                    changed_packages = {"__python_version_changed__"}
+                elif old_packages != system_packages:
+                    # Compute which specific packages changed
+                    changed_packages = compute_changed_packages(old_packages, system_packages)
+
+                # Update the environment record (don't delete and recreate)
+                if old_packages != system_packages or old_python != python_version:
+                    cursor.execute(
+                        """
+                        UPDATE environment
+                        SET system_packages = ?, python_version = ?
+                        WHERE id = ?
+                        """,
+                        (system_packages, python_version, environment_id),
+                    )
+
+            return environment_id, changed_packages
 
     def initiate_execution(  # pylint: disable= R0913 W0613
         self,
@@ -1123,11 +1197,13 @@ class DB:  # pylint: disable=too-many-public-methods
         python_version: str,
         execution_metadata: dict,  # pylint: disable=unused-argument
     ) -> [int, list]:  # exec_id  # changed_file_data  # future_string2
-        exec_id, packages_changed = self.fetch_or_create_environment(
+        exec_id, changed_packages = self.fetch_or_create_environment(
             environment_name, system_packages, python_version
         )
         return {
             "exec_id": exec_id,
             "filenames": self.all_filenames(),
-            "packages_changed": packages_changed,
+            "changed_packages": changed_packages,  # Set of changed package names
+            # Legacy: packages_changed is True if any packages changed
+            "packages_changed": bool(changed_packages),
         }

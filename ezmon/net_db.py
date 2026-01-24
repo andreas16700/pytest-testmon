@@ -226,10 +226,17 @@ class NetDB:
         self.session_id = response.get("session_id")
         self.exec_id = response.get("exec_id")
 
+        # Get changed packages (granular tracking) or convert legacy boolean
+        changed_packages = response.get("changed_packages", set())
+        if isinstance(changed_packages, list):
+            changed_packages = set(changed_packages)
+        packages_changed = response.get("packages_changed", False)
+
         return {
             "exec_id": response["exec_id"],
             "filenames": response.get("filenames", []),
-            "packages_changed": response.get("packages_changed", False),
+            "packages_changed": packages_changed or bool(changed_packages),
+            "changed_packages": changed_packages,
         }
 
     def finish_execution(self, exec_id: int, duration: float = None, select: bool = True):
@@ -276,6 +283,7 @@ class NetDB:
         exec_id: int,
         files_mhashes: Dict[str, Any],
         file_deps_shas: Optional[Dict[str, str]] = None,
+        changed_packages: Optional[set] = None,
     ) -> Dict[str, List[str]]:
         """
         Determine which tests are affected by code changes.
@@ -284,6 +292,7 @@ class NetDB:
             exec_id: Execution/environment ID
             files_mhashes: Dict of {filename: method_checksums}
             file_deps_shas: Dict of {filename: sha} for non-Python dependencies
+            changed_packages: Set of package names that changed (granular tracking)
 
         Returns:
             Dict with 'affected' and 'failing' test lists
@@ -303,6 +312,7 @@ class NetDB:
                 "exec_id": exec_id,
                 "files_mhashes": serialized_mhashes,
                 "file_deps_shas": file_deps_shas or {},
+                "changed_packages": list(changed_packages) if changed_packages else [],
             },
         )
         return {

@@ -236,6 +236,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.exec_id = result["exec_id"]
 
         self.system_packages_change = result["packages_changed"]
+        self.changed_packages = result.get("changed_packages", set())  # Granular package tracking
         self.files_of_interest = result["filenames"]
 
         self.all_files = {}
@@ -346,7 +347,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         # Get file dependency SHAs from disk
         file_deps_shas = self._compute_file_dependency_shas()
 
-        tests = self.db.determine_tests(self.exec_id, files_mhashes, file_deps_shas)
+        # Pass changed_packages for granular external dependency tracking
+        tests = self.db.determine_tests(
+            self.exec_id,
+            files_mhashes,
+            file_deps_shas,
+            changed_packages=self.changed_packages
+        )
         affected_tests, self.failing_tests = tests["affected"], tests["failing"]
 
         if assert_old:

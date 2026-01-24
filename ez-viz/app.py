@@ -333,6 +333,51 @@ def cleanup_old_environments(cursor, environment_name: str, keep_id: int):
         return 0
 
 
+def compute_changed_packages_server(old_packages_str: str, new_packages_str: str) -> list:
+    """
+    Compute which packages changed between two package strings.
+
+    Returns a list of package names that were added, removed, or updated.
+    This enables granular external dependency tracking.
+    """
+    def parse_packages(packages_str):
+        if not packages_str:
+            return {}
+        packages = {}
+        for item in packages_str.split(", "):
+            item = item.strip()
+            if not item:
+                continue
+            parts = item.rsplit(" ", 1)
+            if len(parts) == 2:
+                packages[parts[0]] = parts[1]
+            elif len(parts) == 1:
+                packages[parts[0]] = ""
+        return packages
+
+    old_pkgs = parse_packages(old_packages_str)
+    new_pkgs = parse_packages(new_packages_str)
+
+    changed = set()
+
+    # Added packages
+    for pkg in new_pkgs:
+        if pkg not in old_pkgs:
+            changed.add(pkg)
+
+    # Removed packages
+    for pkg in old_pkgs:
+        if pkg not in new_pkgs:
+            changed.add(pkg)
+
+    # Updated packages (version changed)
+    for pkg in old_pkgs:
+        if pkg in new_pkgs and old_pkgs[pkg] != new_pkgs[pkg]:
+            changed.add(pkg)
+
+    return list(changed)
+
+
 def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None):
     """Register a new repo/job combination in metadata"""
     try:
@@ -1964,9 +2009,11 @@ def rpc_session_initiate():
                 id INTEGER PRIMARY KEY,
                 test_execution_id INTEGER,
                 package_name TEXT NOT NULL,
+                package_version TEXT,
                 FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS ted_te_id ON test_external_dependency (test_execution_id);
+            CREATE INDEX IF NOT EXISTS ted_pkg_name ON test_external_dependency (package_name);
 
             CREATE TABLE IF NOT EXISTS run_uid (
                 id INTEGER PRIMARY KEY,
@@ -2031,7 +2078,7 @@ def rpc_session_initiate():
             CREATE UNIQUE INDEX IF NOT EXISTS sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
         """)
 
-        # Fetch or create environment
+        # Fetch or create environment with GRANULAR package change tracking
         env = cursor.execute(
             """
             SELECT id, environment_name, system_packages, python_version
@@ -2041,29 +2088,32 @@ def rpc_session_initiate():
             (environment_name,),
         ).fetchone()
 
-        packages_changed = False
-        old_exec_id = None
+        changed_packages = []
         if env:
             exec_id = env["id"]
-            packages_changed = (
-                env["system_packages"] != system_packages
-                or env["python_version"] != python_version
-            )
-            if packages_changed:
-                # Create new environment - defer deletion of old one to avoid FK race conditions
-                # with concurrent requests that may still be using the old environment_id
-                old_exec_id = exec_id
+            old_packages = env["system_packages"] or ""
+            old_python = env["python_version"] or ""
+
+            # Python version change requires full re-run
+            if old_python != python_version:
+                changed_packages = ["__python_version_changed__"]
+            elif old_packages != system_packages:
+                # Compute which specific packages changed (granular tracking)
+                changed_packages = compute_changed_packages_server(old_packages, system_packages)
+
+            # Update environment in-place (don't delete and recreate)
+            if old_packages != system_packages or old_python != python_version:
                 cursor.execute(
                     """
-                    INSERT INTO environment (environment_name, system_packages, python_version)
-                    VALUES (?, ?, ?)
+                    UPDATE environment
+                    SET system_packages = ?, python_version = ?
+                    WHERE id = ?
                     """,
-                    (environment_name, system_packages, python_version),
+                    (system_packages, python_version, exec_id),
                 )
-                exec_id = cursor.lastrowid
                 log.info(
-                    "packages_changed old_exec_id=%s new_exec_id=%s",
-                    old_exec_id, exec_id
+                    "packages_updated exec_id=%s changed_packages=%s",
+                    exec_id, changed_packages[:5] if len(changed_packages) > 5 else changed_packages
                 )
         else:
             cursor.execute(
@@ -2082,20 +2132,6 @@ def rpc_session_initiate():
 
         # Commit the main transaction
         conn.commit()
-
-        # Deferred cleanup of old environments (after commit to avoid blocking)
-        # This is safe because the new environment is already committed
-        if old_exec_id is not None:
-            try:
-                cleanup_old_environments(cursor, environment_name, exec_id)
-                conn.commit()
-            except Exception as cleanup_err:
-                log.warning(
-                    "cleanup_old_environments_deferred_error exec_id=%s error=%s",
-                    old_exec_id, cleanup_err
-                )
-                # Don't fail the request if cleanup fails - it can be retried later
-
         conn.close()
 
         # Create session
@@ -2106,19 +2142,21 @@ def rpc_session_initiate():
             "repo_id": repo_id,
             "job_id": job_id,
             "run_id": run_id,
+            "changed_packages": changed_packages,  # Store for later use
             "data": {},
         }
 
         log.info(
-            "rpc_session_initiate success exec_id=%s session_id=%s",
-            exec_id, session_id
+            "rpc_session_initiate success exec_id=%s session_id=%s changed_packages=%d",
+            exec_id, session_id, len(changed_packages)
         )
 
         return jsonify({
             "session_id": session_id,
             "exec_id": exec_id,
             "filenames": filenames,
-            "packages_changed": packages_changed,
+            "packages_changed": bool(changed_packages),
+            "changed_packages": changed_packages,
         })
 
     except Exception as e:
@@ -2442,6 +2480,7 @@ def rpc_tests_determine():
     exec_id = data.get("exec_id")
     files_mhashes = data.get("files_mhashes", {})
     file_deps_shas = data.get("file_deps_shas", {})
+    changed_packages = data.get("changed_packages", [])  # Granular external dep tracking
 
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -2532,6 +2571,29 @@ def rpc_tests_determine():
             current_sha = file_deps_shas.get(filename)
             if current_sha is None or current_sha != stored_sha:
                 method_misses.add(test_name)
+
+        # Check external package dependency changes (granular tracking)
+        if changed_packages:
+            if "__python_version_changed__" in changed_packages:
+                # Python version changed - all tests must re-run
+                for row in cursor.execute(
+                    "SELECT DISTINCT test_name FROM test_execution WHERE environment_id = ?",
+                    (exec_id,),
+                ):
+                    method_misses.add(row["test_name"])
+            else:
+                # Find tests using any of the changed packages
+                placeholders = ", ".join("?" * len(changed_packages))
+                for row in cursor.execute(
+                    f"""
+                    SELECT DISTINCT te.test_name
+                    FROM test_execution te
+                    JOIN test_external_dependency ted ON te.id = ted.test_execution_id
+                    WHERE te.environment_id = ? AND ted.package_name IN ({placeholders})
+                    """,
+                    [exec_id] + list(changed_packages),
+                ):
+                    method_misses.add(row["test_name"])
 
         # Get failing tests
         failing_tests = [

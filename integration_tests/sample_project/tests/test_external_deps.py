@@ -1,24 +1,20 @@
-"""Tests for external_deps - demonstrates external module dependency limitation.
+"""Tests for external_deps - demonstrates granular external dependency tracking.
 
-LIMITATION: ezmon tracks ALL external packages in a single hash. When any
-package changes (added, removed, or updated), ALL tests are re-run.
-
-There's no granular tracking of which tests use which external packages.
+ezmon tracks external packages per-test, enabling selective invalidation
+when specific packages change (instead of re-running all tests).
 
 Test categories:
-- test_uses_neither: Uses NO external deps
+- test_uses_neither: Uses NO external deps (should NOT be affected by package changes)
 - test_uses_dep_a: Uses only dependency A (requests)
 - test_uses_dep_b: Uses only dependency B (numpy)
 - test_uses_both: Uses both dependencies A and B
 
-Expected behavior with granular tracking:
+Expected behavior with granular tracking (NOW IMPLEMENTED):
 - Remove requests: test_uses_dep_a and test_uses_both should re-run
 - Remove numpy: test_uses_dep_b and test_uses_both should re-run
-- Add new package: Only new tests using it should run
+- Add new package: No tests should run (unless they use it)
 - Update requests: Only test_uses_dep_a and test_uses_both should re-run
-
-Actual behavior (current limitation):
-- ANY package change: ALL tests are marked affected
+- test_uses_neither: Should NEVER be affected by external package changes
 """
 
 import pytest
@@ -34,8 +30,9 @@ from src.external_deps import (
 class TestUsesNeither:
     """Tests that use NO external dependencies.
 
-    These tests should NOT be affected by any external package changes,
-    but currently they ARE because ezmon uses a single hash for all packages.
+    These tests should NOT be affected by any external package changes.
+    With granular tracking, only tests that actually use a changed package
+    will be invalidated.
     """
 
     def test_pure_python_mean(self):

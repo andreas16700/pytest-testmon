@@ -304,12 +304,17 @@ def changed_message(
         if config.testmon_data.new_db:
             message += "new DB, "
         else:
-            message += (
-                "The packages installed in your Python environment have been changed. "
-                "All tests have to be re-executed. "
-                if packages_change
-                else f"changed files: {changed_files_msg}, unchanged files: {len(stable_files)}, "
-            )
+            # Check for granular package changes
+            changed_packages = getattr(config.testmon_data, 'changed_packages', set())
+            if changed_packages:
+                if "__python_version_changed__" in changed_packages:
+                    message += "Python version changed - all tests re-running, "
+                else:
+                    pkg_list = ", ".join(sorted(changed_packages)[:5])
+                    if len(changed_packages) > 5:
+                        pkg_list += f" (+{len(changed_packages) - 5} more)"
+                    message += f"changed packages: {pkg_list}, "
+            message += f"changed files: {changed_files_msg}, unchanged files: {len(stable_files)}, "
     if config.testmon_data.environment:
         message += f"environment: {environment}"
     return message
