@@ -138,6 +138,61 @@ def rpc_session_initiate():
 
 ---
 
+## Database Concurrency
+
+The server uses SQLite with special handling for concurrent access from multiple CI jobs.
+
+### Key Helper Functions
+
+**`connect_db_with_retry(db_path, max_retries=5, base_delay=0.1)`**
+- Connects to SQLite with exponential backoff retry logic
+- Enables WAL mode for better concurrent read/write performance
+- Sets 30-second busy timeout
+- Enables foreign key constraints
+
+**`cleanup_old_environments(cursor, environment_name, keep_id)`**
+- Safely deletes old environments with the same name
+- Catches IntegrityError for environments still in use by concurrent requests
+- Used for deferred cleanup after the main transaction commits
+
+### Transaction Strategy
+
+The RPC endpoints use this pattern for safe concurrent access:
+
+```python
+# 1. Connect with retry logic
+conn = connect_db_with_retry(db_path)
+cursor = conn.cursor()
+
+# 2. Acquire write lock early with IMMEDIATE transaction
+cursor.execute("BEGIN IMMEDIATE")
+
+# 3. Perform operations...
+
+# 4. Commit main transaction
+conn.commit()
+
+# 5. Deferred cleanup (non-critical, can fail)
+try:
+    cleanup_old_environments(cursor, env_name, new_id)
+    conn.commit()
+except Exception:
+    pass  # Log and continue
+
+conn.close()
+```
+
+### Why Deferred Deletion?
+
+When CI jobs run in parallel (e.g., matrix builds with py3.10, py3.11, py3.12), multiple requests may call `/api/rpc/session/initiate` simultaneously. If packages have changed, the old approach immediately deleted the old environment, causing:
+
+1. **Race condition**: Request A deletes environment while Request B still references it
+2. **FK violation**: Request B's operations fail with `FOREIGN KEY constraint failed`
+
+The fix defers deletion until after the main transaction commits, so concurrent requests see consistent data.
+
+---
+
 ## Testing RPC Endpoints
 
 ### Manual Testing with curl
@@ -589,23 +644,54 @@ curl -v -X POST http://localhost:8004/api/rpc/session/initiate \
 **Cause**: SQLite locking issues with concurrent access.
 
 **Fix**:
-- Increase timeout in `sqlite3.connect(..., timeout=60)`
-- Use WAL mode: `conn.execute("PRAGMA journal_mode = WAL")`
-- Check for orphaned connections
+- The server now uses `connect_db_with_retry()` with exponential backoff
+- WAL mode is enabled by default: `PRAGMA journal_mode = WAL`
+- Busy timeout is set to 30 seconds: `PRAGMA busy_timeout = 30000`
+- Transactions use `BEGIN IMMEDIATE` to acquire write locks early
 
-### 5. Gzip Decompression Failed
+### 5. "FOREIGN KEY constraint failed" (IntegrityError)
+
+**Cause**: Race condition when multiple concurrent CI jobs call `/api/rpc/session/initiate` simultaneously and packages have changed. The old code immediately deleted the old environment, causing FK violations for concurrent requests still referencing it.
+
+**Fix** (implemented in app.py):
+- Environment deletion is now **deferred** - new environment is created and committed first
+- Old environments are cleaned up after the main transaction commits
+- The `cleanup_old_environments()` helper catches IntegrityError for environments still in use
+- If cleanup fails, it's logged but doesn't fail the request
+
+**Testing concurrent access**:
+```python
+# Test script to verify concurrent session handling
+import concurrent.futures
+import requests
+
+def initiate_session(job_id):
+    return requests.post(
+        "http://localhost:8004/api/rpc/session/initiate",
+        headers={"Authorization": "Bearer your-token", ...},
+        json={"repo_id": "test/repo", "job_id": job_id, ...},
+    )
+
+# Simulate 5 concurrent CI jobs
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    futures = [executor.submit(initiate_session, f"job-{i}") for i in range(5)]
+    results = [f.result() for f in futures]
+    assert all(r.status_code == 200 for r in results)
+```
+
+### 6. Gzip Decompression Failed
 
 **Cause**: Client sent gzip-compressed data but header is missing.
 
 **Fix**: Ensure `Content-Encoding: gzip` header is set when sending compressed data.
 
-### 6. Session Not Found
+### 7. Session Not Found
 
 **Cause**: Session expired (30-minute TTL) or server restarted.
 
 **Fix**: Start a new session. Sessions are stored in memory and don't persist across restarts.
 
-### 7. NetDB Mode Not Activating
+### 8. NetDB Mode Not Activating
 
 **Cause**: Environment variables not set correctly.
 

@@ -252,6 +252,87 @@ def get_job_db_path(repo_id: str, job_id: str) -> Path:
     log.info("job_db_resolve repo_id=%s job_id=%s db_path=%s", repo_id, job_id, db_path)
     return db_path
 
+
+def connect_db_with_retry(db_path: Path, max_retries: int = 5, base_delay: float = 0.1):
+    """
+    Connect to SQLite database with retry logic for busy/locked errors.
+
+    Uses exponential backoff and BEGIN IMMEDIATE for proper write locking.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=60, isolation_level=None)
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 30000")  # 30 second busy timeout
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.row_factory = sqlite3.Row
+            return conn
+        except sqlite3.OperationalError as e:
+            last_error = e
+            if "locked" in str(e).lower() or "busy" in str(e).lower():
+                delay = base_delay * (2 ** attempt)
+                log.warning(
+                    "db_connect_retry attempt=%s delay=%.2fs error=%s path=%s",
+                    attempt + 1, delay, e, db_path
+                )
+                time.sleep(delay)
+            else:
+                raise
+    raise last_error
+
+
+def cleanup_old_environments(cursor, environment_name: str, keep_id: int):
+    """
+    Clean up old environments with the same name, keeping only the specified one.
+
+    This is done in a deferred manner to avoid FK constraint issues during
+    concurrent session initiations.
+    """
+    try:
+        # Find old environments to clean up
+        old_envs = cursor.execute(
+            """
+            SELECT id FROM environment
+            WHERE environment_name = ? AND id != ?
+            """,
+            (environment_name, keep_id),
+        ).fetchall()
+
+        if not old_envs:
+            return 0
+
+        deleted = 0
+        for (old_id,) in old_envs:
+            try:
+                # Delete test data associated with old environment
+                cursor.execute(
+                    "DELETE FROM test_execution WHERE environment_id = ?",
+                    (old_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM environment WHERE id = ?",
+                    (old_id,),
+                )
+                deleted += 1
+            except sqlite3.IntegrityError as e:
+                # Another request may still be using this environment, skip it
+                log.debug(
+                    "cleanup_old_env_skipped id=%s reason=%s",
+                    old_id, e
+                )
+
+        if deleted:
+            log.info(
+                "cleanup_old_environments name=%s kept=%s deleted=%s",
+                environment_name, keep_id, deleted
+            )
+        return deleted
+    except Exception as e:
+        log.warning("cleanup_old_environments_error error=%s", e)
+        return 0
+
+
 def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None):
     """Register a new repo/job combination in metadata"""
     try:
@@ -1816,11 +1897,12 @@ def rpc_session_initiate():
         if not db_path.exists():
             log.info("Creating new testmon database at %s", db_path)
 
-        conn = sqlite3.connect(str(db_path), timeout=60)
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA foreign_keys = TRUE")
-        conn.row_factory = sqlite3.Row
+        # Use retry helper for robust connection with busy timeout
+        conn = connect_db_with_retry(db_path)
         cursor = conn.cursor()
+
+        # Start an immediate transaction to acquire write lock early
+        cursor.execute("BEGIN IMMEDIATE")
 
         # Ensure tables exist (simplified schema creation)
         cursor.executescript("""
@@ -1959,6 +2041,7 @@ def rpc_session_initiate():
         ).fetchone()
 
         packages_changed = False
+        old_exec_id = None
         if env:
             exec_id = env["id"]
             packages_changed = (
@@ -1966,7 +2049,9 @@ def rpc_session_initiate():
                 or env["python_version"] != python_version
             )
             if packages_changed:
-                # Create new environment and delete old one
+                # Create new environment - defer deletion of old one to avoid FK race conditions
+                # with concurrent requests that may still be using the old environment_id
+                old_exec_id = exec_id
                 cursor.execute(
                     """
                     INSERT INTO environment (environment_name, system_packages, python_version)
@@ -1974,9 +2059,11 @@ def rpc_session_initiate():
                     """,
                     (environment_name, system_packages, python_version),
                 )
-                new_exec_id = cursor.lastrowid
-                cursor.execute("DELETE FROM environment WHERE id = ?", (exec_id,))
-                exec_id = new_exec_id
+                exec_id = cursor.lastrowid
+                log.info(
+                    "packages_changed old_exec_id=%s new_exec_id=%s",
+                    old_exec_id, exec_id
+                )
         else:
             cursor.execute(
                 """
@@ -1992,7 +2079,22 @@ def rpc_session_initiate():
             row[0] for row in cursor.execute("SELECT DISTINCT filename FROM file_fp")
         ]
 
+        # Commit the main transaction
         conn.commit()
+
+        # Deferred cleanup of old environments (after commit to avoid blocking)
+        # This is safe because the new environment is already committed
+        if old_exec_id is not None:
+            try:
+                cleanup_old_environments(cursor, environment_name, exec_id)
+                conn.commit()
+            except Exception as cleanup_err:
+                log.warning(
+                    "cleanup_old_environments_deferred_error exec_id=%s error=%s",
+                    old_exec_id, cleanup_err
+                )
+                # Don't fail the request if cleanup fails - it can be retried later
+
         conn.close()
 
         # Create session
