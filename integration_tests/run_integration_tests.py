@@ -257,6 +257,8 @@ class IntegrationTestRunner:
             str(python_venv), "-m", "pytest",
             "--ezmon",
             "-v",
+            "--color=no",  # Disable colors for consistent regex parsing
+            "--tb=short",  # Shorter tracebacks for cleaner output
             "tests/",
         ]
         if extra_args:

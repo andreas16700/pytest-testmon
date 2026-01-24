@@ -1,10 +1,15 @@
 name: Test
 
 on:
-  push:
+  # Run after deploy workflow completes (for push to main)
+  workflow_run:
+    workflows: ["Deploy Testmon Server"]
+    types: [completed]
     branches: [main]
+  # Run directly for PRs (no deploy needed)
   pull_request:
     branches: [main]
+  # Manual trigger
   workflow_dispatch:
 
 env:
@@ -19,6 +24,8 @@ jobs:
   # ============================================================================
   unit-tests:
     runs-on: self-hosted
+    # Skip if triggered by workflow_run and deploy failed
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     env:
       REPO_ID: ${{ github.repository }}
       JOB_ID: "unit-tests"
@@ -34,13 +41,15 @@ jobs:
           pip3 install pytest pytest-cov
 
       - name: Run unit tests with ezmon
-        run: pytest tests/ -v --ezmon --tb=short
+        run: python3 -m pytest tests/ -v --ezmon --tb=short
 
   # ============================================================================
   # Integration Tests - Self-hosted macOS runner with NetDB
   # ============================================================================
   integration-tests:
     runs-on: self-hosted
+    # Skip if triggered by workflow_run and deploy failed
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     env:
       REPO_ID: ${{ github.repository }}
       JOB_ID: "integration-tests"
@@ -62,6 +71,8 @@ jobs:
   # ============================================================================
   lint:
     runs-on: self-hosted
+    # Skip if triggered by workflow_run and deploy failed
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
