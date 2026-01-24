@@ -1,10 +1,12 @@
 import ast
 import os
 from ezmon.common import get_logger
-import networkx as nx
-from pyvis.network import Network
 
 logger = get_logger(__name__)
+
+# networkx and pyvis are optional dependencies for graph generation
+# They are imported lazily in generate_graph() to avoid import errors
+# when users don't have them installed
 
 def scan_project(root_dir):
     project_data = {}
@@ -45,6 +47,20 @@ def get_imports(file_path):
     return list(imports)
 
 def generate_graph(root_dir, output_file="dependency_graph.html"):
+    # Import optional dependencies here to avoid import errors when not installed
+    try:
+        import networkx as nx
+        from pyvis.network import Network
+    except ImportError as e:
+        logger.error(
+            f"Graph generation requires 'networkx' and 'pyvis' packages. "
+            f"Install them with: pip install networkx pyvis"
+        )
+        raise ImportError(
+            "Graph generation requires optional dependencies. "
+            "Install with: pip install networkx pyvis"
+        ) from e
+
     logger.info(f"Scanning project at {root_dir}.")
     data = scan_project(root_dir)
 
