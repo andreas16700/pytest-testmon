@@ -666,6 +666,9 @@ class TestmonCollector:
             if test_name not in nodes_files_lines:
                 nodes_files_lines[test_name] = {}
 
+            # Make a mutable copy of external_imports to add discovered deps
+            all_external_imports = set(external_imports) if external_imports else set()
+
             # Add local imports that were captured during runtime
             # These are imports that happened DURING the test execution
             for local_import in local_imports:
@@ -688,9 +691,14 @@ class TestmonCollector:
             # 2. For each direct import, getting its transitive imports
             # 3. Adding module-level fingerprints (line 0) for any modules
             #    that coverage.py didn't track (because no code was called)
+            # 4. Extracting external package dependencies from each module
             if test_file:
                 # Get direct imports from the test file using AST parsing
                 test_file_imports = self.dependency_tracker.get_test_file_imports(test_file)
+
+                # Also get external imports from the test file itself
+                test_file_external = self.dependency_tracker.get_module_external_imports(test_file)
+                all_external_imports.update(test_file_external)
 
                 for imported_module in test_file_imports:
                     # Add the directly imported module if not already tracked
@@ -704,16 +712,21 @@ class TestmonCollector:
                         if transitive_import not in nodes_files_lines[test_name]:
                             nodes_files_lines[test_name][transitive_import] = {0}
 
+                    # Extract external package dependencies from this module
+                    # This catches imports like 'import requests' at module level
+                    module_external = self.dependency_tracker.get_module_external_imports(imported_module)
+                    all_external_imports.update(module_external)
+
             # Store file dependencies in a special key
             # These will be handled specially in get_tests_fingerprints
             if files:
                 file_deps_key = f"__file_deps__{test_name}"
                 nodes_files_lines[test_name][file_deps_key] = files
 
-            # Store external imports for future granular tracking
-            if external_imports:
+            # Store external imports for granular package tracking
+            if all_external_imports:
                 ext_deps_key = f"__external_deps__{test_name}"
-                nodes_files_lines[test_name][ext_deps_key] = external_imports
+                nodes_files_lines[test_name][ext_deps_key] = all_external_imports
 
         return nodes_files_lines
 

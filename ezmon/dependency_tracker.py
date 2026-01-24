@@ -225,10 +225,14 @@ class DependencyTracker:
                     self._tracked_local_imports[context].add(relpath)
             else:
                 # External module (or built-in)
-                if not self._is_stdlib_module(name):
-                    pkg_name = self._get_package_name(name)
-                    if context in self._tracked_external_imports:
-                        self._tracked_external_imports[context].add(pkg_name)
+                # Get the actual module name from the module object for accuracy
+                actual_name = getattr(module, '__name__', name) if module else name
+                if not self._is_stdlib_module(actual_name):
+                    pkg_name = self._get_package_name(actual_name)
+                    # Only track non-empty, valid package names
+                    if pkg_name and not pkg_name.startswith('_'):
+                        if context in self._tracked_external_imports:
+                            self._tracked_external_imports[context].add(pkg_name)
 
     def _tracking_open(self, file, mode='r', *args, **kwargs):
         """Replacement for builtins.open that tracks file access."""
@@ -372,6 +376,84 @@ class DependencyTracker:
                     imports.add(relpath)
 
         return imports
+
+    def get_module_external_imports(self, module_path: str) -> Set[str]:
+        """
+        Get all external package names imported by a given module.
+
+        This enables tracking external dependencies from module-level imports:
+        - Test imports src/external_deps.py
+        - external_deps.py imports 'requests', 'numpy' at module level
+        - Therefore, test depends on 'requests' and 'numpy' packages
+
+        Uses AST parsing to find import statements, which catches imports
+        that happen at module load time (before test-specific tracking starts).
+
+        Args:
+            module_path: Relative path to the module (e.g., 'src/external_deps.py')
+
+        Returns:
+            Set of external package names (top-level, e.g., 'requests', 'numpy')
+        """
+        external_imports = set()
+
+        # Read and parse the module's source code
+        abs_path = os.path.join(self.rootdir, module_path)
+        if not os.path.exists(abs_path):
+            return external_imports
+
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            tree = ast.parse(source)
+        except (SyntaxError, UnicodeDecodeError, OSError):
+            return external_imports
+
+        # Extract module names from import statements
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imported_modules.add(node.module)
+
+        # Filter for external packages (not local, not stdlib)
+        for module_name in imported_modules:
+            # Get top-level package name
+            pkg_name = self._get_package_name(module_name)
+
+            # Skip private modules
+            if pkg_name.startswith('_'):
+                continue
+
+            # Check if it's a local project module
+            module_file = self._resolve_module_to_file(module_name)
+            if module_file:
+                relpath = self._is_in_project(module_file)
+                if relpath:
+                    # It's a local module, skip
+                    continue
+
+            # Check if it's stdlib
+            if self._is_stdlib_module(module_name):
+                continue
+
+            # Check if the top-level package is installed (exists in sys.modules or can be found)
+            if pkg_name in sys.modules or self._is_installed_package(pkg_name):
+                external_imports.add(pkg_name)
+
+        return external_imports
+
+    @lru_cache(maxsize=256)
+    def _is_installed_package(self, pkg_name: str) -> bool:
+        """Check if a package is installed (can be imported)."""
+        try:
+            spec = importlib.util.find_spec(pkg_name)
+            return spec is not None
+        except (ModuleNotFoundError, ImportError, ValueError):
+            return False
 
     def _resolve_module_to_file(self, module_name: str) -> Optional[str]:
         """Resolve a module name to its file path."""
