@@ -20,6 +20,22 @@ Examples:
 
     # Estimate impact in a different directory
     python -m ezmon.impact /path/to/repo
+
+Coverage Analysis:
+    # Show files with least test coverage (modules/functions least linked to tests)
+    python -m ezmon.impact --coverage --repo matplotlib/matplotlib
+
+    # Coverage analysis for specific job variant
+    python -m ezmon.impact --coverage --repo matplotlib/matplotlib --job macos-14-py3.11
+
+    # Show top 100 least covered files matching a pattern
+    python -m ezmon.impact --coverage --limit 100 --pattern "lib/matplotlib"
+
+    # Show most covered files (descending order)
+    python -m ezmon.impact --coverage --order desc
+
+    # Filter to files with at least 1 test but no more than 10
+    python -m ezmon.impact --coverage --min-tests 1 --max-tests 10
 """
 
 import argparse
@@ -42,6 +58,56 @@ from ezmon.testmon_core import SourceTree
 from ezmon.common import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class FileCoverage:
+    """Coverage data for a single file."""
+    filename: str
+    test_count: int
+    execution_count: int = 0
+
+
+@dataclass
+class CoverageAnalysis:
+    """Coverage analysis result for a job variant."""
+    repo_id: str
+    job_id: str
+    files: List[FileCoverage] = field(default_factory=list)
+    total_files: int = 0
+    total_tests: int = 0
+    error: Optional[str] = None
+
+    def summary(self, show_files: int = 20) -> str:
+        """Generate a summary string."""
+        if self.error:
+            return f"Coverage Analysis for {self.repo_id}/{self.job_id}: ERROR - {self.error}"
+
+        lines = [
+            f"Coverage Analysis for {self.repo_id}/{self.job_id}",
+            "=" * 60,
+            f"Total files tracked: {self.total_files}",
+            f"Total tests: {self.total_tests}",
+            "",
+        ]
+
+        if self.files:
+            lines.append(f"Files with least test coverage (showing {min(show_files, len(self.files))}):")
+            lines.append("-" * 50)
+            lines.append(f"{'File':<50} {'Tests':>8}")
+            lines.append("-" * 50)
+
+            for fc in self.files[:show_files]:
+                # Truncate filename if too long
+                fname = fc.filename
+                if len(fname) > 48:
+                    fname = "..." + fname[-45:]
+                lines.append(f"{fname:<50} {fc.test_count:>8}")
+
+            if len(self.files) > show_files:
+                lines.append(f"  ... and {len(self.files) - show_files} more files")
+
+        return "\n".join(lines)
 
 
 @dataclass
@@ -411,6 +477,65 @@ class ImpactEstimator:
 
         return report
 
+    def analyze_coverage(
+        self,
+        repo_id: str,
+        job_id: str,
+        order: str = "asc",
+        limit: int = 50,
+        min_tests: int = 0,
+        max_tests: Optional[int] = None,
+        pattern: str = "",
+    ) -> CoverageAnalysis:
+        """
+        Analyze test coverage to find files with least/most test dependencies.
+
+        Args:
+            repo_id: Repository identifier
+            job_id: Job variant identifier
+            order: 'asc' for least covered first, 'desc' for most covered
+            limit: Maximum number of files to return
+            min_tests: Minimum test count to include
+            max_tests: Maximum test count to include (None for unlimited)
+            pattern: Filename pattern filter
+
+        Returns:
+            CoverageAnalysis with file coverage data
+        """
+        result = CoverageAnalysis(repo_id=repo_id, job_id=job_id)
+
+        try:
+            url = (
+                f"/api/rpc/coverage/analysis"
+                f"?repo_id={repo_id}"
+                f"&job_id={job_id}"
+                f"&order={order}"
+                f"&limit={limit}"
+                f"&min_tests={min_tests}"
+            )
+            if max_tests is not None:
+                url += f"&max_tests={max_tests}"
+            if pattern:
+                url += f"&pattern={pattern}"
+
+            response = self._make_request("GET", url)
+
+            result.total_files = response.get("total_files", 0)
+            result.total_tests = response.get("total_tests", 0)
+            result.files = [
+                FileCoverage(
+                    filename=f["filename"],
+                    test_count=f["test_count"],
+                    execution_count=f.get("execution_count", 0),
+                )
+                for f in response.get("files", [])
+            ]
+
+        except Exception as e:
+            result.error = str(e)
+
+        return result
+
 
 def main():
     """CLI entry point."""
@@ -463,6 +588,47 @@ def main():
         help="Show verbose output including affected test names",
     )
 
+    # Coverage analysis arguments
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Analyze test coverage instead of estimating impact. Shows files with least test coverage.",
+    )
+    parser.add_argument(
+        "--job",
+        dest="single_job",
+        help="Single job variant for coverage analysis (required with --coverage)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of files to show in coverage analysis (default: 50)",
+    )
+    parser.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        default="asc",
+        help="Sort order for coverage: 'asc' for least covered first (default), 'desc' for most covered",
+    )
+    parser.add_argument(
+        "--min-tests",
+        type=int,
+        default=0,
+        help="Minimum test count to include in coverage analysis (default: 0)",
+    )
+    parser.add_argument(
+        "--max-tests",
+        type=int,
+        default=None,
+        help="Maximum test count to include in coverage analysis",
+    )
+    parser.add_argument(
+        "--pattern",
+        default="",
+        help="Filename pattern filter for coverage analysis (e.g., 'lib/matplotlib')",
+    )
+
     args = parser.parse_args()
 
     # Load .env file if present
@@ -488,7 +654,7 @@ def main():
     if args.job_ids:
         job_ids = [j.strip() for j in args.job_ids.split(",")]
 
-    # Run estimation
+    # Run estimation or coverage analysis
     try:
         estimator = ImpactEstimator(
             server_url=server_url,
@@ -496,6 +662,55 @@ def main():
             repo_path=args.path,
         )
 
+        # Coverage analysis mode
+        if args.coverage:
+            # Get repo_id
+            repo_id = args.repo_id or estimator.get_repo_id()
+            if not repo_id:
+                print("Error: Could not auto-detect repository ID. Please specify with --repo", file=sys.stderr)
+                sys.exit(1)
+
+            # Get job_id - either specified or pick first available
+            job_id = args.single_job
+            if not job_id:
+                variants, _ = estimator.list_variants(repo_id, args.include_incomplete)
+                if not variants:
+                    print(f"Error: No variants found for {repo_id}. Specify with --job", file=sys.stderr)
+                    sys.exit(1)
+                job_id = variants[0]
+                print(f"Using variant: {job_id}", file=sys.stderr)
+
+            analysis = estimator.analyze_coverage(
+                repo_id=repo_id,
+                job_id=job_id,
+                order=args.order,
+                limit=args.limit,
+                min_tests=args.min_tests,
+                max_tests=args.max_tests,
+                pattern=args.pattern,
+            )
+
+            if args.json_output:
+                output = {
+                    "repo_id": analysis.repo_id,
+                    "job_id": analysis.job_id,
+                    "total_files": analysis.total_files,
+                    "total_tests": analysis.total_tests,
+                    "files": [
+                        {"filename": f.filename, "test_count": f.test_count, "execution_count": f.execution_count}
+                        for f in analysis.files
+                    ],
+                    "error": analysis.error,
+                }
+                print(json.dumps(output, indent=2))
+            else:
+                print(analysis.summary(show_files=args.limit))
+
+            if analysis.error:
+                sys.exit(1)
+            sys.exit(0)
+
+        # Impact estimation mode
         report = estimator.estimate_impact(
             repo_id=args.repo_id,
             job_ids=job_ids,

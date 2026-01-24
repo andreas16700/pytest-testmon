@@ -3807,6 +3807,148 @@ def rpc_impact_estimate():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/rpc/coverage/analysis", methods=["GET"])
+@rpc_auth_required
+def rpc_coverage_analysis():
+    """
+    Analyze test coverage to find files/modules with least test dependencies.
+
+    Query params:
+        repo_id: Repository identifier
+        job_id: Job variant identifier
+        order: 'asc' (least covered first, default) or 'desc' (most covered first)
+        limit: Maximum number of results (default: 50)
+        min_tests: Minimum test count to include (default: 0)
+        max_tests: Maximum test count to include (default: unlimited)
+        pattern: Optional filename pattern filter (e.g., 'lib/matplotlib/')
+
+    Returns:
+        JSON with file coverage statistics
+    """
+    repo_id = request.args.get("repo_id")
+    job_id = request.args.get("job_id")
+    order = request.args.get("order", "asc").lower()
+    limit = int(request.args.get("limit", 50))
+    min_tests = int(request.args.get("min_tests", 0))
+    max_tests = request.args.get("max_tests")
+    pattern = request.args.get("pattern", "")
+
+    g.repo_id = repo_id or "-"
+    g.job_id = job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing repo_id or job_id parameter"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({
+                "files": [],
+                "message": "No data found for this repo/job variant"
+            })
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get the latest environment_id
+        row = cursor.execute(
+            "SELECT id FROM environment ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({
+                "files": [],
+                "message": "No test execution data found"
+            })
+
+        exec_id = row["id"]
+
+        # Query to find files and their test coverage count
+        # This counts distinct test names that depend on each file
+        query = """
+            SELECT
+                f.filename,
+                COUNT(DISTINCT te.test_name) as test_count,
+                COUNT(DISTINCT te.id) as execution_count
+            FROM file_fp f
+            LEFT JOIN test_execution_file_fp te_ffp ON f.id = te_ffp.fingerprint_id
+            LEFT JOIN test_execution te ON te_ffp.test_execution_id = te.id
+                AND te.environment_id = ?
+            WHERE 1=1
+        """
+        params = [exec_id]
+
+        # Apply filename pattern filter
+        if pattern:
+            query += " AND f.filename LIKE ?"
+            params.append(f"%{pattern}%")
+
+        query += " GROUP BY f.filename"
+
+        # Apply min/max test count filters in HAVING clause
+        having_clauses = []
+        if min_tests > 0:
+            having_clauses.append(f"test_count >= {min_tests}")
+        if max_tests is not None:
+            having_clauses.append(f"test_count <= {int(max_tests)}")
+
+        if having_clauses:
+            query += " HAVING " + " AND ".join(having_clauses)
+
+        # Order by test count
+        if order == "desc":
+            query += " ORDER BY test_count DESC, f.filename ASC"
+        else:
+            query += " ORDER BY test_count ASC, f.filename ASC"
+
+        query += f" LIMIT {limit}"
+
+        rows = cursor.execute(query, params).fetchall()
+
+        # Get total file count for context
+        total_files = cursor.execute(
+            "SELECT COUNT(DISTINCT filename) FROM file_fp"
+        ).fetchone()[0]
+
+        # Get total test count
+        total_tests = cursor.execute(
+            "SELECT COUNT(DISTINCT test_name) FROM test_execution WHERE environment_id = ?",
+            (exec_id,)
+        ).fetchone()[0]
+
+        conn.close()
+
+        files = [
+            {
+                "filename": row["filename"],
+                "test_count": row["test_count"],
+                "execution_count": row["execution_count"],
+            }
+            for row in rows
+        ]
+
+        log.info(
+            "coverage_analysis repo_id=%s job_id=%s files=%d total_files=%d order=%s",
+            repo_id, job_id, len(files), total_files, order
+        )
+
+        return jsonify({
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "files": files,
+            "total_files": total_files,
+            "total_tests": total_tests,
+            "order": order,
+            "limit": limit,
+        })
+
+    except Exception as e:
+        log_exception("rpc_coverage_analysis", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health")
 def health():
     repo_count = len(get_metadata().get("repos", {}))
