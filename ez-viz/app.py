@@ -3549,15 +3549,17 @@ def serve_react_app(path):
 @rpc_auth_required
 def rpc_repo_variants():
     """
-    List all job variants (job_ids) available for a repository.
+    List all job variants (job_ids) available for a repository with status info.
 
     Query params:
         repo_id: Repository identifier (e.g., 'owner/repo')
+        include_incomplete: If 'true', include variants without successful runs (default: false)
 
     Returns:
-        JSON with list of variant job_ids
+        JSON with list of variants and their status
     """
     repo_id = request.args.get("repo_id")
+    include_incomplete = request.args.get("include_incomplete", "false").lower() == "true"
 
     if not repo_id:
         return jsonify({"error": "Missing repo_id parameter"}), 400
@@ -3569,16 +3571,78 @@ def rpc_repo_variants():
         metadata = get_metadata()
 
         if repo_id not in metadata.get("repos", {}):
-            return jsonify({"variants": [], "message": "Repository not found"})
+            return jsonify({"variants": [], "variants_detail": [], "message": "Repository not found"})
 
         repo_data = metadata["repos"][repo_id]
-        variants = list(repo_data.get("jobs", {}).keys())
+        job_ids = list(repo_data.get("jobs", {}).keys())
 
-        log.info("repo_variants_listed repo_id=%s count=%d", repo_id, len(variants))
+        variants_detail = []
+        complete_variants = []
+
+        for job_id in job_ids:
+            job_meta = repo_data["jobs"][job_id]
+            detail = {
+                "job_id": job_id,
+                "created": job_meta.get("created"),
+                "last_updated": job_meta.get("last_updated"),
+                "test_count": 0,
+                "has_successful_run": False,
+                "is_complete": False,
+            }
+
+            # Query database for test execution info
+            try:
+                db_path = get_job_db_path(repo_id, job_id)
+                if db_path.exists():
+                    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+
+                    # Get latest environment and test count
+                    row = cursor.execute(
+                        """
+                        SELECT e.id, COUNT(te.id) as test_count,
+                               SUM(CASE WHEN te.failed = 0 THEN 1 ELSE 0 END) as passed_count
+                        FROM environment e
+                        LEFT JOIN test_execution te ON e.id = te.environment_id
+                        GROUP BY e.id
+                        ORDER BY e.id DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+
+                    if row and row["test_count"]:
+                        detail["test_count"] = row["test_count"]
+                        detail["has_successful_run"] = row["passed_count"] > 0
+                        # Consider complete if at least 10 tests passed (configurable threshold)
+                        detail["is_complete"] = row["passed_count"] >= 10
+
+                    conn.close()
+            except Exception as e:
+                log.warning("Failed to query variant %s/%s: %s", repo_id, job_id, e)
+
+            variants_detail.append(detail)
+
+            if detail["is_complete"]:
+                complete_variants.append(job_id)
+
+        # Return only complete variants by default
+        if include_incomplete:
+            variants = job_ids
+        else:
+            variants = complete_variants
+
+        log.info(
+            "repo_variants_listed repo_id=%s total=%d complete=%d returned=%d",
+            repo_id, len(job_ids), len(complete_variants), len(variants)
+        )
 
         return jsonify({
             "repo_id": repo_id,
             "variants": variants,
+            "variants_detail": variants_detail,
+            "total_variants": len(job_ids),
+            "complete_variants": len(complete_variants),
         })
 
     except Exception as e:

@@ -266,19 +266,38 @@ class ImpactEstimator:
 
         return files_fshas, files_mhashes
 
-    def list_variants(self, repo_id: str) -> List[str]:
+    def list_variants(self, repo_id: str, include_incomplete: bool = False) -> Tuple[List[str], List[dict]]:
         """
         Get list of job variants (job_ids) available for a repository.
+
+        Args:
+            repo_id: Repository identifier
+            include_incomplete: If True, include variants without complete test data
+
+        Returns:
+            Tuple of (variant_ids, variant_details)
         """
         try:
-            response = self._make_request(
-                "GET",
-                f"/api/rpc/repo/variants?repo_id={repo_id}",
-            )
-            return response.get("variants", [])
+            url = f"/api/rpc/repo/variants?repo_id={repo_id}"
+            if include_incomplete:
+                url += "&include_incomplete=true"
+
+            response = self._make_request("GET", url)
+            variants = response.get("variants", [])
+            details = response.get("variants_detail", [])
+
+            # Log summary if verbose
+            total = response.get("total_variants", len(variants))
+            complete = response.get("complete_variants", len(variants))
+            if total != complete:
+                logger.info(
+                    f"Found {total} variants, {complete} with complete data"
+                )
+
+            return variants, details
         except Exception as e:
             logger.warning(f"Failed to list variants: {e}")
-            return []
+            return [], []
 
     def estimate_impact_for_variant(
         self,
@@ -328,13 +347,15 @@ class ImpactEstimator:
         self,
         repo_id: Optional[str] = None,
         job_ids: Optional[List[str]] = None,
+        include_incomplete: bool = False,
     ) -> ImpactReport:
         """
         Estimate test impact for all (or specified) variants.
 
         Args:
             repo_id: Repository identifier (auto-detected if not provided)
-            job_ids: Specific job variants to check (all if not provided)
+            job_ids: Specific job variants to check (all complete variants if not provided)
+            include_incomplete: If True, include variants without complete test data
 
         Returns:
             ImpactReport with results for each variant
@@ -362,12 +383,19 @@ class ImpactEstimator:
 
         # Get variants to check
         if not job_ids:
-            job_ids = self.list_variants(repo_id)
+            job_ids, variants_detail = self.list_variants(repo_id, include_incomplete)
             if not job_ids:
-                raise ValueError(
-                    f"No variants found for {repo_id}. "
-                    "Specify with --jobs or ensure data exists on server."
-                )
+                # Provide helpful message about why no variants
+                if not include_incomplete:
+                    raise ValueError(
+                        f"No variants with complete data found for {repo_id}. "
+                        "Use --all to include incomplete variants, or specify with --jobs."
+                    )
+                else:
+                    raise ValueError(
+                        f"No variants found for {repo_id}. "
+                        "Specify with --jobs or ensure data exists on server."
+                    )
 
         # Estimate impact for each variant
         report = ImpactReport(
@@ -405,7 +433,13 @@ def main():
     parser.add_argument(
         "--jobs",
         dest="job_ids",
-        help="Comma-separated list of job variants to check (default: all available)",
+        help="Comma-separated list of job variants to check (default: all with complete data)",
+    )
+    parser.add_argument(
+        "--all",
+        dest="include_incomplete",
+        action="store_true",
+        help="Include variants without complete test data (by default only complete variants are used)",
     )
     parser.add_argument(
         "--server",
@@ -465,6 +499,7 @@ def main():
         report = estimator.estimate_impact(
             repo_id=args.repo_id,
             job_ids=job_ids,
+            include_incomplete=args.include_incomplete,
         )
 
         if args.json_output:
