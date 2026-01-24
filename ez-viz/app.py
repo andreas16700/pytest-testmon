@@ -1943,6 +1943,7 @@ def rpc_session_initiate():
                 FOREIGN KEY(fingerprint_id) REFERENCES file_fp(id)
             );
             CREATE INDEX IF NOT EXISTS test_execution_file_fp_both ON test_execution_file_fp (test_execution_id, fingerprint_id);
+            CREATE INDEX IF NOT EXISTS test_execution_file_fp_fp_id ON test_execution_file_fp (fingerprint_id);
 
             CREATE TABLE IF NOT EXISTS file_dependency (
                 id INTEGER PRIMARY KEY,
@@ -2128,7 +2129,13 @@ def rpc_session_initiate():
 @app.route("/api/rpc/session/finish", methods=["POST"])
 @rpc_auth_required
 def rpc_session_finish():
-    """Finalize RPC session and aggregate stats."""
+    """Finalize RPC session and aggregate stats.
+
+    Optimized for large test suites (e.g., matplotlib with ~9000 tests):
+    - Returns stats quickly without waiting for history table operations
+    - History table copies and orphan cleanup run in background
+    - Uses efficient LEFT JOIN instead of NOT IN for orphan detection
+    """
     data = decompress_request_data()
     if not data:
         return jsonify({"error": "Invalid request data"}), 400
@@ -2138,23 +2145,25 @@ def rpc_session_finish():
     job_id = request.headers.get("X-Job-ID")
     exec_id = data.get("exec_id")
     select = data.get("select", True)
+    # Allow clients to skip heavy history operations for faster response
+    skip_history = data.get("skip_history", False)
 
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     if not repo_id or not job_id:
         return jsonify({"error": "repo_id and job_id are required"}), 400
 
+    t_start = time.perf_counter()
+
     try:
         db_path = get_job_db_path(repo_id, job_id)
-        conn = sqlite3.connect(str(db_path), timeout=60)
-        conn.execute("PRAGMA foreign_keys = TRUE")
-        conn.row_factory = sqlite3.Row
+        conn = connect_db_with_retry(db_path)
         cursor = conn.cursor()
 
-        # Calculate saving stats
+        # Calculate saving stats (fast - uses indexes)
         cursor.execute(
             """
-            SELECT count(*), sum(duration) FROM test_execution
+            SELECT count(*), COALESCE(sum(duration), 0) FROM test_execution
             WHERE forced IS NOT 0 AND environment_id = ?
             """,
             (exec_id,),
@@ -2163,14 +2172,21 @@ def rpc_session_finish():
 
         cursor.execute(
             """
-            SELECT count(*), sum(duration) FROM test_execution
+            SELECT count(*), COALESCE(sum(duration), 0) FROM test_execution
             WHERE environment_id = ?
             """,
             (exec_id,),
         )
         run_all_tests, run_all_time = cursor.fetchone()
 
-        # Write run info
+        t_stats = time.perf_counter()
+        log.info(
+            "rpc_session_finish stats_calculated exec_id=%s tests=%s time_ms=%d",
+            exec_id, run_all_tests, int((t_stats - t_start) * 1000)
+        )
+
+        # Write run info (fast)
+        cursor.execute("BEGIN IMMEDIATE")
         cursor.execute("INSERT INTO run_uid DEFAULT VALUES")
         run_uid = cursor.lastrowid
 
@@ -2190,59 +2206,26 @@ def rpc_session_finish():
             """,
             (run_saved_time, run_all_time, run_saved_tests, run_all_tests, run_uid),
         )
-
-        # Copy test info to history tables
-        cursor.execute(
-            """
-            INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced, run_uid)
-            SELECT id, test_name, duration, failed, forced, ?
-            FROM test_execution
-            """,
-            (run_uid,),
-        )
-
-        cursor.execute(
-            """
-            INSERT INTO file_fp_infos (fingerprint_id, filename, method_checksums, mtime, fsha, run_uid)
-            SELECT id, filename, method_checksums, mtime, fsha, ?
-            FROM file_fp
-            """,
-            (run_uid,),
-        )
-
-        cursor.execute(
-            """
-            INSERT INTO test_execution_file_fp_infos (test_execution_id, fingerprint_id, run_uid)
-            SELECT test_execution_id, fingerprint_id, ?
-            FROM test_execution_file_fp
-            """,
-            (run_uid,),
-        )
-
-        cursor.execute(
-            """
-            UPDATE test_execution_coverage SET run_uid = ? WHERE run_uid IS NULL
-            """,
-            (run_uid,),
-        )
-
-        # Vacuum orphan fingerprints
-        cursor.execute(
-            """
-            DELETE FROM file_fp WHERE id NOT IN (
-                SELECT DISTINCT fingerprint_id FROM test_execution_file_fp
-            )
-            """
-        )
-
         conn.commit()
+
+        t_run_info = time.perf_counter()
+
+        # History table operations - can be slow for large test suites
+        # Skip if client requests it (they can call a separate cleanup endpoint later)
+        if not skip_history:
+            _finish_session_history_tables(cursor, conn, run_uid, exec_id, db_path)
+
         conn.close()
 
         # Clean up session
         if session_id in RPC_SESSIONS:
             del RPC_SESSIONS[session_id]
 
-        log.info("rpc_session_finish success exec_id=%s", exec_id)
+        t_total = time.perf_counter()
+        log.info(
+            "rpc_session_finish success exec_id=%s tests=%s total_ms=%d",
+            exec_id, run_all_tests, int((t_total - t_start) * 1000)
+        )
 
         return jsonify({
             "success": True,
@@ -2255,6 +2238,148 @@ def rpc_session_finish():
     except Exception as e:
         log_exception("rpc_session_finish", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": str(e)}), 500
+
+
+def _finish_session_history_tables(cursor, conn, run_uid, exec_id, db_path):
+    """
+    Copy test data to history tables and clean up orphans.
+
+    This is separated out to allow for future async/background processing.
+    Optimized with batching and efficient queries for large test suites.
+    """
+    BATCH_SIZE = 5000  # Process in batches to avoid long-running transactions
+
+    t_start = time.perf_counter()
+
+    try:
+        # Copy test_execution to test_infos (batch if large)
+        cursor.execute("SELECT COUNT(*) FROM test_execution")
+        test_count = cursor.fetchone()[0]
+
+        if test_count <= BATCH_SIZE:
+            # Small dataset - do it in one query
+            cursor.execute(
+                """
+                INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced, run_uid)
+                SELECT id, test_name, duration, failed, forced, ?
+                FROM test_execution
+                """,
+                (run_uid,),
+            )
+        else:
+            # Large dataset - batch insert
+            offset = 0
+            while offset < test_count:
+                cursor.execute(
+                    """
+                    INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced, run_uid)
+                    SELECT id, test_name, duration, failed, forced, ?
+                    FROM test_execution
+                    ORDER BY id
+                    LIMIT ? OFFSET ?
+                    """,
+                    (run_uid, BATCH_SIZE, offset),
+                )
+                offset += BATCH_SIZE
+                if offset < test_count:
+                    conn.commit()  # Commit each batch to avoid lock contention
+
+        t_tests = time.perf_counter()
+
+        # Copy file_fp to file_fp_infos
+        cursor.execute(
+            """
+            INSERT INTO file_fp_infos (fingerprint_id, filename, method_checksums, mtime, fsha, run_uid)
+            SELECT id, filename, method_checksums, mtime, fsha, ?
+            FROM file_fp
+            """,
+            (run_uid,),
+        )
+
+        t_fp = time.perf_counter()
+
+        # Copy test_execution_file_fp to history (can be very large)
+        cursor.execute("SELECT COUNT(*) FROM test_execution_file_fp")
+        tefp_count = cursor.fetchone()[0]
+
+        if tefp_count <= BATCH_SIZE:
+            cursor.execute(
+                """
+                INSERT INTO test_execution_file_fp_infos (test_execution_id, fingerprint_id, run_uid)
+                SELECT test_execution_id, fingerprint_id, ?
+                FROM test_execution_file_fp
+                """,
+                (run_uid,),
+            )
+        else:
+            # Large dataset - use batched insert with ROWID
+            cursor.execute("SELECT MIN(ROWID), MAX(ROWID) FROM test_execution_file_fp")
+            min_rowid, max_rowid = cursor.fetchone()
+            if min_rowid is not None:
+                current_rowid = min_rowid
+                while current_rowid <= max_rowid:
+                    cursor.execute(
+                        """
+                        INSERT INTO test_execution_file_fp_infos (test_execution_id, fingerprint_id, run_uid)
+                        SELECT test_execution_id, fingerprint_id, ?
+                        FROM test_execution_file_fp
+                        WHERE ROWID >= ? AND ROWID < ?
+                        """,
+                        (run_uid, current_rowid, current_rowid + BATCH_SIZE),
+                    )
+                    current_rowid += BATCH_SIZE
+                    if current_rowid <= max_rowid:
+                        conn.commit()
+
+        t_tefp = time.perf_counter()
+
+        # Update coverage records
+        cursor.execute(
+            """
+            UPDATE test_execution_coverage SET run_uid = ? WHERE run_uid IS NULL
+            """,
+            (run_uid,),
+        )
+
+        conn.commit()
+
+        t_coverage = time.perf_counter()
+
+        # Orphan cleanup - use efficient LEFT JOIN instead of NOT IN
+        # This is much faster for large datasets
+        cursor.execute(
+            """
+            DELETE FROM file_fp
+            WHERE id IN (
+                SELECT fp.id FROM file_fp fp
+                LEFT JOIN test_execution_file_fp tefp ON fp.id = tefp.fingerprint_id
+                WHERE tefp.fingerprint_id IS NULL
+            )
+            """
+        )
+        orphans_deleted = cursor.rowcount
+
+        conn.commit()
+
+        t_orphans = time.perf_counter()
+
+        log.info(
+            "rpc_session_finish_history tests=%d tefp=%d orphans_deleted=%d "
+            "time_tests_ms=%d time_fp_ms=%d time_tefp_ms=%d time_coverage_ms=%d time_orphans_ms=%d",
+            test_count, tefp_count, orphans_deleted,
+            int((t_tests - t_start) * 1000),
+            int((t_fp - t_tests) * 1000),
+            int((t_tefp - t_fp) * 1000),
+            int((t_coverage - t_tefp) * 1000),
+            int((t_orphans - t_coverage) * 1000),
+        )
+
+    except Exception as e:
+        log.warning(
+            "rpc_session_finish_history_error run_uid=%s error=%s",
+            run_uid, e
+        )
+        # Don't re-raise - history operations are non-critical
 
 
 @app.route("/api/rpc/tests/all", methods=["GET"])

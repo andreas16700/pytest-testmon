@@ -691,7 +691,34 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
 
 **Fix**: Start a new session. Sessions are stored in memory and don't persist across restarts.
 
-### 8. NetDB Mode Not Activating
+### 9. Session Finish Timeout for Large Test Suites
+
+**Cause**: For large test suites like matplotlib (~9000 tests), the `/api/rpc/session/finish` endpoint may timeout because it copies all test data to history tables and runs orphan cleanup.
+
+**Fix** (implemented in app.py):
+- History table operations are now batched (5000 records per batch)
+- Orphan cleanup uses efficient `LEFT JOIN` instead of slow `NOT IN` subquery
+- Added dedicated index on `test_execution_file_fp(fingerprint_id)` for fast joins
+- Added detailed timing logs to identify bottlenecks
+- Clients can pass `skip_history: true` to skip non-critical history operations
+
+**Monitoring**: Check logs for timing breakdown:
+```
+rpc_session_finish_history tests=9000 tefp=450000 orphans_deleted=123
+time_tests_ms=500 time_fp_ms=100 time_tefp_ms=2000 time_coverage_ms=50 time_orphans_ms=300
+```
+
+**Client-side mitigation**: Increase timeout or use `skip_history`:
+```python
+# In NetDB client, increase timeout for large test suites
+response = session.post(
+    f"{server}/api/rpc/session/finish",
+    json={"exec_id": exec_id, "select": True, "skip_history": True},
+    timeout=120,  # 2 minutes instead of 60s
+)
+```
+
+### 10. NetDB Mode Not Activating
 
 **Cause**: Environment variables not set correctly.
 
