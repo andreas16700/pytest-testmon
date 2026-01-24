@@ -31,10 +31,21 @@ from functools import wraps
 import traceback
 from urllib.parse import urlencode
 import array
-from openai import OpenAI
+
+# OpenAI is optional - only needed for AI-assisted workflow modification
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    OpenAI = None
 
 EZMON_FP_DIR = Path(os.getenv("EZMON_FP_DIR", "./.ezmon-fp")).resolve()
 CURRENT_MODEL = "gpt-4o-mini"
+
+# CI/CD Authentication Token - set via environment variable or use default for testing
+# In production, set EZMON_CI_TOKEN to a secure random string
+CI_AUTH_TOKEN = os.environ.get("EZMON_CI_TOKEN", "ezmon-ci-test-token-2024")
 # -----------------------------------------------------------------------------
 # Logging helpers
 # -----------------------------------------------------------------------------
@@ -274,13 +285,16 @@ def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None
 
 @app.route("/api/ask_ai", methods=["POST"])
 def leverage_ai_model():
+    if not OPENAI_AVAILABLE:
+        return jsonify({"error": "OpenAI not available. Install with: pip install openai"}), 503
+
     data = request.get_json()
     content = data.get("content")
     if not content:
         return jsonify({"error": "No content provided"}), 400
     api_key = os.getenv("AI_GITHUB_TOKEN")
     if not api_key:
-        print("}Error: GITHUB_TOKEN environment variable not set.")
+        print("Error: AI_GITHUB_TOKEN environment variable not set.")
         return
 
     client = OpenAI(
@@ -1731,8 +1745,8 @@ def rpc_auth_required(f):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            # For now, accept any non-empty token (can add token validation later)
-            if token:
+            # Validate against CI token
+            if token == CI_AUTH_TOKEN:
                 return f(*args, **kwargs)
 
         return jsonify({"error": "Unauthorized"}), 401
