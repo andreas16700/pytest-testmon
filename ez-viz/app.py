@@ -3267,8 +3267,12 @@ def serve_ezmon_fp(subpath: str):
 
 
 if __name__ == "__main__":
-    log.info("server_start data_dir=%s", BASE_DATA_DIR.absolute())
+    port = int(os.environ.get("PORT", 8004))
+    host = os.environ.get("HOST", "0.0.0.0")
+    debug = os.environ.get("FLASK_DEBUG", "true").lower() == "true"
+
+    log.info("server_start data_dir=%s port=%s", BASE_DATA_DIR.absolute(), port)
     print("Starting Testmon Multi-Project Server")
     print(f"Data directory: {BASE_DATA_DIR.absolute()}")
-    print("Server running on http://localhost:8000")
-    app.run(debug=True, host="0.0.0.0", port=8000)
+    print(f"Server running on http://{host}:{port}")
+    app.run(debug=debug, host=host, port=port)

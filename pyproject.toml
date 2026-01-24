@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
     "pytest>=5,<10",
     "coverage>=6,<8",
+    "requests>=2.20",
     "typing_extensions>=3.7; python_version < '3.8'",
 ]
 
