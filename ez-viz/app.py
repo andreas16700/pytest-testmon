@@ -1710,6 +1710,1485 @@ def list_runs(repo_id: str, job_id: str):
 
 
 # -----------------------------------------------------------------------------
+# RPC ENDPOINTS - Direct Server Communication for NetDB
+# -----------------------------------------------------------------------------
+
+# In-memory session store for RPC sessions (with TTL)
+# Format: {session_id: {"created": timestamp, "exec_id": int, "repo_id": str, "job_id": str, "data": {}}}
+RPC_SESSIONS = {}
+RPC_SESSION_TTL = 1800  # 30 minutes
+
+
+def rpc_auth_required(f):
+    """Decorator to require authentication for RPC endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Check for session cookie (browser-based OAuth)
+        if "github_token" in session:
+            return f(*args, **kwargs)
+
+        # Check for Authorization header (CI/CD token)
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            # For now, accept any non-empty token (can add token validation later)
+            if token:
+                return f(*args, **kwargs)
+
+        return jsonify({"error": "Unauthorized"}), 401
+    return decorated
+
+
+def cleanup_expired_sessions():
+    """Remove expired RPC sessions."""
+    now = time.time()
+    expired = [
+        sid for sid, data in RPC_SESSIONS.items()
+        if now - data.get("created", 0) > RPC_SESSION_TTL
+    ]
+    for sid in expired:
+        del RPC_SESSIONS[sid]
+
+
+def get_rpc_db_connection(repo_id: str, job_id: str, readonly: bool = False):
+    """Get a database connection for RPC operations."""
+    db_path = get_job_db_path(repo_id, job_id)
+    return get_db_connection(db_path, readonly=readonly)
+
+
+def decompress_request_data():
+    """Decompress gzip request body if needed."""
+    import gzip as gzip_module
+    if request.headers.get("Content-Encoding") == "gzip":
+        try:
+            decompressed = gzip_module.decompress(request.data)
+            return json.loads(decompressed)
+        except Exception as e:
+            log.error(f"Failed to decompress gzip data: {e}")
+            return None
+    return request.get_json()
+
+
+@app.route("/api/rpc/session/initiate", methods=["POST"])
+@rpc_auth_required
+def rpc_session_initiate():
+    """Start a new RPC session for test execution."""
+    cleanup_expired_sessions()
+
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = data.get("repo_id")
+    job_id = data.get("job_id")
+    environment_name = data.get("environment_name", "default")
+    system_packages = data.get("system_packages", "")
+    python_version = data.get("python_version", "")
+    run_id = data.get("run_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "repo_id and job_id are required"}), 400
+
+    try:
+        # Register repo/job in metadata
+        register_repo_job(repo_id, job_id)
+
+        # Get or create the database
+        db_path = get_job_db_path(repo_id, job_id)
+
+        # Create tables if DB doesn't exist
+        if not db_path.exists():
+            log.info("Creating new testmon database at %s", db_path)
+
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = TRUE")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Ensure tables exist (simplified schema creation)
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS metadata (dataid TEXT PRIMARY KEY, data TEXT);
+
+            CREATE TABLE IF NOT EXISTS environment (
+                id INTEGER PRIMARY KEY ASC,
+                environment_name TEXT,
+                system_packages TEXT,
+                python_version TEXT,
+                UNIQUE (environment_name, system_packages, python_version)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_execution (
+                id INTEGER PRIMARY KEY ASC,
+                environment_id INTEGER,
+                test_name TEXT,
+                duration FLOAT,
+                failed BIT,
+                forced BIT,
+                FOREIGN KEY(environment_id) REFERENCES environment(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS test_execution_fk_name ON test_execution (environment_id, test_name);
+
+            CREATE TABLE IF NOT EXISTS file_fp (
+                id INTEGER PRIMARY KEY,
+                filename TEXT,
+                method_checksums BLOB,
+                mtime FLOAT,
+                fsha TEXT,
+                UNIQUE (filename, fsha, method_checksums)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_execution_file_fp (
+                test_execution_id INTEGER,
+                fingerprint_id INTEGER,
+                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
+                FOREIGN KEY(fingerprint_id) REFERENCES file_fp(id)
+            );
+            CREATE INDEX IF NOT EXISTS test_execution_file_fp_both ON test_execution_file_fp (test_execution_id, fingerprint_id);
+
+            CREATE TABLE IF NOT EXISTS file_dependency (
+                id INTEGER PRIMARY KEY,
+                filename TEXT NOT NULL,
+                sha TEXT NOT NULL,
+                UNIQUE (filename, sha)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_execution_file_dependency (
+                test_execution_id INTEGER,
+                file_dependency_id INTEGER,
+                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
+                FOREIGN KEY(file_dependency_id) REFERENCES file_dependency(id)
+            );
+            CREATE INDEX IF NOT EXISTS tefd_both ON test_execution_file_dependency (test_execution_id, file_dependency_id);
+
+            CREATE TABLE IF NOT EXISTS test_external_dependency (
+                id INTEGER PRIMARY KEY,
+                test_execution_id INTEGER,
+                package_name TEXT NOT NULL,
+                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS ted_te_id ON test_external_dependency (test_execution_id);
+
+            CREATE TABLE IF NOT EXISTS run_uid (
+                id INTEGER PRIMARY KEY,
+                repo_run_id INTEGER NULL,
+                create_date TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS run_infos (
+                run_time_saved REAL,
+                run_time_all REAL,
+                tests_saved INTEGER,
+                tests_all INTEGER,
+                run_uid INTEGER,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_infos (
+                id INTEGER PRIMARY KEY ASC,
+                test_execution_id INTEGER,
+                test_name TEXT,
+                duration FLOAT,
+                failed BIT,
+                forced BIT,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS file_fp_infos (
+                id INTEGER PRIMARY KEY,
+                fingerprint_id INTEGER,
+                filename TEXT,
+                method_checksums BLOB,
+                mtime FLOAT,
+                fsha TEXT,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_execution_file_fp_infos (
+                id INTEGER PRIMARY KEY,
+                test_execution_id INTEGER,
+                fingerprint_id INTEGER,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_execution_coverage (
+                id INTEGER PRIMARY KEY,
+                test_execution_id INTEGER,
+                filename TEXT,
+                lines TEXT,
+                run_uid INTEGER NULL,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS suite_execution_file_fsha (
+                suite_execution_id INTEGER,
+                filename TEXT,
+                fsha text,
+                FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
+        """)
+
+        # Fetch or create environment
+        env = cursor.execute(
+            """
+            SELECT id, environment_name, system_packages, python_version
+            FROM environment WHERE environment_name = ?
+            ORDER BY id DESC
+            """,
+            (environment_name,),
+        ).fetchone()
+
+        packages_changed = False
+        if env:
+            exec_id = env["id"]
+            packages_changed = (
+                env["system_packages"] != system_packages
+                or env["python_version"] != python_version
+            )
+            if packages_changed:
+                # Create new environment and delete old one
+                cursor.execute(
+                    """
+                    INSERT INTO environment (environment_name, system_packages, python_version)
+                    VALUES (?, ?, ?)
+                    """,
+                    (environment_name, system_packages, python_version),
+                )
+                new_exec_id = cursor.lastrowid
+                cursor.execute("DELETE FROM environment WHERE id = ?", (exec_id,))
+                exec_id = new_exec_id
+        else:
+            cursor.execute(
+                """
+                INSERT INTO environment (environment_name, system_packages, python_version)
+                VALUES (?, ?, ?)
+                """,
+                (environment_name, system_packages, python_version),
+            )
+            exec_id = cursor.lastrowid
+
+        # Get all filenames
+        filenames = [
+            row[0] for row in cursor.execute("SELECT DISTINCT filename FROM file_fp")
+        ]
+
+        conn.commit()
+        conn.close()
+
+        # Create session
+        session_id = str(uuid.uuid4())
+        RPC_SESSIONS[session_id] = {
+            "created": time.time(),
+            "exec_id": exec_id,
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "run_id": run_id,
+            "data": {},
+        }
+
+        log.info(
+            "rpc_session_initiate success exec_id=%s session_id=%s",
+            exec_id, session_id
+        )
+
+        return jsonify({
+            "session_id": session_id,
+            "exec_id": exec_id,
+            "filenames": filenames,
+            "packages_changed": packages_changed,
+        })
+
+    except Exception as e:
+        log_exception("rpc_session_initiate", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/session/finish", methods=["POST"])
+@rpc_auth_required
+def rpc_session_finish():
+    """Finalize RPC session and aggregate stats."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    session_id = request.headers.get("X-Session-ID")
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    select = data.get("select", True)
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "repo_id and job_id are required"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.execute("PRAGMA foreign_keys = TRUE")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Calculate saving stats
+        cursor.execute(
+            """
+            SELECT count(*), sum(duration) FROM test_execution
+            WHERE forced IS NOT 0 AND environment_id = ?
+            """,
+            (exec_id,),
+        )
+        run_saved_tests, run_saved_time = cursor.fetchone()
+
+        cursor.execute(
+            """
+            SELECT count(*), sum(duration) FROM test_execution
+            WHERE environment_id = ?
+            """,
+            (exec_id,),
+        )
+        run_all_tests, run_all_time = cursor.fetchone()
+
+        # Write run info
+        cursor.execute("INSERT INTO run_uid DEFAULT VALUES")
+        run_uid = cursor.lastrowid
+
+        # Get run_id from session
+        rpc_session = RPC_SESSIONS.get(session_id, {})
+        run_id = rpc_session.get("run_id")
+        if run_id:
+            cursor.execute(
+                "UPDATE run_uid SET repo_run_id = ? WHERE id = ?",
+                (run_id, run_uid),
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO run_infos (run_time_saved, run_time_all, tests_saved, tests_all, run_uid)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_saved_time, run_all_time, run_saved_tests, run_all_tests, run_uid),
+        )
+
+        # Copy test info to history tables
+        cursor.execute(
+            """
+            INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced, run_uid)
+            SELECT id, test_name, duration, failed, forced, ?
+            FROM test_execution
+            """,
+            (run_uid,),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO file_fp_infos (fingerprint_id, filename, method_checksums, mtime, fsha, run_uid)
+            SELECT id, filename, method_checksums, mtime, fsha, ?
+            FROM file_fp
+            """,
+            (run_uid,),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO test_execution_file_fp_infos (test_execution_id, fingerprint_id, run_uid)
+            SELECT test_execution_id, fingerprint_id, ?
+            FROM test_execution_file_fp
+            """,
+            (run_uid,),
+        )
+
+        cursor.execute(
+            """
+            UPDATE test_execution_coverage SET run_uid = ? WHERE run_uid IS NULL
+            """,
+            (run_uid,),
+        )
+
+        # Vacuum orphan fingerprints
+        cursor.execute(
+            """
+            DELETE FROM file_fp WHERE id NOT IN (
+                SELECT DISTINCT fingerprint_id FROM test_execution_file_fp
+            )
+            """
+        )
+
+        conn.commit()
+        conn.close()
+
+        # Clean up session
+        if session_id in RPC_SESSIONS:
+            del RPC_SESSIONS[session_id]
+
+        log.info("rpc_session_finish success exec_id=%s", exec_id)
+
+        return jsonify({
+            "success": True,
+            "run_saved_time": run_saved_time,
+            "run_all_time": run_all_time,
+            "run_saved_tests": run_saved_tests,
+            "run_all_tests": run_all_tests,
+        })
+
+    except Exception as e:
+        log_exception("rpc_session_finish", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/all", methods=["GET"])
+@rpc_auth_required
+def rpc_tests_all():
+    """Get all test executions for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id", type=int)
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"tests": {}})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute(
+            """
+            SELECT test_name, duration, failed, forced
+            FROM test_execution WHERE environment_id = ?
+            """,
+            (exec_id,),
+        ).fetchall()
+
+        conn.close()
+
+        tests = {
+            row["test_name"]: {
+                "duration": row["duration"],
+                "failed": row["failed"],
+                "forced": row["forced"],
+            }
+            for row in rows
+        }
+
+        return jsonify({"tests": tests})
+
+    except Exception as e:
+        log_exception("rpc_tests_all", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/determine", methods=["POST"])
+@rpc_auth_required
+def rpc_tests_determine():
+    """Determine which tests are affected by code changes."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    files_mhashes = data.get("files_mhashes", {})
+    file_deps_shas = data.get("file_deps_shas", {})
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"affected": [], "failing": []})
+
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.execute("PRAGMA foreign_keys = TRUE")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Reset forced flags
+        cursor.execute(
+            "UPDATE test_execution SET forced = NULL WHERE environment_id = ?",
+            (exec_id,),
+        )
+
+        # Create temp table for changed files
+        cursor.execute("CREATE TEMP TABLE IF NOT EXISTS changed_files_mhashes (exec_id INTEGER, filename TEXT, mhashes BLOB)")
+        cursor.execute("DELETE FROM changed_files_mhashes")
+
+        for filename, mhashes_hex in files_mhashes.items():
+            mhashes_blob = bytes.fromhex(mhashes_hex) if mhashes_hex else None
+            cursor.execute(
+                "INSERT INTO changed_files_mhashes VALUES (?, ?, ?)",
+                (exec_id, filename, mhashes_blob),
+            )
+
+        # Find tests affected by changed files
+        rows = cursor.execute(
+            """
+            SELECT
+                f.filename,
+                te.test_name,
+                f.method_checksums,
+                te.failed,
+                te.duration
+            FROM test_execution te, test_execution_file_fp te_ffp, file_fp f, changed_files_mhashes chfm
+            WHERE
+                chfm.exec_id = ? AND
+                te.environment_id = ? AND
+                te.id = te_ffp.test_execution_id AND
+                te_ffp.fingerprint_id = f.id AND
+                chfm.filename = f.filename
+            """,
+            (exec_id, exec_id),
+        ).fetchall()
+
+        # Check method checksums for actual changes
+        method_misses = set()
+        for row in rows:
+            filename = row["filename"]
+            test_name = row["test_name"]
+            stored_checksums = row["method_checksums"]
+
+            mhashes_hex = files_mhashes.get(filename)
+            if mhashes_hex is None:
+                method_misses.add(test_name)
+                continue
+
+            new_checksums = bytes.fromhex(mhashes_hex)
+            if stored_checksums != new_checksums:
+                # Detailed fingerprint check
+                stored_set = set(array.array("i", stored_checksums).tolist()) if stored_checksums else set()
+                new_set = set(array.array("i", new_checksums).tolist()) if new_checksums else set()
+                if stored_set - new_set:
+                    method_misses.add(test_name)
+
+        # Check file dependency changes
+        for row in cursor.execute(
+            """
+            SELECT te.test_name, fd.filename, fd.sha
+            FROM test_execution te
+            JOIN test_execution_file_dependency tefd ON te.id = tefd.test_execution_id
+            JOIN file_dependency fd ON tefd.file_dependency_id = fd.id
+            WHERE te.environment_id = ?
+            """,
+            (exec_id,),
+        ):
+            test_name = row["test_name"]
+            filename = row["filename"]
+            stored_sha = row["sha"]
+            current_sha = file_deps_shas.get(filename)
+            if current_sha is None or current_sha != stored_sha:
+                method_misses.add(test_name)
+
+        # Get failing tests
+        failing_tests = [
+            row["test_name"]
+            for row in cursor.execute(
+                "SELECT test_name FROM test_execution WHERE environment_id = ? AND failed = 1",
+                (exec_id,),
+            )
+        ]
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "affected": list(method_misses),
+            "failing": failing_tests,
+        })
+
+    except Exception as e:
+        log_exception("rpc_tests_determine", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/fetch_unknown", methods=["POST"])
+@rpc_auth_required
+def rpc_files_fetch_unknown():
+    """Find files whose SHA has changed."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    files_fshas = data.get("files_fshas", {})
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"unknown_files": []})
+
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Create temp table for current file SHAs
+        cursor.execute("CREATE TEMP TABLE IF NOT EXISTS changed_files_fshas (exec_id INTEGER, filename TEXT, fsha TEXT)")
+        cursor.execute("DELETE FROM changed_files_fshas WHERE exec_id = ?", (exec_id,))
+
+        for filename, fsha in files_fshas.items():
+            cursor.execute(
+                "INSERT INTO changed_files_fshas VALUES (?, ?, ?)",
+                (exec_id, filename, fsha),
+            )
+
+        # Find files where SHA doesn't match
+        unknown_files = [
+            row["filename"]
+            for row in cursor.execute(
+                """
+                SELECT DISTINCT f.filename
+                FROM test_execution te, test_execution_file_fp te_ffp, file_fp f
+                LEFT OUTER JOIN changed_files_fshas chff
+                ON f.filename = chff.filename AND f.fsha = chff.fsha AND chff.exec_id = ?
+                WHERE
+                    te.environment_id = ? AND
+                    te.id = te_ffp.test_execution_id AND
+                    te_ffp.fingerprint_id = f.id AND
+                    (f.fsha IS NULL OR chff.fsha IS NULL)
+                """,
+                (exec_id, exec_id),
+            )
+        ]
+
+        conn.close()
+
+        return jsonify({"unknown_files": unknown_files})
+
+    except Exception as e:
+        log_exception("rpc_files_fetch_unknown", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/test_execution/batch_insert", methods=["POST"])
+@rpc_auth_required
+def rpc_test_execution_batch_insert():
+    """Bulk insert test execution results."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    tests = data.get("tests", {})
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.execute("PRAGMA foreign_keys = TRUE")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        for test_name, test_data in tests.items():
+            # Delete existing test execution
+            cursor.execute(
+                """
+                DELETE FROM test_execution_file_fp
+                WHERE test_execution_id IN (
+                    SELECT id FROM test_execution WHERE environment_id = ? AND test_name = ?
+                )
+                """,
+                (exec_id, test_name),
+            )
+            cursor.execute(
+                """
+                DELETE FROM test_execution_file_dependency
+                WHERE test_execution_id IN (
+                    SELECT id FROM test_execution WHERE environment_id = ? AND test_name = ?
+                )
+                """,
+                (exec_id, test_name),
+            )
+            cursor.execute(
+                """
+                DELETE FROM test_external_dependency
+                WHERE test_execution_id IN (
+                    SELECT id FROM test_execution WHERE environment_id = ? AND test_name = ?
+                )
+                """,
+                (exec_id, test_name),
+            )
+            cursor.execute(
+                "DELETE FROM test_execution WHERE environment_id = ? AND test_name = ?",
+                (exec_id, test_name),
+            )
+
+            # Insert new test execution
+            cursor.execute(
+                """
+                INSERT INTO test_execution (environment_id, test_name, duration, failed, forced)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    exec_id,
+                    test_name,
+                    test_data.get("duration"),
+                    1 if test_data.get("failed") else 0,
+                    test_data.get("forced"),
+                ),
+            )
+            te_id = cursor.lastrowid
+
+            # Insert fingerprints
+            for dep in test_data.get("deps", []):
+                filename = dep["filename"]
+                fsha = dep.get("fsha")
+                mtime = dep.get("mtime")
+                checksums_hex = dep.get("method_checksums")
+                checksums_blob = bytes.fromhex(checksums_hex) if checksums_hex else None
+
+                # Fetch or create fingerprint
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO file_fp (filename, method_checksums, fsha, mtime)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (filename, checksums_blob, fsha, mtime),
+                    )
+                    fp_id = cursor.lastrowid
+                except sqlite3.IntegrityError:
+                    row = cursor.execute(
+                        """
+                        SELECT id FROM file_fp
+                        WHERE filename = ? AND method_checksums = ?
+                        """,
+                        (filename, checksums_blob),
+                    ).fetchone()
+                    fp_id = row[0] if row else None
+
+                if fp_id:
+                    cursor.execute(
+                        "INSERT INTO test_execution_file_fp VALUES (?, ?)",
+                        (te_id, fp_id),
+                    )
+
+            # Insert file dependencies
+            for file_dep in test_data.get("file_deps", []):
+                filename = file_dep["filename"]
+                sha = file_dep["sha"]
+
+                try:
+                    cursor.execute(
+                        "INSERT INTO file_dependency (filename, sha) VALUES (?, ?)",
+                        (filename, sha),
+                    )
+                    fd_id = cursor.lastrowid
+                except sqlite3.IntegrityError:
+                    row = cursor.execute(
+                        "SELECT id FROM file_dependency WHERE filename = ? AND sha = ?",
+                        (filename, sha),
+                    ).fetchone()
+                    fd_id = row[0] if row else None
+
+                if fd_id:
+                    cursor.execute(
+                        "INSERT INTO test_execution_file_dependency VALUES (?, ?)",
+                        (te_id, fd_id),
+                    )
+
+            # Insert external dependencies
+            for pkg_name in test_data.get("external_deps", []):
+                cursor.execute(
+                    "INSERT INTO test_external_dependency (test_execution_id, package_name) VALUES (?, ?)",
+                    (te_id, pkg_name),
+                )
+
+        conn.commit()
+        conn.close()
+
+        log.info("rpc_batch_insert success tests=%s", len(tests))
+        return jsonify({"success": True, "inserted": len(tests)})
+
+    except Exception as e:
+        log_exception("rpc_test_execution_batch_insert", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/coverage/batch_insert", methods=["POST"])
+@rpc_auth_required
+def rpc_coverage_batch_insert():
+    """Bulk insert coverage data."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    coverage = data.get("coverage", {})
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        rows = []
+        for test_name, files in coverage.items():
+            # Find test execution ID
+            row = cursor.execute(
+                """
+                SELECT id FROM test_execution
+                WHERE environment_id = ? AND test_name = ?
+                """,
+                (exec_id, test_name),
+            ).fetchone()
+
+            if not row:
+                continue
+
+            te_id = row[0]
+            for filename, lines in files.items():
+                if not lines:
+                    continue
+                line_list = sorted(lines) if isinstance(lines, list) else sorted(list(lines))
+                rows.append((te_id, filename, json.dumps(line_list)))
+
+        if rows:
+            cursor.executemany(
+                """
+                INSERT INTO test_execution_coverage (test_execution_id, filename, lines)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+
+        conn.commit()
+        conn.close()
+
+        log.info("rpc_coverage_insert success rows=%s", len(rows))
+        return jsonify({"success": True, "inserted": len(rows)})
+
+    except Exception as e:
+        log_exception("rpc_coverage_batch_insert", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/fingerprint/fetch_or_create", methods=["POST"])
+@rpc_auth_required
+def rpc_fingerprint_fetch_or_create():
+    """Fetch or create a fingerprint record."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    filename = data.get("filename")
+    fsha = data.get("fsha")
+    checksums_hex = data.get("method_checksums")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not filename:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        cursor = conn.cursor()
+
+        checksums_blob = bytes.fromhex(checksums_hex) if checksums_hex else None
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO file_fp (filename, method_checksums, fsha)
+                VALUES (?, ?, ?)
+                """,
+                (filename, checksums_blob, fsha),
+            )
+            fp_id = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            row = cursor.execute(
+                """
+                SELECT id FROM file_fp
+                WHERE filename = ? AND method_checksums = ?
+                """,
+                (filename, checksums_blob),
+            ).fetchone()
+            fp_id = row[0] if row else None
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"fingerprint_id": fp_id})
+
+    except Exception as e:
+        log_exception("rpc_fingerprint_fetch_or_create", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/file_dependency/fetch_or_create", methods=["POST"])
+@rpc_auth_required
+def rpc_file_dependency_fetch_or_create():
+    """Fetch or create a file dependency record."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    filename = data.get("filename")
+    sha = data.get("sha")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not filename or not sha:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "INSERT INTO file_dependency (filename, sha) VALUES (?, ?)",
+                (filename, sha),
+            )
+            fd_id = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            row = cursor.execute(
+                "SELECT id FROM file_dependency WHERE filename = ? AND sha = ?",
+                (filename, sha),
+            ).fetchone()
+            fd_id = row[0] if row else None
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"file_dependency_id": fd_id})
+
+    except Exception as e:
+        log_exception("rpc_file_dependency_fetch_or_create", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/list", methods=["GET"])
+@rpc_auth_required
+def rpc_files_list():
+    """Get all tracked filenames for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id", type=int)
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"filenames": []})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        filenames = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT f.filename
+                FROM file_fp f, test_execution_file_fp te_ffp, test_execution te
+                WHERE te.id = te_ffp.test_execution_id
+                AND te_ffp.fingerprint_id = f.id
+                AND te.environment_id = ?
+                """,
+                (exec_id,),
+            )
+        ]
+        conn.close()
+
+        return jsonify({"filenames": filenames})
+
+    except Exception as e:
+        log_exception("rpc_files_list", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/all", methods=["GET"])
+@rpc_auth_required
+def rpc_files_all():
+    """Get all filenames across all environments."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"filenames": []})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        filenames = [
+            row[0]
+            for row in conn.execute("SELECT DISTINCT filename FROM file_fp")
+        ]
+        conn.close()
+
+        return jsonify({"filenames": filenames})
+
+    except Exception as e:
+        log_exception("rpc_files_all", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/fingerprints", methods=["GET"])
+@rpc_auth_required
+def rpc_files_fingerprints():
+    """Get filename fingerprint details for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id", type=int)
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"fingerprints": []})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute(
+            """
+            SELECT DISTINCT
+                f.filename,
+                f.mtime,
+                f.fsha,
+                f.id as fingerprint_id,
+                sum(failed) as failed_count
+            FROM test_execution te, test_execution_file_fp te_ffp, file_fp f
+            WHERE te.id = te_ffp.test_execution_id
+            AND te_ffp.fingerprint_id = f.id
+            AND environment_id = ?
+            GROUP BY f.filename, f.mtime, f.fsha, f.id
+            """,
+            (exec_id,),
+        ).fetchall()
+
+        conn.close()
+
+        return jsonify({"fingerprints": [dict(row) for row in rows]})
+
+    except Exception as e:
+        log_exception("rpc_files_fingerprints", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/changed_data", methods=["POST"])
+@rpc_auth_required
+def rpc_files_changed_data():
+    """Get changed file data for fingerprint comparison."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    fingerprint_ids = data.get("fingerprint_ids", [])
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    if not fingerprint_ids:
+        return jsonify({"data": []})
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"data": []})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+
+        placeholders = ",".join("?" * len(fingerprint_ids))
+        rows = conn.execute(
+            f"""
+            SELECT
+                f.filename,
+                te.test_name,
+                f.method_checksums,
+                f.id,
+                te.failed,
+                te.duration
+            FROM test_execution te, test_execution_file_fp te_ffp, file_fp f
+            WHERE
+                te.environment_id = ? AND
+                te.id = te_ffp.test_execution_id AND
+                te_ffp.fingerprint_id = f.id AND
+                f.id IN ({placeholders})
+            """,
+            [exec_id] + fingerprint_ids,
+        ).fetchall()
+
+        conn.close()
+
+        result = []
+        for row in rows:
+            checksums = row["method_checksums"]
+            result.append({
+                "filename": row["filename"],
+                "test_name": row["test_name"],
+                "method_checksums": checksums.hex() if checksums else None,
+                "id": row["id"],
+                "failed": row["failed"],
+                "duration": row["duration"],
+            })
+
+        return jsonify({"data": result})
+
+    except Exception as e:
+        log_exception("rpc_files_changed_data", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/delete", methods=["POST"])
+@rpc_auth_required
+def rpc_tests_delete():
+    """Delete test executions from the server."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    test_names = data.get("test_names", [])
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    if not test_names:
+        return jsonify({"success": True, "deleted": 0})
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        conn.execute("PRAGMA foreign_keys = TRUE")
+        cursor = conn.cursor()
+
+        for test_name in test_names:
+            cursor.execute(
+                """
+                DELETE FROM test_execution_file_fp
+                WHERE test_execution_id IN (
+                    SELECT id FROM test_execution WHERE environment_id = ? AND test_name = ?
+                )
+                """,
+                (exec_id, test_name),
+            )
+            cursor.execute(
+                "DELETE FROM test_execution WHERE environment_id = ? AND test_name = ?",
+                (exec_id, test_name),
+            )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"success": True, "deleted": len(test_names)})
+
+    except Exception as e:
+        log_exception("rpc_tests_delete", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/file_dependencies/list", methods=["GET"])
+@rpc_auth_required
+def rpc_file_dependencies_list():
+    """Get all file dependency filenames for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id", type=int)
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"filenames": []})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        filenames = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT fd.filename
+                FROM file_dependency fd
+                JOIN test_execution_file_dependency tefd ON fd.id = tefd.file_dependency_id
+                JOIN test_execution te ON tefd.test_execution_id = te.id
+                WHERE te.environment_id = ?
+                """,
+                (exec_id,),
+            )
+        ]
+        conn.close()
+
+        return jsonify({"filenames": filenames})
+
+    except Exception as e:
+        log_exception("rpc_file_dependencies_list", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/update_mtimes", methods=["POST"])
+@rpc_auth_required
+def rpc_files_update_mtimes():
+    """Update file modification times."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    updates = data.get("updates", [])
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    if not updates:
+        return jsonify({"success": True, "updated": 0})
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        cursor = conn.cursor()
+
+        for update in updates:
+            cursor.execute(
+                "UPDATE file_fp SET mtime = ?, fsha = ? WHERE id = ?",
+                (update["mtime"], update["fsha"], update["id"]),
+            )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"success": True, "updated": len(updates)})
+
+    except Exception as e:
+        log_exception("rpc_files_update_mtimes", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/stats/savings", methods=["GET"])
+@rpc_auth_required
+def rpc_stats_savings():
+    """Fetch test savings statistics."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id", type=int)
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({
+                "run_saved_time": 0,
+                "run_all_time": 0,
+                "run_saved_tests": 0,
+                "run_all_tests": 0,
+                "total_saved_time": 0,
+                "total_all_time": 0,
+                "total_saved_tests": 0,
+                "total_all_tests": 0,
+            })
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Current run stats
+        cursor.execute(
+            """
+            SELECT count(*), sum(duration) FROM test_execution
+            WHERE forced IS NOT 0 AND environment_id = ?
+            """,
+            (exec_id,),
+        )
+        run_saved_tests, run_saved_time = cursor.fetchone()
+
+        cursor.execute(
+            """
+            SELECT count(*), sum(duration) FROM test_execution
+            WHERE environment_id = ?
+            """,
+            (exec_id,),
+        )
+        run_all_tests, run_all_time = cursor.fetchone()
+
+        # Total stats from metadata
+        def get_attr(name, default=0):
+            row = cursor.execute(
+                "SELECT data FROM metadata WHERE dataid = ?",
+                (f"None:{name}",),
+            ).fetchone()
+            if row:
+                try:
+                    return json.loads(row[0])
+                except:
+                    pass
+            return default
+
+        total_saved_time = get_attr("time_saved", 0)
+        total_all_time = get_attr("time_all", 0)
+        total_saved_tests = get_attr("tests_saved", 0)
+        total_all_tests = get_attr("tests_all", 0)
+
+        conn.close()
+
+        return jsonify({
+            "run_saved_time": run_saved_time or 0,
+            "run_all_time": run_all_time or 0,
+            "run_saved_tests": run_saved_tests or 0,
+            "run_all_tests": run_all_tests or 0,
+            "total_saved_time": total_saved_time or 0,
+            "total_all_time": total_all_time or 0,
+            "total_saved_tests": total_saved_tests or 0,
+            "total_all_tests": total_all_tests or 0,
+        })
+
+    except Exception as e:
+        log_exception("rpc_stats_savings", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/metadata/write", methods=["POST"])
+@rpc_auth_required
+def rpc_metadata_write():
+    """Write a metadata attribute."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    attribute = data.get("attribute")
+    value = data.get("data")
+    exec_id = data.get("exec_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not attribute:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(str(db_path), timeout=60)
+        cursor = conn.cursor()
+
+        dataid = f"{exec_id}:{attribute}"
+        cursor.execute(
+            "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
+            (dataid, json.dumps(value)),
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        log_exception("rpc_metadata_write", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/metadata/read", methods=["GET"])
+@rpc_auth_required
+def rpc_metadata_read():
+    """Read a metadata attribute."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    attribute = request.args.get("attribute")
+    exec_id = request.args.get("exec_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not attribute:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"data": None})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        cursor = conn.cursor()
+
+        dataid = f"{exec_id}:{attribute}"
+        row = cursor.execute(
+            "SELECT data FROM metadata WHERE dataid = ?",
+            (dataid,),
+        ).fetchone()
+
+        conn.close()
+
+        if row:
+            try:
+                return jsonify({"data": json.loads(row[0])})
+            except:
+                return jsonify({"data": row[0]})
+
+        return jsonify({"data": None})
+
+    except Exception as e:
+        log_exception("rpc_metadata_read", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+# -----------------------------------------------------------------------------
 # WEB + Health - UPDATED FOR REACT
 # -----------------------------------------------------------------------------
 

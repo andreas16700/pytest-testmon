@@ -20,6 +20,7 @@ import pytest
 from coverage import Coverage, CoverageData
 
 from ezmon import db
+from ezmon.net_db import create_net_db_from_env, NetDB
 from ezmon import TESTMON_VERSION as TM_CLIENT_VERSION
 from ezmon.common import (
     get_logger,
@@ -47,6 +48,32 @@ CHECKUMS_ARRAY_TYPE = "I"
 DB_FILENAME = ".testmondata"
 
 logger = get_logger(__name__)
+
+
+def create_database(rootdir, readonly=False):
+    """
+    Factory function to create the appropriate database backend.
+
+    If TESTMON_NET_ENABLED=true and required env vars are set,
+    returns a NetDB instance for remote server communication.
+    Otherwise, returns a local SQLite DB instance.
+
+    Args:
+        rootdir: Project root directory
+        readonly: Whether to open in readonly mode
+
+    Returns:
+        Either NetDB or db.DB instance
+    """
+    net_db = create_net_db_from_env()
+    if net_db is not None:
+        logger.info("Using NetDB for remote server communication")
+        return net_db
+
+    # Fall back to local SQLite database
+    import os
+    datafile = os.path.join(rootdir, get_data_file_path())
+    return db.DB(datafile, readonly=readonly)
 
 
 def get_data_file_path():
@@ -179,9 +206,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         if database:
             self.db = database  # pylint: disable=invalid-name
         else:
-            self.db = db.DB(
-                os.path.join(self.rootdir, get_data_file_path()), readonly=readonly
-            )  # pylint: disable=invalid-name
+            self.db = create_database(self.rootdir, readonly=readonly)  # pylint: disable=invalid-name
 
         try:
             result = self.db.initiate_execution(

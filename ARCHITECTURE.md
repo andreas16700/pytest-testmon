@@ -377,6 +377,128 @@ Environment variables for CI:
 - `REPO_ID`, `JOB_ID`, `RUN_ID`: CI metadata
 - `GITHUB_REPOSITORY`: Auto-detected from GitHub Actions
 
+## NetDB Architecture (Direct Server Communication)
+
+NetDB is an alternative to the download/upload SQLite file approach. Instead of syncing entire database files, the pytest-ezmon plugin communicates directly with the server via RPC-style API calls during test execution.
+
+### Architecture Overview
+
+```
+┌─────────────────┐         HTTPS/REST          ┌──────────────────┐
+│  pytest-ezmon   │◄──────────────────────────►│   Flask Server   │
+│    (NetDB)      │   JSON (gzip compressed)    │   (ez-viz/app)   │
+└─────────────────┘                             └────────┬─────────┘
+                                                         │
+                                                         ▼
+                                                ┌──────────────────┐
+                                                │  SQLite per job  │
+                                                │  .testmondata    │
+                                                └──────────────────┘
+```
+
+### Key Benefits
+
+- **No local `.testmondata` file needed** in CI/CD ephemeral environments
+- **Reduced data transfer**: Only changed data is sent, not entire database files
+- **Real-time updates**: Test results are stored immediately on the server
+- **Better concurrency**: Server-side locking handles multiple concurrent runs
+
+### Data Flow
+
+A typical CI/CD test run with 500 tests requires only ~5 network requests:
+
+1. **pytest_configure** → `POST /api/rpc/session/initiate`
+   - Sends: environment name, system packages, Python version
+   - Returns: `exec_id`, `filenames`, `packages_changed`
+
+2. **determine_stable** → `POST /api/rpc/tests/determine`
+   - Sends: file hashes, dependency SHAs
+   - Returns: `affected` tests, `failing` tests
+
+3. **Every 250 tests** → `POST /api/rpc/test_execution/batch_insert`
+   - Sends: gzip-compressed batch of test results + fingerprints
+   - Server bulk inserts all data
+
+4. **pytest_sessionfinish** → `POST /api/rpc/session/finish`
+   - Server aggregates stats, vacuums orphans, commits
+
+### Key Components
+
+| Component | File | Description |
+|-----------|------|-------------|
+| `NetDB` | `ezmon/net_db.py` | Client-side class implementing DB interface via HTTP |
+| `create_database()` | `ezmon/testmon_core.py` | Factory function selecting NetDB or local DB |
+| RPC Endpoints | `ez-viz/app.py` | Server-side `/api/rpc/*` routes |
+
+### NetDB Class Features
+
+- **Same interface as `db.DB`**: Drop-in replacement for local SQLite
+- **Client-side LRU cache**: Reduces network calls for fingerprint lookups
+- **Gzip compression**: Payloads > 1KB are automatically compressed
+- **Connection pooling**: Uses `requests.Session` for efficient HTTP
+- **Retry logic**: Exponential backoff for transient failures
+
+### Environment Variables
+
+```bash
+# Required for NetDB mode
+TESTMON_NET_ENABLED=true
+TESTMON_SERVER=https://your-server.com
+REPO_ID=owner/repo              # or GITHUB_REPOSITORY
+JOB_ID=test-py311               # identifier for this variant
+
+# Optional
+TESTMON_AUTH_TOKEN=your-token   # for authentication
+RUN_ID=$GITHUB_RUN_ID           # links to CI run
+```
+
+### RPC Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/rpc/session/initiate` | POST | Start execution, return exec_id |
+| `/api/rpc/session/finish` | POST | Finalize, aggregate stats |
+| `/api/rpc/tests/all` | GET | Get all test executions |
+| `/api/rpc/tests/determine` | POST | Compute affected tests |
+| `/api/rpc/tests/delete` | POST | Delete test executions |
+| `/api/rpc/files/fetch_unknown` | POST | Find changed files |
+| `/api/rpc/files/list` | GET | List files for environment |
+| `/api/rpc/files/fingerprints` | GET | Get fingerprint details |
+| `/api/rpc/test_execution/batch_insert` | POST | Bulk insert tests |
+| `/api/rpc/coverage/batch_insert` | POST | Bulk insert coverage |
+| `/api/rpc/fingerprint/fetch_or_create` | POST | Fetch/create fingerprint |
+| `/api/rpc/file_dependency/fetch_or_create` | POST | Fetch/create file dep |
+| `/api/rpc/metadata/read` | GET | Read metadata attribute |
+| `/api/rpc/metadata/write` | POST | Write metadata attribute |
+
+### Authentication
+
+RPC endpoints support two authentication methods:
+
+1. **Session cookie**: For browser-based OAuth (existing frontend flow)
+2. **Authorization header**: For CI/CD tokens (`Bearer <token>`)
+
+```bash
+# CI/CD usage
+export TESTMON_AUTH_TOKEN=your-service-token
+```
+
+### Performance Comparison
+
+| Metric | Download/Upload Approach | NetDB Approach |
+|--------|-------------------------|----------------|
+| Network calls | 2 (download + upload) | ~5 per run |
+| Data transfer | ~5-10 MB each way | ~100-400 KB total |
+| Startup latency | High (download entire DB) | Low (single init call) |
+| Concurrent safety | Manual locking needed | Server-side locking |
+
+### Backward Compatibility
+
+- Local `.testmondata` mode remains **default**
+- NetDB activates only when `TESTMON_NET_ENABLED=true`
+- Existing `server_sync.py` upload/download still works
+- All visualization endpoints unchanged (read same SQLite files)
+
 ## Visualization Frontend (ez-viz)
 
 The Flask-based frontend (`ez-viz/app.py`) provides:
