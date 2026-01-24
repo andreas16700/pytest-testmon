@@ -23,7 +23,16 @@ def get_env_vars() -> Dict[str, Optional[str]]:
 
 
 def should_sync() -> bool:
-    """Check if all required environment variables are set."""
+    """
+    Check if old-style sync (download/upload SQLite file) should be used.
+
+    Returns False if NetDB is enabled (TESTMON_NET_ENABLED=true) since
+    NetDB handles all server communication directly without file transfers.
+    """
+    # Skip old sync when NetDB is enabled - it handles communication directly
+    if os.environ.get("TESTMON_NET_ENABLED", "").lower() == "true":
+        return False
+
     env_vars = get_env_vars()
     return all(env_vars.values())
 
