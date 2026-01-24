@@ -37,8 +37,8 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip
-          pip3 install -e .
-          pip3 install pytest pytest-cov
+          python3 -m pip install -e .
+          python3 -m pip install pytest pytest-cov
 
       - name: Run unit tests with ezmon
         run: python3 -m pytest tests/ -v --ezmon --tb=short
@@ -61,7 +61,7 @@ jobs:
       - name: Install ezmon
         run: |
           python3 -m pip install --upgrade pip
-          pip3 install -e .
+          python3 -m pip install -e .
 
       - name: Run integration tests with ezmon
         run: python3 integration_tests/run_integration_tests.py -v
@@ -78,5 +78,5 @@ jobs:
 
       - name: Lint
         run: |
-          pip3 install flake8
-          flake8 ezmon/ --max-line-length=120 --ignore=E501,W503 || true
+          python3 -m pip install flake8
+          python3 -m flake8 ezmon/ --max-line-length=120 --ignore=E501,W503 || true

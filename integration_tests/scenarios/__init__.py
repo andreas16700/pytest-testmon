@@ -163,14 +163,13 @@ def register(scenario: Scenario) -> Scenario:
 # -----------------------------------------------------------------------------
 # Scenario: Modify math_utils.add()
 # Tests that call add() are selected via method-level tracking.
-# Tests that import math_utils transitively but don't call its functions
-# are also selected via module-level fingerprinting.
 # Tests that call OTHER math functions (subtract, multiply, divide) have
-# method-level tracking for those functions, so they're NOT selected.
+# method-level tracking for those specific functions, so they're NOT selected.
+# This demonstrates precise method-level tracking.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_math_utils",
-    description="Change math_utils.add() - method-level + module-level tracking",
+    description="Change math_utils.add() - only tests calling add() are selected",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -179,35 +178,32 @@ register(Scenario(
             content="result = a + b\n    return result",
         )
     ],
-    # Selected: tests that call add() (method-level) + tests with module-level dep only
+    # Selected: only tests that call add() directly
     expected_selected=[
-        TEST_CALC_ADD,  # calls add() directly
-        # Tests that don't call math functions get module-level dep on math_utils
-        TEST_CALC_UNKNOWN_OP,  # imports calculator, but no math function call
-        TEST_CALC_HISTORY,    # imports calculator, but no math function call
-        TEST_CALC_CLEAR,      # imports calculator, but no math function call
-    ] + ALL_MATH_TESTS,  # direct import of math_utils
+        TEST_CALC_ADD,      # calls add() via calculator
+        TEST_MATH_ADD_POS,  # calls add() directly
+        TEST_MATH_ADD_NEG,  # calls add() directly
+        TEST_MATH_ADD_MIX,  # calls add() directly
+    ],
     # Deselected: tests that have method-level tracking for OTHER math functions
     expected_deselected=[
         TEST_CALC_SUBTRACT,    # has method-level tracking for subtract()
         TEST_CALC_MULTIPLY,    # has method-level tracking for multiply()
         TEST_CALC_DIVIDE,      # has method-level tracking for divide()
         TEST_CALC_DIVIDE_ZERO, # has method-level tracking for divide()
-    ] + ALL_FMT_TESTS + ALL_STR_TESTS,  # no dependency on math_utils
+    ],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify string_utils.uppercase()
 # Tests that call uppercase() are selected via method-level tracking.
-# Tests that import string_utils transitively but don't call its functions
-# are also selected via module-level fingerprinting.
 # Tests that call OTHER string functions have method-level tracking for those,
-# so they're NOT selected.
+# so they're NOT selected. This demonstrates precise method-level tracking.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_string_utils",
-    description="Change string_utils.uppercase() - method-level + module-level tracking",
+    description="Change string_utils.uppercase() - only tests calling uppercase() are selected",
     modifications=[
         Modification(
             file="src/string_utils.py",
@@ -216,30 +212,28 @@ register(Scenario(
             content="upper_result = s.upper()\n    return upper_result",
         )
     ],
-    # Selected: tests that call uppercase() + tests with module-level dep only
+    # Selected: only tests that call uppercase() directly
     expected_selected=[
-        TEST_FMT_UPPER,   # calls uppercase() directly
-        # Tests that don't call string functions get module-level dep
-        TEST_FMT_UNKNOWN, # imports formatter, but no string function call
-        TEST_FMT_CHANGE,  # imports formatter, but set_style doesn't call string funcs
-        TEST_FMT_DEFAULT, # shares fingerprint patterns with uppercase tests
-    ] + ALL_STR_TESTS,  # direct import of string_utils
+        TEST_FMT_UPPER,      # calls uppercase() via formatter
+        TEST_STR_UPPER_LOW,  # calls uppercase() directly
+        TEST_STR_UPPER_MIX,  # calls uppercase() directly
+    ],
     # Deselected: tests that have method-level tracking for OTHER string functions
     expected_deselected=[
         TEST_FMT_LOWER,   # has method-level tracking for lowercase()
         TEST_FMT_TITLE,   # has method-level tracking for capitalize()
-    ] + ALL_CALC_TESTS + ALL_MATH_TESTS,  # no dependency on string_utils
+    ],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify calculator.clear_history()
 # test_clear_history calls clear_history() directly.
-# Some other tests may also be selected if they share fingerprint patterns.
+# Method-level tracking ensures only the test that calls this method is selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_calculator_only",
-    description="Change Calculator.clear_history() - tests with matching fingerprints selected",
+    description="Change Calculator.clear_history() - only test calling it is selected",
     modifications=[
         Modification(
             file="src/calculator.py",
@@ -249,20 +243,20 @@ register(Scenario(
             content="def clear_history(self):\n        self.history = list()",
         )
     ],
-    # test_divide_by_zero may share fingerprint patterns with clear_history
-    expected_selected=[TEST_CALC_CLEAR, TEST_CALC_DIVIDE_ZERO],
-    expected_deselected=[t for t in ALL_TESTS if t not in [TEST_CALC_CLEAR, TEST_CALC_DIVIDE_ZERO]],
+    # Only test_clear_history calls clear_history() directly
+    expected_selected=[TEST_CALC_CLEAR],
+    expected_deselected=[],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify formatter.set_style()
 # test_change_style calls set_style() directly.
-# Some other tests may also be selected if they share fingerprint patterns.
+# Method-level tracking ensures only the test that calls this method is selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_formatter_only",
-    description="Change Formatter.set_style() - tests with matching fingerprints selected",
+    description="Change Formatter.set_style() - only test calling it is selected",
     modifications=[
         Modification(
             file="src/formatter.py",
@@ -272,9 +266,9 @@ register(Scenario(
             content="def set_style(self, style):\n        self.style = str(style)",
         )
     ],
-    # test_default_style may share fingerprint patterns
-    expected_selected=[TEST_FMT_CHANGE, TEST_FMT_DEFAULT],
-    expected_deselected=[t for t in ALL_TESTS if t not in [TEST_FMT_CHANGE, TEST_FMT_DEFAULT]],
+    # Only test_change_style calls set_style() directly
+    expected_selected=[TEST_FMT_CHANGE],
+    expected_deselected=[],
 ))
 
 
@@ -344,11 +338,12 @@ def test_another_new():
 
 # -----------------------------------------------------------------------------
 # Scenario: Multiple modifications
-# Modify subtract() and lowercase() - tests with method-level + module-level deps run
+# Modify subtract() and lowercase() - only tests calling these are selected
+# This demonstrates precise method-level tracking with multiple changes.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="multiple_modifications",
-    description="Change subtract() and lowercase() - method-level + module-level tracking",
+    description="Change subtract() and lowercase() - only tests calling these are selected",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -363,27 +358,22 @@ register(Scenario(
             content="lower_result = s.lower()\n    return lower_result",
         ),
     ],
-    # Selected: tests that call modified functions + tests with module-level deps
+    # Selected: only tests that call subtract() or lowercase()
     expected_selected=[
-        # Tests calling subtract() (method-level)
+        # Tests calling subtract()
         TEST_CALC_SUBTRACT,
-        # Tests with module-level dep on math_utils (no method-level tracking)
-        TEST_CALC_UNKNOWN_OP,
-        TEST_CALC_HISTORY,
-        TEST_CALC_CLEAR,
-        # Tests calling lowercase() (method-level)
+        TEST_MATH_SUB_POS,
+        TEST_MATH_SUB_NEG,
+        # Tests calling lowercase()
         TEST_FMT_LOWER,
-        # Tests with module-level dep on string_utils (no method-level tracking)
-        TEST_FMT_UNKNOWN,
-        TEST_FMT_CHANGE,
-        TEST_FMT_DEFAULT,  # may share fingerprint patterns
-    ] + ALL_MATH_TESTS + ALL_STR_TESTS,  # direct imports
+        TEST_STR_LOWER_UP,
+        TEST_STR_LOWER_MIX,
+    ],
     # Deselected: tests with method-level tracking for OTHER functions
     expected_deselected=[
         TEST_CALC_ADD,        # has method-level for add()
         TEST_CALC_MULTIPLY,   # has method-level for multiply()
         TEST_CALC_DIVIDE,     # has method-level for divide()
-        TEST_CALC_DIVIDE_ZERO,# has method-level for divide()
         TEST_FMT_UPPER,       # has method-level for uppercase()
         TEST_FMT_TITLE,       # has method-level for capitalize()
     ],
