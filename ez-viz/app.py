@@ -31,6 +31,7 @@ from functools import wraps
 import traceback
 from urllib.parse import urlencode
 import array
+from github import Github, GithubException
 
 # OpenAI is optional - only needed for AI-assisted workflow modification
 try:
@@ -496,7 +497,7 @@ def github_login():
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": CALLBACK,
-        "scope": "repo read:user user:email",
+        "scope": "repo workflow read:user user:email",
         "state": state,
         "allow_signup": "false"
     }
@@ -727,6 +728,7 @@ def upload_dependency_graph():
     file = request.files.get("file")
     repo_id = request.form.get("repo_id")
     job_id = request.form.get("job_id")
+    run_id = request.form.get("run_id")
 
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -746,7 +748,7 @@ def upload_dependency_graph():
         # 1. Determine Path
         # We get the standard DB path, then swap the filename
         db_path = get_job_db_path(repo_id, job_id)
-        graph_path = db_path.with_name("dependency_graph.html")
+        graph_path = db_path.parent / f"dependency_graph_{run_id}.html"
 
         # 2. Write File
         log.info("graph_write_attempt dest=%s", graph_path)
@@ -807,20 +809,18 @@ def _open_db_or_404(repo_id: str, job_id: str):
         return None, jsonify({"error": "No data found"}), 404
     return db_path, None, None
 
-@app.route("/api/dependencyGraph/<path:repo_id>/<job_id>", methods=["GET"])
-def retrieve_dependency_graph(repo_id: str, job_id: str):
+@app.route("/api/dependencyGraph/<path:repo_id>/<job_id>/<run_id>", methods=["GET"])
+def retrieve_dependency_graph(repo_id: str, job_id: str, run_id: str):
     try:
         db_path = get_job_db_path(repo_id, job_id)
         job_path = db_path.parent
-        dependency_graph_path = job_path / "dependency_graph.html"
+        dependency_graph_path = job_path / f"dependency_graph_{run_id}.html"
 
         if not dependency_graph_path.exists():
-            log.error(f"GRAPH NOT FOUND!")
-            log.error(f"Looking at: {dependency_graph_path}")
-            log.error(f"Resolved absolute path: {dependency_graph_path.resolve()}")
+            log.error(f"Graph not found at: {dependency_graph_path}")
             return {"error": "Graph not found"}, 404
-        else:
-            return send_file(dependency_graph_path)
+
+        return send_file(dependency_graph_path)
     except Exception as e:
         return {"error": str(e)}, 500
 
@@ -905,6 +905,110 @@ def get_user_repositories():
 
     return all_repos
 
+@app.route("/api/commit_workflow", methods=["POST"])
+@login_required
+def commit_workflow():
+    print("--- DEBUG: Entering commit_workflow endpoint ---")
+
+    # 1. Check Token
+    token = session.get("github_token")
+    if not token:
+        print("--- DEBUG: Error - No token found in session")
+        log.warning("commit_workflow_unauthorized: No token in session")
+        return jsonify({"error": "No access token found"}), 401
+    print(f"--- DEBUG: Token found (length: {len(token)})")
+
+    # 2. Parse Request Data
+    data = request.json
+    print(f"--- DEBUG: Raw payload: {data}")
+
+    owner = data.get("owner")
+    repo_name = data.get("repo")
+    file_path = data.get("path")
+    new_content = data.get("content")
+    commit_message = data.get("message", "Update workflow via Ezmon")
+
+    # Default to main, but allow frontend to override if needed
+    # IMPORTANT: We will print the branch being used
+    branch = data.get("branch", "main")
+
+    print(f"--- DEBUG: Parsed vars -> Owner: {owner}, Repo: {repo_name}, Path: {file_path}, Branch: {branch}")
+
+    # 3. Validate Inputs
+    if not all([owner, repo_name, file_path, new_content]):
+        print("--- DEBUG: Error - Missing required fields")
+        log.warning("commit_workflow_missing_fields data=%s", data.keys())
+        return jsonify({"error": "Missing required fields (owner, repo, path, content)"}), 400
+
+    try:
+        # 4. Initialize GitHub Client
+        print("--- DEBUG: Initializing PyGithub client...")
+        gh = Github(token)
+
+        target_repo_string = f"{owner}/{repo_name}"
+        print(f"--- DEBUG: Fetching repo object for '{target_repo_string}'...")
+        repo = gh.get_repo(target_repo_string)
+        print("--- DEBUG: Repo object fetched successfully.")
+
+        try:
+            # 5. Try to get existing file (Update Mode)
+            print(f"--- DEBUG: Checking if file exists at '{file_path}' on branch '{branch}'...")
+
+            # We MUST get the current file content to retrieve its 'sha'.
+            contents = repo.get_contents(file_path, ref=branch)
+            print(f"--- DEBUG: File found! Existing SHA: {contents.sha}")
+
+            print("--- DEBUG: Attempting update_file...")
+            repo.update_file(
+                path=file_path,
+                message=commit_message,
+                content=new_content,
+                sha=contents.sha, # Required: The SHA of the file we are replacing
+                branch=branch
+            )
+            print("--- DEBUG: update_file successful!")
+
+            log.info("commit_workflow_updated repo=%s/%s path=%s", owner, repo_name, file_path)
+            return jsonify({"success": True, "action": "updated"}), 200
+
+        except GithubException as e:
+            print(f"--- DEBUG: GithubException inside inner try block. Status: {e.status}")
+
+            # 6. If file not found (404), Create it (Create Mode)
+            if e.status == 404:
+                print("--- DEBUG: File not found (404). Switching to create_file mode...")
+                repo.create_file(
+                    path=file_path,
+                    message=commit_message,
+                    content=new_content,
+                    branch=branch
+                )
+                print("--- DEBUG: create_file successful!")
+
+                log.info("commit_workflow_created repo=%s/%s path=%s", owner, repo_name, file_path)
+                return jsonify({"success": True, "action": "created"}), 201
+            else:
+                # If it's a permission error (403) or other issue, raise it to the outer block
+                print(f"--- DEBUG: Exception was not 404. Re-raising: {e}")
+                raise e
+
+    except GithubException as e:
+        # Handle GitHub-specific API errors
+        error_msg = e.data.get('message', str(e)) if e.data else str(e)
+        print(f"--- DEBUG: FATAL GithubException: {error_msg}")
+        print(f"--- DEBUG: Full Exception Data: {e.data}")
+
+        log.error("github_api_error repo=%s/%s error=%s", owner, repo_name, error_msg)
+        return jsonify({"error": f"GitHub API Error: {error_msg}"}), 500
+
+    except Exception as e:
+        # Handle generic server errors
+        print(f"--- DEBUG: FATAL Unexpected Exception: {str(e)}")
+        traceback.print_exc() # Print full stack trace to console
+
+        log_exception("commit_workflow_unexpected_error", repo=f"{owner}/{repo_name}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/repos/<owner>/<repo>/actions/workflows")
 @login_required
 def get_workflow_files(owner, repo):
@@ -913,11 +1017,9 @@ def get_workflow_files(owner, repo):
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json"
     }
-
     # 1. Get the list of all workflows
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows"
     resp = requests.get(url, headers=headers)
-
     if resp.status_code == 404:
         return jsonify([])
     if resp.status_code != 200:
@@ -925,18 +1027,21 @@ def get_workflow_files(owner, repo):
 
     data = resp.json()
     all_workflows = data.get('workflows', [])
-
     # 2. Filter workflows: Must contain 'pytest'
-    pytest_workflows = []
+    results = []
 
     for wf in all_workflows:
         # Fetch content and check
         print(f"Checking content of: {wf['path']}")
-        if contains_pytest(owner, repo, wf['path'], token):
-            pytest_workflows.append(wf)
-
-    print(f"Found {len(pytest_workflows)} pytest workflows")
-    return jsonify(pytest_workflows)
+        has_pytest = contains_pytest(owner, repo, wf['path'], token)
+        results.append({
+            "id": wf["id"],
+            "name": wf["name"],
+            "path": wf["path"],
+            "node_id": wf["node_id"],
+            "uses_pytest": has_pytest
+        })
+    return jsonify(results)
 
 def contains_pytest(owner, repo, file_path, token):
     """

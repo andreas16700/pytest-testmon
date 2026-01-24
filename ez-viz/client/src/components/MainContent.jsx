@@ -102,6 +102,7 @@ function MainContent({
                     <FilesTab
                         currentRepo={currentRepo}
                         currentJob={currentJob}
+                        currentRun={selectedRunId}
                         allFiles={allFiles}
                         search={fileSearch}
                         setSearch={setFileSearch}

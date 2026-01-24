@@ -2,16 +2,16 @@ import React from "react";
 import FileItem from "./FileItem.jsx";
 import SearchBox from "./SearchBox.jsx";
 
-function FilesTab({currentRepo, currentJob, allFiles, search, setSearch, showFileDetails}) {
+function FilesTab({currentRepo, currentJob, currentRun, allFiles, search, setSearch, showFileDetails}) {
 
     const handleShowGraph = () => {
-        if (!currentRepo || !currentJob) {
-            console.error("Cannot show graph: Missing repoId or jobId");
+        if (!currentRepo || !currentJob || !currentRun) {
+            console.error("Cannot show graph: Missing repo/job/run info");
             return;
         }
 
         try {
-            const graphUrl = `/api/dependencyGraph/${currentRepo}/${currentJob}`;
+            const graphUrl = `/api/dependencyGraph/${currentRepo}/${currentJob}/${currentRun}`;
             window.open(graphUrl, "_blank", "noopener, noreferrer");
         } catch (error) {
             console.error("Failed to open dependency graph:", error);

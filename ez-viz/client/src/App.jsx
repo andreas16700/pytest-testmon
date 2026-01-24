@@ -24,6 +24,9 @@ function App() {
     const [allFiles, setAllFiles] = useState([]);
     const [isPopupWindowOpen, setIsPopupWindowOpen] = useState(false);
     const [workflowFile, setWorkflowFile] = useState("");
+    const [originalWorkflowFile, setOriginalWorkflowFile] = useState("");
+    const [popupRepo, setPopupRepo] = useState(null);
+    const [popupFilePath, setPopupFilePath] = useState("");
 
     const [activeTab, setActiveTab] = useState("summary");
     const [testSearch, setTestSearch] = useState("");
@@ -66,56 +69,40 @@ function App() {
 
     const loadRepos = async () => {
         try {
-            const systemReposDataRes = await fetch("/api/repos", {credentials: "include"});
-            const systemReposData = await systemReposDataRes.json();
-            const systemRepos = systemReposData.system_repos || [];
-            const userRepos = systemReposData.user_repos || [];
+            const systemAndUserReposDataRes = await fetch("/api/repos", {credentials: "include"});
+            const systemAndUserReposData = await systemAndUserReposDataRes.json();
+            const systemRepos = systemAndUserReposData.system_repos || [];
+            const userRepos = systemAndUserReposData.user_repos || [];
             setRepos(systemRepos);
             const systemRepoNames = new Set(systemRepos.map((r) => r.name));
-            const missing = userRepos.filter((repo) => !systemRepoNames.has(repo.full_name));
-            const checks = missing.map(async (repository) => {
-                try {
-                    const workflowFilesRes = await fetch(`/api/repos/${user.login}/${repository.name}/actions/workflows`, {credentials: "include"});
-                    const workflowFiles = await workflowFilesRes.json();
-                    return workflowFiles.length > 0 ? repository : null;
-                } catch (e) {
-                    console.error(`Failed to check workflows for ${repository.name}`, e);
-                    return null;
-                }
-            });
-            const results = await Promise.all(checks);
-
-            const ezmonAdaptableRepos = results.filter(repo => repo !== null);
-
-            setUserOtherRepos(ezmonAdaptableRepos);
+            const missing = userRepos.filter((repo) => !systemRepoNames.has(repo.full_name)); // user repositories that are not listed in the selection bar
+            setUserOtherRepos(missing);
         } catch (err) {
+            console.error("Failed to load repositories:", err);
             setError("Failed to load repositories");
         }
     };
 
-    const generateWorkflowFile = async (repo) => {
+    const generateWorkflowFile = async (repo, workflow) => {
         try {
-            const repoWorkflowFilesRes = await fetch(`/api/repos/${user.login}/${repo.name}/actions/workflows`, {credentials: "include"});
-            const repoWorkflowFiles = await repoWorkflowFilesRes.json();
-
-            for (let file of repoWorkflowFiles) {
-                const content = await fetchWorkflowContent(user.login, repo.name, file.path);
-                const aiResponse = await fetch("/api/ask_ai", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({content: content}),
-                });
-                if (!aiResponse.ok) {
-                    throw new Error(`Server error: ${aiResponse.status}`);
-                }
-
-                const data = await aiResponse.json();
-                setWorkflowFile(data.content);
-                setIsPopupWindowOpen(true);
+            setPopupRepo(repo);
+            const content = await fetchWorkflowContent(user.login, repo.name, workflow.path);
+            setOriginalWorkflowFile(content);
+            setPopupFilePath(workflow.path);
+            const aiResponse = await fetch("/api/ask_ai", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({content: content}),
+            });
+            if (!aiResponse.ok) {
+                throw new Error(`Server error: ${aiResponse.status}`);
             }
 
+            const data = await aiResponse.json();
+            setWorkflowFile(data.content);
+            setIsPopupWindowOpen(true);
         } catch (err) {
             console.error(err);
         }
@@ -288,7 +275,7 @@ function App() {
                     </svg>
                 </button>
 
-                {/* 3. RIGHT MAIN: Data Visualization and Tabs */}
+                {/* 2. RIGHT MAIN: Data Visualization and Tabs */}
                 <main className="app-content-area flex-1 overflow-hidden">
                     {loading ? (
                         <div className="app-loading-state">
@@ -347,7 +334,7 @@ function App() {
                 {modal.content}
             </Modal>
 
-            {isPopupWindowOpen && <WorkflowFilePopup workflowFile={workflowFile} setIsPopupWindowOpen={setIsPopupWindowOpen}/>}
+            {isPopupWindowOpen && <WorkflowFilePopup workflowFile={workflowFile} originalWorkflowFile={originalWorkflowFile} setIsPopupWindowOpen={setIsPopupWindowOpen} user={user} repo={popupRepo} filePath={popupFilePath}/>}
         </div>
     );
 }
