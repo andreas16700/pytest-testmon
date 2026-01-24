@@ -83,6 +83,9 @@ class DependencyTracker:
             'node_modules', '.eggs', '*.egg-info',
         ])
 
+        # Cache for local package detection
+        self._local_packages_cache: Dict[str, bool] = {}
+
     def _is_in_project(self, filepath: str) -> Optional[str]:
         """
         Check if a file is within the project directory.
@@ -115,6 +118,50 @@ class DependencyTracker:
         except (ValueError, TypeError):
             self._path_cache[filepath] = None
             return None
+
+    def _is_local_package(self, pkg_name: str) -> bool:
+        """
+        Check if a package name corresponds to a local project package.
+
+        This handles the case where a package is installed (e.g., pip install -e .)
+        but is actually the project being tested. For example, when testing
+        matplotlib, 'import matplotlib.pyplot' should NOT be treated as an
+        external dependency because matplotlib IS the local project.
+
+        We detect this by checking if there's a Python package directory
+        in the project that matches the package name.
+        """
+        if pkg_name in self._local_packages_cache:
+            return self._local_packages_cache[pkg_name]
+
+        # Look for a package directory matching this name anywhere in the project
+        # Common patterns:
+        # - src/packagename/
+        # - lib/packagename/
+        # - packagename/
+        search_dirs = ['', 'src', 'lib', 'source', 'packages']
+
+        for search_dir in search_dirs:
+            if search_dir:
+                pkg_path = os.path.join(self.rootdir, search_dir, pkg_name)
+            else:
+                pkg_path = os.path.join(self.rootdir, pkg_name)
+
+            # Check if it's a package (directory with __init__.py or just a .py file)
+            if os.path.isdir(pkg_path):
+                init_file = os.path.join(pkg_path, '__init__.py')
+                if os.path.exists(init_file):
+                    self._local_packages_cache[pkg_name] = True
+                    return True
+
+            # Also check for single-file modules
+            py_file = pkg_path + '.py'
+            if os.path.exists(py_file):
+                self._local_packages_cache[pkg_name] = True
+                return True
+
+        self._local_packages_cache[pkg_name] = False
+        return False
 
     def _compute_file_sha(self, filepath: str) -> Optional[str]:
         """Compute SHA1 hash of file contents."""
@@ -229,8 +276,10 @@ class DependencyTracker:
                 actual_name = getattr(module, '__name__', name) if module else name
                 if not self._is_stdlib_module(actual_name):
                     pkg_name = self._get_package_name(actual_name)
-                    # Only track non-empty, valid package names
-                    if pkg_name and not pkg_name.startswith('_'):
+                    # Only track non-empty, valid package names that aren't local packages
+                    # This handles the case where the project being tested is pip-installed
+                    # (e.g., matplotlib tests importing matplotlib.pyplot)
+                    if pkg_name and not pkg_name.startswith('_') and not self._is_local_package(pkg_name):
                         if context in self._tracked_external_imports:
                             self._tracked_external_imports[context].add(pkg_name)
 
@@ -428,7 +477,12 @@ class DependencyTracker:
             if pkg_name.startswith('_'):
                 continue
 
-            # Check if it's a local project module
+            # Check if the top-level package is a local project package
+            # This handles pip-installed projects being tested (e.g., matplotlib tests)
+            if self._is_local_package(pkg_name):
+                continue
+
+            # Check if it's a local project module (file-based check)
             module_file = self._resolve_module_to_file(module_name)
             if module_file:
                 relpath = self._is_in_project(module_file)
