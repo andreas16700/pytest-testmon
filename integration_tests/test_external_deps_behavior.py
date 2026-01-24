@@ -6,15 +6,15 @@ These tests verify that when external packages change, only tests that
 actually use those packages are invalidated (not all tests).
 
 Test scenarios:
-1. Adding new external dependency: no tests selected (new pkg not used yet)
-2. Updating dependency A: only tests using A should be selected
+1. Updating dependency A: only tests using A should be selected
+2. Adding new external dependency: no tests selected (new pkg not used yet)
 3. Removing dependency B: only tests using B should be selected
-4. Updating both A and B: tests using A, B, or both should be selected
 
-The test works by:
-1. Running pytest --ezmon to populate the database with external deps
-2. Directly modifying the environment's system_packages in the database
-3. Running pytest --ezmon again and checking which tests are selected
+The tests use ACTUAL pip operations to manage dependencies:
+1. Create a venv with specific package versions
+2. Run pytest --ezmon to populate the database
+3. Use pip to install/uninstall/upgrade packages
+4. Run pytest --ezmon again and verify only affected tests are selected
 """
 
 import os
@@ -30,9 +30,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
 SAMPLE_PROJECT = SCRIPT_DIR / "sample_project"
-
-sys.path.insert(0, str(REPO_ROOT))
-from ezmon.common import parse_system_packages
 
 
 class Colors:
@@ -69,19 +66,85 @@ def setup_workspace():
     return temp_dir, workspace
 
 
-def create_venv(workspace: Path) -> Path:
-    """Create venv and install ezmon."""
+def create_venv(workspace: Path, requests_version: str = "2.31.0", numpy_version: str = "1.26.0") -> tuple:
+    """Create venv and install ezmon with specific package versions.
+
+    Returns:
+        tuple: (python_venv_path, pip_path)
+    """
     venv_path = workspace / ".venv"
     subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True, capture_output=True)
 
     pip = venv_path / "bin" / "pip"
     python_venv = venv_path / "bin" / "python"
 
-    # Install ezmon and test dependencies
+    # Install ezmon first
+    log(f"Installing ezmon and base dependencies...", "debug")
     subprocess.run([str(pip), "install", "--upgrade", "pip"], capture_output=True)
-    subprocess.run([str(pip), "install", str(REPO_ROOT), "requests", "numpy"], capture_output=True, check=True)
+    subprocess.run([str(pip), "install", str(REPO_ROOT)], capture_output=True, check=True)
 
-    return python_venv
+    # Install specific versions of test dependencies
+    if requests_version:
+        log(f"Installing requests=={requests_version}", "debug")
+        result = subprocess.run(
+            [str(pip), "install", f"requests=={requests_version}"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            log(f"Warning: Could not install requests=={requests_version}, trying latest", "debug")
+            subprocess.run([str(pip), "install", "requests"], capture_output=True)
+
+    if numpy_version:
+        log(f"Installing numpy=={numpy_version}", "debug")
+        result = subprocess.run(
+            [str(pip), "install", f"numpy=={numpy_version}"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            log(f"Warning: Could not install numpy=={numpy_version}, trying latest", "debug")
+            subprocess.run([str(pip), "install", "numpy"], capture_output=True)
+
+    return python_venv, pip
+
+
+def pip_install(pip: Path, package: str, version: str = None):
+    """Install a package using pip."""
+    pkg_spec = f"{package}=={version}" if version else package
+    log(f"pip install {pkg_spec}", "debug")
+    result = subprocess.run(
+        [str(pip), "install", pkg_spec],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        log(f"pip install failed: {result.stderr}", "error")
+        return False
+    return True
+
+
+def pip_uninstall(pip: Path, package: str):
+    """Uninstall a package using pip."""
+    log(f"pip uninstall {package}", "debug")
+    result = subprocess.run(
+        [str(pip), "uninstall", "-y", package],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        log(f"pip uninstall failed: {result.stderr}", "error")
+        return False
+    return True
+
+
+def pip_show(pip: Path, package: str) -> str:
+    """Get installed version of a package."""
+    result = subprocess.run(
+        [str(pip), "show", package],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        for line in result.stdout.split('\n'):
+            if line.startswith('Version:'):
+                return line.split(':', 1)[1].strip()
+    return None
 
 
 def run_pytest_ezmon(workspace: Path, python_venv: Path, test_files: str = None):
@@ -117,83 +180,6 @@ def get_db_path(workspace: Path) -> Path:
     return workspace / ".testmondata"
 
 
-def modify_system_packages(db_path: Path, old_version: str, new_version: str, package_name: str):
-    """
-    Modify the system_packages in the database to simulate a package change.
-
-    Args:
-        db_path: Path to .testmondata
-        old_version: Current version string (e.g., "1.0")
-        new_version: New version string (e.g., "2.0")
-        package_name: Package name to modify (e.g., "requests")
-    """
-    conn = sqlite3.connect(str(db_path))
-    cursor = conn.cursor()
-
-    # Get current system_packages
-    row = cursor.execute("SELECT id, system_packages FROM environment ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        raise RuntimeError("No environment found in database")
-
-    env_id, current_packages = row
-    log(f"Current packages (truncated): {current_packages[:100]}...", "debug")
-
-    # Modify the package version
-    old_pattern = f"{package_name} {old_version}"
-    new_pattern = f"{package_name} {new_version}"
-
-    if old_pattern in current_packages:
-        new_packages = current_packages.replace(old_pattern, new_pattern)
-        log(f"Changed {old_pattern} -> {new_pattern}", "debug")
-    elif package_name in current_packages:
-        # Find and replace any version
-        import re
-        new_packages = re.sub(f"{package_name} [\\d.]+", new_pattern, current_packages)
-        log(f"Changed {package_name} version to {new_version}", "debug")
-    else:
-        # Add the package
-        new_packages = current_packages + f", {new_pattern}"
-        log(f"Added {new_pattern}", "debug")
-
-    cursor.execute("UPDATE environment SET system_packages = ? WHERE id = ?", (new_packages, env_id))
-    conn.commit()
-    conn.close()
-
-
-def add_package_to_db(db_path: Path, package_name: str, version: str):
-    """Add a new package to system_packages."""
-    conn = sqlite3.connect(str(db_path))
-    cursor = conn.cursor()
-
-    row = cursor.execute("SELECT id, system_packages FROM environment ORDER BY id DESC LIMIT 1").fetchone()
-    env_id, current_packages = row
-
-    new_packages = current_packages + f", {package_name} {version}"
-    cursor.execute("UPDATE environment SET system_packages = ? WHERE id = ?", (new_packages, env_id))
-    conn.commit()
-    conn.close()
-    log(f"Added {package_name} {version} to packages", "debug")
-
-
-def remove_package_from_db(db_path: Path, package_name: str):
-    """Remove a package from system_packages."""
-    conn = sqlite3.connect(str(db_path))
-    cursor = conn.cursor()
-
-    row = cursor.execute("SELECT id, system_packages FROM environment ORDER BY id DESC LIMIT 1").fetchone()
-    env_id, current_packages = row
-
-    # Remove the package (handles "pkg version" format)
-    import re
-    new_packages = re.sub(f",?\\s*{package_name} [\\d.]+", "", current_packages)
-    new_packages = new_packages.strip(", ")
-
-    cursor.execute("UPDATE environment SET system_packages = ? WHERE id = ?", (new_packages, env_id))
-    conn.commit()
-    conn.close()
-    log(f"Removed {package_name} from packages", "debug")
-
-
 def check_external_deps_recorded(db_path: Path):
     """Check what external dependencies were recorded."""
     conn = sqlite3.connect(str(db_path))
@@ -224,17 +210,27 @@ def test_update_dependency_a():
     """
     Test: Updating dependency A (requests) should only affect tests using requests.
 
+    Uses ACTUAL pip operations:
+    1. Install requests==2.28.0 initially
+    2. Run pytest --ezmon to populate database
+    3. pip install requests==2.31.0 (upgrade)
+    4. Run pytest --ezmon - only requests-using tests should run
+
     Expected:
     - TestUsesNeither tests: NOT selected (don't use requests)
     - TestUsesDepA tests: SELECTED (use requests)
     - TestUsesDepB tests: NOT selected (only use numpy)
     - TestUsesBoth tests: SELECTED (use both)
     """
-    log("Test: Update dependency A (requests)")
+    log("Test: Update dependency A (requests) via pip upgrade")
 
     temp_dir, workspace = setup_workspace()
     try:
-        python_venv = create_venv(workspace)
+        # Install with older version of requests
+        python_venv, pip = create_venv(workspace, requests_version="2.28.0", numpy_version="1.26.0")
+
+        initial_requests_version = pip_show(pip, "requests")
+        log(f"Initial requests version: {initial_requests_version}", "debug")
 
         # Initial run - populate database
         log("Running initial pytest --ezmon...", "debug")
@@ -246,15 +242,18 @@ def test_update_dependency_a():
         deps = check_external_deps_recorded(db_path)
         log(f"Recorded external deps: {deps}", "debug")
 
-        # Simulate requests version change
-        log("Simulating requests version change...", "debug")
-        modify_system_packages(db_path, "2.28", "2.29", "requests")
+        # Upgrade requests using pip
+        log("Upgrading requests via pip...", "debug")
+        pip_install(pip, "requests", "2.31.0")
+
+        new_requests_version = pip_show(pip, "requests")
+        log(f"New requests version: {new_requests_version}", "debug")
 
         # Run again
-        log("Running pytest --ezmon after package change...", "debug")
+        log("Running pytest --ezmon after package upgrade...", "debug")
         selected2, deselected2, stdout2, _ = run_pytest_ezmon(workspace, python_venv)
 
-        log(f"After update: {len(selected2)} selected, {deselected2} deselected", "debug")
+        log(f"After upgrade: {len(selected2)} selected, {deselected2} deselected", "debug")
         log(f"Selected tests: {selected2}", "debug")
 
         # Verify expectations
@@ -277,6 +276,12 @@ def test_update_dependency_a():
             if "TestUsesDepB" in test:
                 errors.append(f"TestUsesDepB test should NOT be selected: {test}")
 
+        # TestUsesBoth should be selected (uses requests)
+        both_tests = [t for t in selected2 if "TestUsesBoth" in t]
+        if not both_tests:
+            if any("TestUsesBoth" in t for t in deps.keys()):
+                errors.append("TestUsesBoth tests should be selected (use requests)")
+
         if errors:
             for e in errors:
                 log(e, "error")
@@ -293,22 +298,35 @@ def test_add_new_dependency():
     """
     Test: Adding a new external dependency should NOT select any tests.
 
-    If a new package is added that no test has ever used, no tests should run.
+    Uses ACTUAL pip operations:
+    1. Create venv WITHOUT flask
+    2. Run pytest --ezmon to populate database
+    3. pip install flask
+    4. Run pytest --ezmon - no tests should run (none use flask)
     """
-    log("Test: Add new dependency (flask)")
+    log("Test: Add new dependency (flask) via pip install")
 
     temp_dir, workspace = setup_workspace()
     try:
-        python_venv = create_venv(workspace)
+        python_venv, pip = create_venv(workspace)
+
+        # Verify flask is not installed
+        flask_version = pip_show(pip, "flask")
+        if flask_version:
+            log(f"Flask already installed ({flask_version}), uninstalling...", "debug")
+            pip_uninstall(pip, "flask")
 
         # Initial run
         log("Running initial pytest --ezmon...", "debug")
         selected1, _, _, _ = run_pytest_ezmon(workspace, python_venv)
         log(f"Initial run: {len(selected1)} tests executed", "debug")
 
-        # Add a new package that no test uses
-        db_path = get_db_path(workspace)
-        add_package_to_db(db_path, "flask", "2.0.0")
+        # Install flask using pip
+        log("Installing flask via pip...", "debug")
+        pip_install(pip, "flask")
+
+        flask_version = pip_show(pip, "flask")
+        log(f"Flask version installed: {flask_version}", "debug")
 
         # Run again
         log("Running pytest --ezmon after adding new package...", "debug")
@@ -331,20 +349,39 @@ def test_add_new_dependency():
 def test_remove_dependency():
     """
     Test: Removing a dependency should select tests that used it.
+
+    Uses ACTUAL pip operations:
+    1. Create venv with numpy installed
+    2. Run pytest --ezmon to populate database
+    3. pip uninstall numpy
+    4. Run pytest --ezmon - only numpy-using tests should be selected
+       (they will be SKIPPED since numpy is missing, but still selected)
     """
-    log("Test: Remove dependency (numpy)")
+    log("Test: Remove dependency (numpy) via pip uninstall")
 
     temp_dir, workspace = setup_workspace()
     try:
-        python_venv = create_venv(workspace)
+        python_venv, pip = create_venv(workspace)
+
+        numpy_version = pip_show(pip, "numpy")
+        log(f"Initial numpy version: {numpy_version}", "debug")
 
         # Initial run
         log("Running initial pytest --ezmon...", "debug")
         selected1, _, _, _ = run_pytest_ezmon(workspace, python_venv)
+        log(f"Initial run: {len(selected1)} tests executed", "debug")
 
-        # Remove numpy
+        # Check recorded deps
         db_path = get_db_path(workspace)
-        remove_package_from_db(db_path, "numpy")
+        deps = check_external_deps_recorded(db_path)
+        log(f"Recorded external deps: {deps}", "debug")
+
+        # Uninstall numpy using pip
+        log("Uninstalling numpy via pip...", "debug")
+        pip_uninstall(pip, "numpy")
+
+        numpy_version = pip_show(pip, "numpy")
+        log(f"Numpy version after uninstall: {numpy_version}", "debug")
 
         # Run again
         log("Running pytest --ezmon after removing numpy...", "debug")
@@ -353,8 +390,10 @@ def test_remove_dependency():
         log(f"After removing numpy: {len(selected2)} selected, {deselected2} deselected", "debug")
         log(f"Selected: {selected2}", "debug")
 
-        # TestUsesNeither should NOT be selected
+        # Verify expectations
         errors = []
+
+        # TestUsesNeither should NOT be selected
         for test in selected2:
             if "TestUsesNeither" in test:
                 errors.append(f"TestUsesNeither test should NOT be selected: {test}")
@@ -363,6 +402,18 @@ def test_remove_dependency():
         for test in selected2:
             if "TestUsesDepA" in test:
                 errors.append(f"TestUsesDepA test should NOT be selected: {test}")
+
+        # TestUsesDepB SHOULD be selected (uses numpy)
+        dep_b_tests = [t for t in selected2 if "TestUsesDepB" in t]
+        if not dep_b_tests:
+            if any("TestUsesDepB" in t for t in deps.keys()):
+                errors.append("TestUsesDepB tests should be selected (use numpy)")
+
+        # TestUsesBoth SHOULD be selected (uses numpy)
+        both_tests = [t for t in selected2 if "TestUsesBoth" in t]
+        if not both_tests:
+            if any("TestUsesBoth" in t for t in deps.keys()):
+                errors.append("TestUsesBoth tests should be selected (use numpy)")
 
         if errors:
             for e in errors:
@@ -377,16 +428,17 @@ def test_remove_dependency():
 
 
 def main():
-    print(f"\n{Colors.BOLD}External Dependency Tracking Integration Tests{Colors.END}\n")
+    print(f"\n{Colors.BOLD}External Dependency Tracking Integration Tests{Colors.END}")
+    print(f"{Colors.BOLD}(Using actual pip operations){Colors.END}\n")
     print("-" * 60)
 
     results = []
 
     # Run tests
     tests = [
-        ("Update dependency A", test_update_dependency_a),
-        ("Add new dependency", test_add_new_dependency),
-        ("Remove dependency", test_remove_dependency),
+        ("Update dependency A (pip upgrade)", test_update_dependency_a),
+        ("Add new dependency (pip install)", test_add_new_dependency),
+        ("Remove dependency (pip uninstall)", test_remove_dependency),
     ]
 
     for name, test_func in tests:
