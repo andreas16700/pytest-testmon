@@ -10,7 +10,7 @@ on:
 env:
   # NetDB configuration - uses the production server
   TESTMON_NET_ENABLED: "true"
-  TESTMON_SERVER: "https://ezmon.yourdomain.com"  # TODO: Update with your actual server URL
+  TESTMON_SERVER: "https://ezmon.aloiz.ch"
   TESTMON_AUTH_TOKEN: "ezmon-ci-test-token-2024"
 
 jobs:
