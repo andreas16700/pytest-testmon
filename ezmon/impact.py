@@ -536,6 +536,43 @@ class ImpactEstimator:
 
         return result
 
+    def get_tests_for_file(
+        self,
+        repo_id: str,
+        job_id: str,
+        filename: str,
+        limit: int = 500,
+    ) -> Tuple[List[str], int, Optional[str]]:
+        """
+        Get the list of tests that depend on a specific file.
+
+        Args:
+            repo_id: Repository identifier
+            job_id: Job variant identifier
+            filename: The file to query (exact match or pattern with % wildcard)
+            limit: Maximum number of test names to return
+
+        Returns:
+            Tuple of (test_names, total_count, error)
+        """
+        try:
+            from urllib.parse import quote
+            url = (
+                f"/api/rpc/coverage/tests"
+                f"?repo_id={quote(repo_id)}"
+                f"&job_id={quote(job_id)}"
+                f"&filename={quote(filename)}"
+                f"&limit={limit}"
+            )
+
+            response = self._make_request("GET", url)
+            tests = response.get("tests", [])
+            total_count = response.get("total_count", len(tests))
+            return tests, total_count, None
+
+        except Exception as e:
+            return [], 0, str(e)
+
 
 def main():
     """CLI entry point."""
@@ -628,6 +665,11 @@ def main():
         default="",
         help="Filename pattern filter for coverage analysis (e.g., 'lib/matplotlib')",
     )
+    parser.add_argument(
+        "--tests-for",
+        dest="tests_for_file",
+        help="Get list of tests that depend on a specific file (e.g., 'lib/matplotlib/_afm.py')",
+    )
 
     args = parser.parse_args()
 
@@ -708,6 +750,57 @@ def main():
 
             if analysis.error:
                 sys.exit(1)
+            sys.exit(0)
+
+        # Tests-for-file mode
+        if args.tests_for_file:
+            # Get repo_id
+            repo_id = args.repo_id or estimator.get_repo_id()
+            if not repo_id:
+                print("Error: Could not auto-detect repository ID. Please specify with --repo", file=sys.stderr)
+                sys.exit(1)
+
+            # Get job_id - either specified or pick first available
+            job_id = args.single_job
+            if not job_id:
+                variants, _ = estimator.list_variants(repo_id, args.include_incomplete)
+                if not variants:
+                    print(f"Error: No variants found for {repo_id}. Specify with --job", file=sys.stderr)
+                    sys.exit(1)
+                job_id = variants[0]
+                print(f"Using variant: {job_id}", file=sys.stderr)
+
+            tests, total_count, error = estimator.get_tests_for_file(
+                repo_id=repo_id,
+                job_id=job_id,
+                filename=args.tests_for_file,
+                limit=args.limit,
+            )
+
+            if error:
+                print(f"Error: {error}", file=sys.stderr)
+                sys.exit(1)
+
+            if args.json_output:
+                output = {
+                    "repo_id": repo_id,
+                    "job_id": job_id,
+                    "filename": args.tests_for_file,
+                    "tests": tests,
+                    "count": len(tests),
+                    "total_count": total_count,
+                }
+                print(json.dumps(output, indent=2))
+            else:
+                print(f"Tests depending on: {args.tests_for_file}")
+                print(f"Variant: {job_id}")
+                print(f"Total tests: {total_count}")
+                print("-" * 60)
+                for test in tests:
+                    print(f"  {test}")
+                if len(tests) < total_count:
+                    print(f"  ... and {total_count - len(tests)} more (use --limit to see more)")
+
             sys.exit(0)
 
         # Impact estimation mode

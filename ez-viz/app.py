@@ -3949,6 +3949,113 @@ def rpc_coverage_analysis():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/rpc/coverage/tests", methods=["GET"])
+@rpc_auth_required
+def rpc_coverage_tests():
+    """
+    Get the list of tests that depend on a specific file.
+
+    Query params:
+        repo_id: Repository identifier
+        job_id: Job variant identifier
+        filename: The file to query (exact match or pattern with % wildcard)
+        limit: Maximum number of test names to return (default: 500)
+
+    Returns:
+        JSON with test names that depend on the specified file
+    """
+    repo_id = request.args.get("repo_id")
+    job_id = request.args.get("job_id")
+    filename = request.args.get("filename")
+    limit = int(request.args.get("limit", 500))
+
+    g.repo_id = repo_id or "-"
+    g.job_id = job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing repo_id or job_id parameter"}), 400
+    if not filename:
+        return jsonify({"error": "Missing filename parameter"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({
+                "tests": [],
+                "message": "No data found for this repo/job variant"
+            })
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get the latest environment_id
+        row = cursor.execute(
+            "SELECT id FROM environment ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({
+                "tests": [],
+                "message": "No test execution data found"
+            })
+
+        exec_id = row["id"]
+
+        # Query to get test names for a specific file
+        # Support both exact match and LIKE pattern
+        if "%" in filename:
+            filename_clause = "f.filename LIKE ?"
+        else:
+            filename_clause = "f.filename = ?"
+
+        query = f"""
+            SELECT DISTINCT te.test_name
+            FROM file_fp f
+            JOIN test_execution_file_fp te_ffp ON f.id = te_ffp.fingerprint_id
+            JOIN test_execution te ON te_ffp.test_execution_id = te.id
+            WHERE {filename_clause}
+              AND te.environment_id = ?
+            ORDER BY te.test_name
+            LIMIT ?
+        """
+
+        rows = cursor.execute(query, (filename, exec_id, limit)).fetchall()
+        tests = [row["test_name"] for row in rows]
+
+        # Get total count (may be more than limit)
+        count_query = f"""
+            SELECT COUNT(DISTINCT te.test_name) as cnt
+            FROM file_fp f
+            JOIN test_execution_file_fp te_ffp ON f.id = te_ffp.fingerprint_id
+            JOIN test_execution te ON te_ffp.test_execution_id = te.id
+            WHERE {filename_clause}
+              AND te.environment_id = ?
+        """
+        total_count = cursor.execute(count_query, (filename, exec_id)).fetchone()["cnt"]
+
+        conn.close()
+
+        log.info(
+            "coverage_tests repo_id=%s job_id=%s filename=%s count=%d total=%d",
+            repo_id, job_id, filename, len(tests), total_count
+        )
+
+        return jsonify({
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "filename": filename,
+            "tests": tests,
+            "count": len(tests),
+            "total_count": total_count,
+        })
+
+    except Exception as e:
+        log_exception("rpc_coverage_tests", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health")
 def health():
     repo_count = len(get_metadata().get("repos", {}))
