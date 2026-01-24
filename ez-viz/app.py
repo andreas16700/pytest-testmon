@@ -3541,6 +3541,208 @@ def serve_react_app(path):
         log.error("react_build_missing expected=%s", react_index)
         return jsonify({"error": "React app not built"}), 500
 
+# -----------------------------------------------------------------------------
+# IMPACT ESTIMATION ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@app.route("/api/rpc/repo/variants", methods=["GET"])
+@rpc_auth_required
+def rpc_repo_variants():
+    """
+    List all job variants (job_ids) available for a repository.
+
+    Query params:
+        repo_id: Repository identifier (e.g., 'owner/repo')
+
+    Returns:
+        JSON with list of variant job_ids
+    """
+    repo_id = request.args.get("repo_id")
+
+    if not repo_id:
+        return jsonify({"error": "Missing repo_id parameter"}), 400
+
+    g.repo_id = repo_id
+    g.job_id = "*"
+
+    try:
+        metadata = get_metadata()
+
+        if repo_id not in metadata.get("repos", {}):
+            return jsonify({"variants": [], "message": "Repository not found"})
+
+        repo_data = metadata["repos"][repo_id]
+        variants = list(repo_data.get("jobs", {}).keys())
+
+        log.info("repo_variants_listed repo_id=%s count=%d", repo_id, len(variants))
+
+        return jsonify({
+            "repo_id": repo_id,
+            "variants": variants,
+        })
+
+    except Exception as e:
+        log_exception("rpc_repo_variants", repo_id=repo_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/impact/estimate", methods=["POST"])
+@rpc_auth_required
+def rpc_impact_estimate():
+    """
+    Estimate which tests would be affected by code changes.
+
+    This is a stateless endpoint that doesn't require an active session.
+    It compares provided file fingerprints against stored test coverage data.
+
+    Request body:
+        repo_id: Repository identifier
+        job_id: Job variant identifier
+        files_fshas: Dict mapping filename to file SHA (for change detection)
+        files_mhashes: Dict mapping filename to hex-encoded method checksums
+
+    Returns:
+        JSON with lists of affected and failing tests
+    """
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = data.get("repo_id")
+    job_id = data.get("job_id")
+    files_fshas = data.get("files_fshas", {})
+    files_mhashes = data.get("files_mhashes", {})
+
+    g.repo_id = repo_id or "-"
+    g.job_id = job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing repo_id or job_id"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({
+                "affected": [],
+                "failing": [],
+                "message": "No data found for this repo/job variant"
+            })
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get the latest environment_id (most recent test run)
+        row = cursor.execute(
+            "SELECT id FROM environment ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({
+                "affected": [],
+                "failing": [],
+                "message": "No test execution data found"
+            })
+
+        exec_id = row["id"]
+
+        # Find files that have changed (different SHA)
+        changed_files = set()
+        for filename, new_fsha in files_fshas.items():
+            if new_fsha is None:
+                # File was deleted
+                changed_files.add(filename)
+                continue
+
+            row = cursor.execute(
+                """
+                SELECT DISTINCT f.fsha
+                FROM file_fp f
+                JOIN test_execution_file_fp te_ffp ON f.id = te_ffp.fingerprint_id
+                JOIN test_execution te ON te_ffp.test_execution_id = te.id
+                WHERE te.environment_id = ? AND f.filename = ?
+                LIMIT 1
+                """,
+                (exec_id, filename),
+            ).fetchone()
+
+            if row is None or row["fsha"] != new_fsha:
+                changed_files.add(filename)
+
+        if not changed_files:
+            conn.close()
+            return jsonify({
+                "affected": [],
+                "failing": [],
+                "message": "No changes detected in tracked files"
+            })
+
+        # Find tests affected by changed files
+        affected_tests = set()
+
+        for filename in changed_files:
+            # Get tests that depend on this file
+            rows = cursor.execute(
+                """
+                SELECT DISTINCT
+                    te.test_name,
+                    f.method_checksums
+                FROM test_execution te
+                JOIN test_execution_file_fp te_ffp ON te.id = te_ffp.test_execution_id
+                JOIN file_fp f ON te_ffp.fingerprint_id = f.id
+                WHERE te.environment_id = ? AND f.filename = ?
+                """,
+                (exec_id, filename),
+            ).fetchall()
+
+            for row in rows:
+                test_name = row["test_name"]
+                stored_checksums = row["method_checksums"]
+
+                # Check if method checksums actually changed
+                mhashes_hex = files_mhashes.get(filename)
+                if mhashes_hex is None:
+                    # File deleted or no checksums provided - assume affected
+                    affected_tests.add(test_name)
+                    continue
+
+                new_checksums = bytes.fromhex(mhashes_hex)
+                if stored_checksums != new_checksums:
+                    # Detailed fingerprint check
+                    stored_set = set(array.array("i", stored_checksums).tolist()) if stored_checksums else set()
+                    new_set = set(array.array("i", new_checksums).tolist()) if new_checksums else set()
+                    if stored_set - new_set:
+                        # Some checksums are missing - methods were changed/deleted
+                        affected_tests.add(test_name)
+
+        # Get currently failing tests
+        failing_tests = [
+            row["test_name"]
+            for row in cursor.execute(
+                "SELECT test_name FROM test_execution WHERE environment_id = ? AND failed = 1",
+                (exec_id,),
+            )
+        ]
+
+        conn.close()
+
+        log.info(
+            "impact_estimated repo_id=%s job_id=%s changed_files=%d affected=%d failing=%d",
+            repo_id, job_id, len(changed_files), len(affected_tests), len(failing_tests)
+        )
+
+        return jsonify({
+            "affected": sorted(affected_tests),
+            "failing": failing_tests,
+            "changed_files": sorted(changed_files),
+        })
+
+    except Exception as e:
+        log_exception("rpc_impact_estimate", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health")
 def health():
     repo_count = len(get_metadata().get("repos", {}))
