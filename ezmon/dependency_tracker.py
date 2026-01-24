@@ -235,11 +235,20 @@ class DependencyTracker:
         # Call original open first
         result = self._original_open(file, mode, *args, **kwargs)
 
-        if self._active and isinstance(file, str):
-            try:
-                self._track_file(file, mode)
-            except Exception:
-                pass  # Don't let tracking errors affect the test
+        if self._active:
+            # Handle both str and Path objects (os.PathLike)
+            if isinstance(file, str):
+                filepath = file
+            elif isinstance(file, os.PathLike):
+                filepath = os.fspath(file)
+            else:
+                filepath = None
+
+            if filepath:
+                try:
+                    self._track_file(filepath, mode)
+                except Exception:
+                    pass  # Don't let tracking errors affect the test
 
         return result
 
