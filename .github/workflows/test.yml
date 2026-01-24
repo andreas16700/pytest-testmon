@@ -8,53 +8,22 @@ on:
   workflow_dispatch:
 
 env:
-  # CI token for RPC authentication (matches server default)
+  # NetDB configuration - uses the production server
+  TESTMON_NET_ENABLED: "true"
+  TESTMON_SERVER: "https://ezmon.yourdomain.com"  # TODO: Update with your actual server URL
   TESTMON_AUTH_TOKEN: "ezmon-ci-test-token-2024"
 
 jobs:
   # ============================================================================
-  # Unit Tests - Linux (GitHub hosted)
+  # Unit Tests - Self-hosted macOS runner with NetDB
   # ============================================================================
-  unit-tests-linux:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12']
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-          pip install pytest pytest-cov
-
-      - name: Run unit tests
-        run: pytest tests/ -v --tb=short
-
-      - name: Run tests with coverage
-        if: matrix.python-version == '3.10'
-        run: pytest tests/ -v --cov=ezmon --cov-report=xml
-
-      - name: Upload coverage
-        if: matrix.python-version == '3.10'
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
-
-  # ============================================================================
-  # Unit Tests - macOS (Self-hosted)
-  # ============================================================================
-  unit-tests-macos:
+  unit-tests:
     runs-on: self-hosted
+    env:
+      REPO_ID: ${{ github.repository }}
+      JOB_ID: "unit-tests"
+      RUN_ID: ${{ github.run_id }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -64,131 +33,39 @@ jobs:
           pip3 install -e .
           pip3 install pytest pytest-cov
 
-      - name: Run unit tests
-        run: pytest tests/ -v --tb=short
+      - name: Run unit tests with ezmon
+        run: pytest tests/ -v --ezmon --tb=short
 
   # ============================================================================
-  # Integration Tests - NetDB with Flask server
+  # Integration Tests - Self-hosted macOS runner with NetDB
   # ============================================================================
-  integration-netdb:
-    runs-on: ubuntu-latest
+  integration-tests:
+    runs-on: self-hosted
+    env:
+      REPO_ID: ${{ github.repository }}
+      JOB_ID: "integration-tests"
+      RUN_ID: ${{ github.run_id }}
+
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-          pip install flask flask-cors python-dotenv
-
-      - name: Start Flask server
-        run: |
-          cd ez-viz
-          echo "SECRET_KEY=test-secret-key-ci" > .env
-          mkdir -p ${{ github.workspace }}/testmon-data
-          echo "TESTMON_DATA_DIR=${{ github.workspace }}/testmon-data" >> .env
-
-          # Start server
-          python app.py &
-
-          # Wait for server
-          for i in {1..30}; do
-            if curl -s http://localhost:8004/health > /dev/null 2>&1; then
-              echo "Server ready"
-              break
-            fi
-            [ $i -eq 30 ] && echo "Server failed" && exit 1
-            sleep 1
-          done
-
-      - name: Test RPC endpoints
-        run: python ez-viz/test_rpc_endpoints.py --url http://localhost:8004 --token "$TESTMON_AUTH_TOKEN"
-
-      - name: Test NetDB client
-        run: python ez-viz/test_net_db.py --url http://localhost:8004 --token "$TESTMON_AUTH_TOKEN"
-
-      - name: Run sample project with NetDB
-        env:
-          TESTMON_NET_ENABLED: "true"
-          TESTMON_SERVER: "http://localhost:8004"
-          REPO_ID: "test/sample-project"
-          JOB_ID: "ci-netdb-test"
-        run: |
-          cd integration_tests/sample_project
-          git init && git config user.email "ci@test.com" && git config user.name "CI"
-          git add -A && git commit -m "init"
-
-          echo "=== First run ==="
-          pytest --ezmon -v 2>&1 | tee first.log
-
-          echo "=== Second run ==="
-          pytest --ezmon -v 2>&1 | tee second.log
-
-      - name: Verify server data
-        run: |
-          curl -s "http://localhost:8004/api/rpc/tests/all?exec_id=1" \
-            -H "Authorization: Bearer $TESTMON_AUTH_TOKEN" \
-            -H "X-Repo-ID: test/sample-project" \
-            -H "X-Job-ID: ci-netdb-test" | python -c "
-          import sys, json
-          tests = json.load(sys.stdin).get('tests', {})
-          print(f'Found {len(tests)} tests')
-          sys.exit(0 if len(tests) > 0 else 1)
-          "
-
-      - name: Cleanup
-        if: always()
-        run: pkill -f "python app.py" || true
-
-  # ============================================================================
-  # Integration Tests - Local DB with ezmon
-  # ============================================================================
-  integration-local:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
 
       - name: Install ezmon
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-
-      - name: Cache testmondata
-        uses: actions/cache@v4
-        with:
-          path: integration_tests/.testmondata
-          key: testmon-${{ runner.os }}-${{ hashFiles('integration_tests/**/*.py') }}
-          restore-keys: testmon-${{ runner.os }}-
+          python3 -m pip install --upgrade pip
+          pip3 install -e .
 
       - name: Run integration tests with ezmon
-        run: |
-          cd integration_tests
-          # Use ezmon for our own tests
-          pytest -v --ezmon --tb=short || pytest -v --tb=short
+        run: python3 integration_tests/run_integration_tests.py -v
 
   # ============================================================================
   # Lint
   # ============================================================================
   lint:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
       - name: Lint
         run: |
-          pip install flake8
+          pip3 install flake8
           flake8 ezmon/ --max-line-length=120 --ignore=E501,W503 || true
