@@ -157,13 +157,19 @@ def get_system_packages(ignore=None, rootdir=None):
         ignore = set(ignore)
 
     packages = []
+    local_packages_found = []  # Debug: track which packages were detected as local
     for package, version in get_system_packages_raw():
         if package in ignore:
             continue
         # Skip local packages (the project being tested)
         if rootdir and is_local_package(package, rootdir):
+            local_packages_found.append(package)
             continue
         packages.append(f"{package} {version}")
+
+    # Debug output
+    if rootdir:
+        logger.info(f"get_system_packages: rootdir={rootdir}, local_packages={local_packages_found}")
 
     return ", ".join(sorted(set(packages)))
 
