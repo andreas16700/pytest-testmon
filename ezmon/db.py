@@ -10,7 +10,7 @@ from ezmon.process_code import blob_to_checksums, checksums_to_blob
 from ezmon.common import TestExecutions
 
 
-DATA_VERSION = 16  # Incremented for file_dependency table
+DATA_VERSION = 16  # Keep version stable - dependency_graph uses IF NOT EXISTS
 
 ChangedFileData = namedtuple(
     "ChangedFileData", "filename name method_checksums id failed"
@@ -79,6 +79,9 @@ class DB:  # pylint: disable=too-many-public-methods
         # Ensure run_infos table exists for older DB files without recreating the DB file.
         # Using IF NOT EXISTS makes this safe to run against an existing DB.
         self.con.executescript(self._create_run_infos_statement())
+        # Ensure dependency_graph table exists for older DB files.
+        # This allows smooth upgrades without triggering full test re-runs.
+        self.con.executescript(self._create_dependency_graph_statement())
 
     def version_compatibility(self):
         return DATA_VERSION
@@ -403,6 +406,62 @@ class DB:  # pylint: disable=too-many-public-methods
     def insert_into_suite_files_fshas(self, con, exec_id, files_fshas):
         pass
 
+    def insert_dependency_graph_edges(self, edges, run_uid):
+        """Insert dependency graph edges discovered during test execution.
+
+        Args:
+            edges: List of tuples (source_file, target_file, target_package, edge_type)
+                - For local imports: (source, target, None, 'local')
+                - For external imports: (source, None, package_name, 'external')
+            run_uid: The run UID to associate edges with
+        """
+        if not edges:
+            return
+
+        with self.con as con:
+            # Use INSERT OR IGNORE to handle duplicates gracefully
+            con.executemany(
+                """INSERT OR IGNORE INTO dependency_graph
+                   (source_file, target_file, target_package, edge_type, run_uid)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [(src, tgt, pkg, etype, run_uid) for src, tgt, pkg, etype in edges],
+            )
+
+    def get_dependency_graph(self, run_uid=None):
+        """Retrieve dependency graph edges.
+
+        Args:
+            run_uid: Optional run UID to filter by. If None, returns latest run's graph.
+
+        Returns:
+            List of dicts with keys: source_file, target_file, target_package, edge_type
+        """
+        with self.con as con:
+            if run_uid is None:
+                # Get the latest run_uid
+                row = con.execute("SELECT MAX(id) FROM run_uid").fetchone()
+                if row and row[0]:
+                    run_uid = row[0]
+                else:
+                    return []
+
+            cursor = con.execute(
+                """SELECT source_file, target_file, target_package, edge_type
+                   FROM dependency_graph
+                   WHERE run_uid = ?
+                   ORDER BY source_file, target_file, target_package""",
+                (run_uid,),
+            )
+            return [
+                {
+                    "source_file": row[0],
+                    "target_file": row[1],
+                    "target_package": row[2],
+                    "edge_type": row[3],
+                }
+                for row in cursor.fetchall()
+            ]
+
     def write_attribute(self, attribute, data, exec_id=None):
         dataid = f"{exec_id}:{attribute}"
         with self.con as con:
@@ -695,6 +754,35 @@ class DB:  # pylint: disable=too-many-public-methods
             CREATE INDEX IF NOT EXISTS ted_pkg_name ON test_external_dependency (package_name);
         """
 
+    def _create_dependency_graph_statement(self) -> str:
+        """Table for storing file-to-file dependency graph edges.
+
+        This captures actual import relationships discovered during test execution:
+        - source_file: The Python file containing the import statement
+        - target_file: The imported file (relative path for local imports)
+        - target_package: External package name (for external imports)
+        - edge_type: 'local' or 'external'
+        - run_uid: Associates with a specific test run
+
+        This data is collected at runtime by the dependency tracker, NOT by
+        static AST analysis, ensuring accurate dependency information.
+        """
+        return """
+            CREATE TABLE IF NOT EXISTS dependency_graph (
+                id INTEGER PRIMARY KEY,
+                source_file TEXT NOT NULL,
+                target_file TEXT,
+                target_package TEXT,
+                edge_type TEXT NOT NULL CHECK (edge_type IN ('local', 'external')),
+                run_uid INTEGER,
+                FOREIGN KEY(run_uid) REFERENCES run_uid(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS dg_source ON dependency_graph (source_file);
+            CREATE INDEX IF NOT EXISTS dg_target ON dependency_graph (target_file);
+            CREATE INDEX IF NOT EXISTS dg_run_uid ON dependency_graph (run_uid);
+            CREATE UNIQUE INDEX IF NOT EXISTS dg_unique_edge ON dependency_graph (source_file, target_file, target_package, run_uid);
+        """
+
     def init_tables(self):
         connection = self.con
 
@@ -713,6 +801,7 @@ class DB:  # pylint: disable=too-many-public-methods
             + self._create_test_execution_coverage_statement()
             + self._create_file_dependency_statement()
             + self._create_external_dependency_statement()
+            + self._create_dependency_graph_statement()
         )
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")

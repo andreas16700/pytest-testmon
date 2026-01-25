@@ -586,6 +586,54 @@ class NetDB:
         )
         return response.get("data", default)
 
+    def insert_dependency_graph_edges(self, edges: List[tuple], exec_id: int):
+        """Insert dependency graph edges via RPC.
+
+        Args:
+            edges: List of tuples (source_file, target_file, target_package, edge_type)
+            exec_id: Execution ID to associate edges with
+        """
+        if not edges:
+            return
+
+        # Serialize edges for transport
+        serialized_edges = [
+            {
+                "source_file": src,
+                "target_file": tgt,
+                "target_package": pkg,
+                "edge_type": etype,
+            }
+            for src, tgt, pkg, etype in edges
+        ]
+
+        self._make_request(
+            "POST",
+            "/api/rpc/dependency_graph/batch_insert",
+            data={
+                "exec_id": exec_id,
+                "edges": serialized_edges,
+            },
+            compress=True,
+            timeout=120,
+        )
+
+    def get_dependency_graph(self, run_uid: int = None) -> List[Dict]:
+        """Retrieve dependency graph edges via RPC.
+
+        Args:
+            run_uid: Optional run UID to filter by.
+
+        Returns:
+            List of dicts with keys: source_file, target_file, target_package, edge_type
+        """
+        response = self._make_request(
+            "GET",
+            "/api/rpc/dependency_graph/get",
+            data={"run_uid": run_uid} if run_uid else {},
+        )
+        return response.get("edges", [])
+
     def close(self):
         """Close the HTTP session."""
         if self._http_session:

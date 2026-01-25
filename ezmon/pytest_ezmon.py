@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
-from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync, upload_dependency_graph
+from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync
 from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
@@ -31,7 +31,6 @@ from ezmon.testmon_core import (
 )
 from ezmon import configure
 from ezmon.common import get_logger, get_system_packages
-from ezmon import graph as ezmon_graph
 
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
@@ -354,12 +353,10 @@ def pytest_unconfigure(config):
     # Upload if sync is enabled - AFTER database is committed and closed
     if should_sync():
         testmon_file = get_testmon_file(config)
-        graph_file = testmon_file.parent / f"dependency_graph_{os.getenv('RUN_ID')}.html"
         logger.info(f"Testmon file path: {testmon_file}")
-        logger.info(f"Graph File Path: {graph_file}")
         # Give file system time to flush
         time.sleep(0.2)
-        
+
         if testmon_file.exists() and testmon_file.stat().st_size > 0:
             logger.info(f"📦 Uploading: {testmon_file.stat().st_size:,} bytes")
             repo_name = os.getenv("GITHUB_REPOSITORY") or os.getenv("REPO_ID") or "unknown"
@@ -367,12 +364,8 @@ def pytest_unconfigure(config):
         else:
             logger.info("No testmon data to upload")
 
-        if config.getoption("--ezmon-graph"):
-            if graph_file.exists() and graph_file.stat().st_size > 0:
-                logger.info(f"Uploading Graph: {graph_file.stat().st_size:,} bytes")
-                upload_dependency_graph(graph_file)
-            else:
-                logger.warning(f"--ezmon-graph was set, but {graph_file.name} was not found or is empty.")
+        # Note: Dependency graph data is now collected automatically during
+        # test execution and stored in the database (no separate upload needed).
 
 
 class TestmonCollect:
@@ -461,6 +454,10 @@ class TestmonCollect:
                 time.time() - self._sessionstarttime,
                 session.config.testmon_config.select,
             )
+            # Save dependency graph edges after finish_execution (which creates run_uid)
+            graph_edges = self.testmon.get_graph_edges()
+            if graph_edges:
+                self.testmon_data.save_dependency_graph(graph_edges)
         self.testmon.close()
 
 
@@ -642,12 +639,10 @@ class TestmonSelect:
             session.exitstatus = ExitCode.OK
 
         if self.config.getoption("ezmon_graph"):
-            root_dir = self.config.rootdir.strpath
-            logger.info(f"Root Directory: {root_dir}")
-            logger.info("Generating dependency graph...")
-            run_id = os.getenv("RUN_ID")
-            logger.info(f"Run ID: {run_id}")
-            ezmon_graph.generate_graph(root_dir)
+            # The --ezmon-graph option is now deprecated.
+            # Dependency graph data is automatically collected during test execution
+            # and stored in the database. View it in the ez-viz interface.
+            logger.info("Note: --ezmon-graph is deprecated. Dependency graph is now collected automatically during test execution.")
 
     @pytest.hookimpl(trylast=True)
     def pytest_terminal_summary(self):

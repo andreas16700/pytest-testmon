@@ -492,6 +492,31 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         if nodes_files_lines:
             self.db.insert_coverage_lines(self.exec_id, nodes_files_lines)
 
+    def save_dependency_graph(self, graph_edges):
+        """Save dependency graph edges discovered during test execution.
+
+        Args:
+            graph_edges: List of tuples (source_file, target_file, target_package, edge_type)
+        """
+        if not graph_edges:
+            return
+
+        # Get the current run_uid
+        # For local DB, query directly. For NetDB, use the RPC method
+        if isinstance(self.db, NetDB):
+            # NetDB: use the RPC endpoint
+            self.db.insert_dependency_graph_edges(graph_edges, self.exec_id)
+            logger.info(f"Saved {len(graph_edges)} dependency graph edges via NetDB")
+        else:
+            # Local DB: get the latest run_uid
+            with self.db.con as con:
+                row = con.execute("SELECT MAX(id) FROM run_uid").fetchone()
+                run_uid = row[0] if row and row[0] else None
+
+            if run_uid is not None:
+                self.db.insert_dependency_graph_edges(graph_edges, run_uid)
+                logger.info(f"Saved {len(graph_edges)} dependency graph edges for run_uid={run_uid}")
+
     def fetch_saving_stats(self, select):
         return self.db.fetch_saving_stats(self.exec_id, select)
 
@@ -557,6 +582,8 @@ class TestmonCollector:
         self.dependency_tracker = DependencyTracker(rootdir)
         # Store tracked dependencies per test for batch processing
         self._tracked_deps = {}  # {test_name: (files, local_imports, external_imports)}
+        # Store dependency graph edges: (source_file, target_file, target_package, edge_type)
+        self._graph_edges = set()
 
     def start_cov(self):
         if not self.cov._started:
@@ -687,7 +714,10 @@ class TestmonCollector:
         return nodes_files_lines
 
     def _merge_tracked_deps(self, nodes_files_lines):
-        """Merge tracked file and import dependencies into coverage data."""
+        """Merge tracked file and import dependencies into coverage data.
+
+        Also collects dependency graph edges for visualization.
+        """
         for test_name, (files, local_imports, external_imports, test_file) in self._tracked_deps.items():
             if test_name not in nodes_files_lines:
                 nodes_files_lines[test_name] = {}
@@ -726,7 +756,11 @@ class TestmonCollector:
                 test_file_external = self.dependency_tracker.get_module_external_imports(test_file)
                 all_external_imports.update(test_file_external)
 
+                # Collect graph edges: test_file -> imported modules
                 for imported_module in test_file_imports:
+                    # Graph edge: test file imports local module
+                    self._graph_edges.add((test_file, imported_module, None, 'local'))
+
                     # Add the directly imported module if not already tracked
                     if imported_module not in nodes_files_lines[test_name]:
                         nodes_files_lines[test_name][imported_module] = {0}
@@ -734,6 +768,9 @@ class TestmonCollector:
                     # Get transitive imports (modules that imported_module imports)
                     transitive_imports = self.dependency_tracker.get_module_imports(imported_module)
                     for transitive_import in transitive_imports:
+                        # Graph edge: imported module imports another module
+                        self._graph_edges.add((imported_module, transitive_import, None, 'local'))
+
                         # Add if NOT already tracked by coverage
                         if transitive_import not in nodes_files_lines[test_name]:
                             nodes_files_lines[test_name][transitive_import] = {0}
@@ -741,7 +778,14 @@ class TestmonCollector:
                     # Extract external package dependencies from this module
                     # This catches imports like 'import requests' at module level
                     module_external = self.dependency_tracker.get_module_external_imports(imported_module)
+                    for pkg in module_external:
+                        # Graph edge: module imports external package
+                        self._graph_edges.add((imported_module, None, pkg, 'external'))
                     all_external_imports.update(module_external)
+
+                # Graph edges: test file imports external packages
+                for pkg in test_file_external:
+                    self._graph_edges.add((test_file, None, pkg, 'external'))
 
             # Store file dependencies in a special key
             # These will be handled specially in get_tests_fingerprints
@@ -755,6 +799,14 @@ class TestmonCollector:
                 nodes_files_lines[test_name][ext_deps_key] = all_external_imports
 
         return nodes_files_lines
+
+    def get_graph_edges(self):
+        """Return collected dependency graph edges.
+
+        Returns:
+            List of tuples: (source_file, target_file, target_package, edge_type)
+        """
+        return list(self._graph_edges)
 
     def get_nodes_files_lines(self, dont_include):
         cov_data: CoverageData = self.cov.get_data()
