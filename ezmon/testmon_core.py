@@ -381,22 +381,38 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.stable_files = set(self.all_files) - self.unstable_files
 
     def _compute_file_dependency_shas(self):
-        """Compute SHA hashes for all tracked file dependencies."""
+        """Compute SHA hashes for all tracked file dependencies.
+
+        Uses git blob hash from the committed version (HEAD) to match
+        how dependencies were recorded. This ensures:
+        1. Files not in git won't have a SHA (treated as changed)
+        2. Files modified during workflow use committed state
+        """
+        import subprocess
         file_deps_shas = {}
 
         # Get list of file dependencies from database
         file_dep_filenames = self.db.get_file_dependency_filenames(self.exec_id)
 
         for filename in file_dep_filenames:
-            filepath = os.path.join(self.rootdir, filename)
-            if os.path.exists(filepath):
-                try:
-                    with open(filepath, 'rb') as f:
-                        content = f.read()
-                    file_deps_shas[filename] = hashlib.sha1(content).hexdigest()
-                except (OSError, IOError):
-                    # File can't be read, mark as changed
-                    pass
+            try:
+                # Use git ls-tree to get the committed blob hash
+                # This matches how we record file dependencies
+                result = subprocess.run(
+                    ['git', 'ls-tree', 'HEAD', '--', filename],
+                    cwd=self.rootdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # Output format: "100644 blob <sha>\t<filename>"
+                    parts = result.stdout.strip().split()
+                    if len(parts) >= 3 and parts[1] == 'blob':
+                        file_deps_shas[filename] = parts[2]
+            except Exception:
+                # File not in git or error - mark as changed (no SHA)
+                pass
 
         return file_deps_shas
 

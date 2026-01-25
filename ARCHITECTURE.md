@@ -102,6 +102,8 @@ pytest-testmon/
 │   ├── configure.py           # Configuration and decision logic
 │   ├── common.py              # Shared utilities and type definitions
 │   ├── server_sync.py         # Server synchronization for distributed CI
+│   ├── dependency_tracker.py  # Import and file dependency tracking
+│   ├── net_db.py              # Network database client for server communication
 │   └── graph.py               # Dependency graph generation
 ├── ez-viz/                    # Frontend visualization server (Flask)
 │   └── app.py                 # Multi-project dashboard and API
@@ -121,6 +123,8 @@ pytest-testmon/
 | `TestmonData` | testmon_core.py | Orchestrates fingerprint creation and stability analysis |
 | `TestmonCollector` | testmon_core.py | Coverage collection during test execution |
 | `DB` | db.py | SQLite database schema, CRUD operations |
+| `DependencyTracker` | dependency_tracker.py | Tracks file reads and imports during test execution |
+| `NetDB` | net_db.py | Network-based DB implementation for server communication |
 
 ### Pytest Plugin
 
@@ -272,6 +276,140 @@ When you modify a function, only tests that have that function's checksum in the
 # → Only test_clear_history re-runs (it's the only test with clear_history checksum)
 ```
 
+## Dependency Tracking
+
+Beyond coverage-based fingerprinting, ezmon tracks additional dependencies that coverage.py might miss:
+
+### Import Tracking
+
+The `DependencyTracker` class hooks into Python's import system to capture:
+
+1. **Local module imports**: All Python files within the project that are imported during test execution
+2. **External package imports**: Third-party packages (e.g., `requests`, `numpy`) imported by each test
+
+#### Local Module Detection
+
+A module is considered "local" if:
+- Its file path is within the project's root directory
+- OR it's a pip-installed editable package that corresponds to a local package directory
+
+This second condition is important for projects like matplotlib where the package is pip-installed (`pip install -e .`) but we still want to track it as a local dependency:
+
+```python
+# In matplotlib project:
+import matplotlib.pyplot  # This is local, even though it's "installed"
+
+# The tracker checks for: <rootdir>/matplotlib/ or <rootdir>/lib/matplotlib/
+# If found, matplotlib is treated as a local package, not external
+```
+
+#### External Package Tracking
+
+External packages are tracked at the **package level** (e.g., `requests` not `requests.adapters`):
+
+- Each test has a set of external packages it depends on
+- When a package version changes, only tests that import that package are marked as affected
+- Standard library modules (os, sys, json, etc.) are excluded
+
+### File Dependency Tracking
+
+Ezmon tracks non-Python files (JSON, YAML, images, etc.) that are read during test execution.
+
+#### How It Works
+
+The `DependencyTracker` hooks `builtins.open()` to intercept file reads:
+
+```python
+# During test execution:
+with open('config.json') as f:    # Intercepted!
+    config = json.load(f)
+
+# The tracker records: test depends on config.json with SHA <committed_sha>
+```
+
+#### Git-Based Tracking (Critical Design Decision)
+
+**Only files committed to git are tracked**, and the **committed state** (not the working tree state) is used:
+
+1. **Ephemeral/generated files are NOT tracked**: Files like `result_images/`, `__pycache__/`, or test outputs that aren't in git won't create dependencies
+
+2. **Workflow-modified files use committed state**: If a CI workflow modifies a config file during testing, we track the file's committed SHA, not the modified content
+
+```
+# Example: config.json in git with content A (SHA: abc123)
+# Workflow modifies it to content B during testing
+
+# Old behavior (WRONG):
+#   Track config.json with SHA of content B
+#   → Every run sees config.json as "changed"
+#   → All dependent tests always run
+
+# New behavior (CORRECT):
+#   Track config.json with SHA abc123 (from git HEAD)
+#   → Only runs tests when config.json actually changes in a commit
+```
+
+#### Implementation Details
+
+```python
+def _get_committed_file_sha(self, relpath: str) -> Optional[str]:
+    """
+    Get git blob hash for the committed version of a file.
+    Returns None for files not in git (ephemeral/generated).
+    """
+    result = subprocess.run(
+        ['git', 'ls-tree', 'HEAD', '--', relpath],
+        capture_output=True, text=True
+    )
+    # Parse: "100644 blob <sha>\t<filename>"
+    return sha_from_output(result.stdout)
+```
+
+This approach ensures:
+- `result_images/` (25,284 generated test images in matplotlib) → NOT tracked
+- `baseline_images/` (reference images in git) → Tracked correctly
+- `config.json` (modified during workflow) → Tracked with committed state
+
+### Database Schema for Dependencies
+
+```sql
+-- File dependencies (non-Python files)
+file_dependency (
+    id INTEGER PRIMARY KEY,
+    filename TEXT,        -- Relative path: "config.json"
+    sha TEXT              -- Git blob hash of committed version
+)
+
+-- Many-to-many: tests to file dependencies
+test_execution_file_dependency (
+    test_execution_id INTEGER,
+    file_dependency_id INTEGER
+)
+```
+
+### Dependency Flow During Test Execution
+
+```
+1. Test starts
+   ├─ DependencyTracker.start(test_name)
+   ├─ Hook builtins.open() and builtins.__import__()
+   └─ Initialize tracking sets for this test
+
+2. Test runs
+   ├─ Coverage.py tracks executed lines
+   ├─ DependencyTracker captures:
+   │   ├─ File reads: open('config.json', 'r') → record if in git
+   │   ├─ Local imports: import src.utils → record path
+   │   └─ External imports: import requests → record package name
+   └─ Test completes
+
+3. Test ends
+   ├─ DependencyTracker.stop() returns (files, local_imports, external_imports)
+   ├─ Files → stored in file_dependency table
+   ├─ Local imports → coverage.py already handles these
+   └─ External imports → stored in environment/test metadata
+```
+
 ## Coverage Context Limitation
 
 **Important**: Due to a fundamental limitation in coverage.py's dynamic context tracking, only the **first test to execute a code path** gets recorded as depending on that code. Subsequent tests calling the same code (under different contexts) don't get the dependency recorded.
@@ -302,37 +440,11 @@ This is a known limitation of the coverage.py context tracking approach used by 
 
 ## Known Limitations
 
-### 1. File Dependencies Not Tracked
+### 1. Coverage Context Limitation (see above)
 
-Ezmon only tracks Python source file dependencies. If a test reads data from a JSON, YAML, CSV, or other non-Python file, changes to that file will **not** trigger test re-runs.
+Only the first test to execute a code path gets the dependency recorded. This is a fundamental limitation of coverage.py's dynamic context tracking.
 
-```python
-# src/config_reader.py
-def load_config():
-    with open("config.json") as f:
-        return json.load(f)
-
-# tests/test_config.py
-def test_config_value():
-    config = load_config()
-    assert config["threshold"] == 50  # Value from config.json
-```
-
-If `config.json` changes, the test will **not** be re-run.
-
-**Potential solution**: Track file reads via `open()` monkey-patching or import hooks.
-
-### 2. External Package Dependencies (Coarse Granularity)
-
-Ezmon tracks all external packages in a single `system_packages` hash. When **any** package changes, **all** tests are marked as affected.
-
-- Test A uses `requests`
-- Test B uses `numpy`
-- Update `requests` → Both tests re-run (should only be Test A)
-
-**Potential solution**: Track which packages each test imports and create per-test package fingerprints.
-
-### 3. Import Without Execution
+### 2. Import Without Execution
 
 When a module is imported but specific functions are not called during test execution, those functions are **not** tracked in the test's fingerprint.
 
@@ -346,10 +458,6 @@ def test_something():
 If `helper_function()` body changes, this test will **not** be re-run.
 
 **Note**: This is by design - ezmon tracks executed code, not imported code. If the function body isn't executed, there's no dependency.
-
-### 4. Coverage Context Limitation (see above)
-
-Only the first test to execute a code path gets the dependency recorded. This is a fundamental limitation of coverage.py's dynamic context tracking.
 
 ## Command Line Options
 
@@ -608,12 +716,17 @@ The integration tests use declarative scenarios that modify code and verify indi
 | `modify_decorator` | Change memoize() | Decorators and closures |
 | `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
 
-**Limitation Demonstration Scenarios (intentionally fail until fixes implemented):**
+**File Dependency Scenarios:**
 
 | Scenario | Description | Status |
 |----------|-------------|--------|
-| `modify_config_file` | Change config.json | **FAILS** - expects tests to run |
-| `modify_uncalled_method` | Change imported but uncalled function | **FAILS** - expects all importing tests to run |
+| `modify_config_file` | Change config.json | **PASSES** - tests reading config.json are selected |
+
+**Limitation Demonstration Scenarios:**
+
+| Scenario | Description | Status |
+|----------|-------------|--------|
+| `modify_uncalled_method` | Change imported but uncalled function | **FAILS** - by design, uncalled code has no dependency |
 
 ### Sample Project Structure
 
@@ -655,5 +768,6 @@ This verifies:
 - **Generators**: Generator functions with `yield` are tracked correctly
 - **Decorators**: Decorator functions and closures are tracked correctly
 - **Context managers**: `__enter__`/`__exit__` methods are tracked correctly
-- **File dependency limitation**: Non-Python file changes don't trigger re-runs
-- **Import without execution**: Imported but uncalled functions don't create dependencies
+- **File dependencies**: Non-Python files in git trigger re-runs when changed
+- **Git-only tracking**: Ephemeral/generated files don't create spurious dependencies
+- **Import without execution**: Imported but uncalled functions don't create dependencies (by design)

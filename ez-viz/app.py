@@ -3345,6 +3345,46 @@ def rpc_tests_delete():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/rpc/job/reset", methods=["POST"])
+@rpc_auth_required
+def rpc_job_reset():
+    """
+    Reset all data for a specific job (variant).
+
+    This deletes the entire database for the job, effectively starting fresh.
+    Used for integration testing to ensure test isolation.
+    """
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters (repo_id, job_id)"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+
+        if db_path.exists():
+            # Delete the database file
+            db_path.unlink()
+            log.info("rpc_job_reset deleted db repo_id=%s job_id=%s", repo_id, job_id)
+
+            # Also delete WAL and SHM files if they exist
+            for ext in ["-wal", "-shm"]:
+                wal_path = db_path.parent / (db_path.name + ext)
+                if wal_path.exists():
+                    wal_path.unlink()
+
+            return jsonify({"success": True, "deleted": True})
+        else:
+            return jsonify({"success": True, "deleted": False, "message": "Database did not exist"})
+
+    except Exception as e:
+        log_exception("rpc_job_reset", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/rpc/file_dependencies/list", methods=["GET"])
 @rpc_auth_required
 def rpc_file_dependencies_list():

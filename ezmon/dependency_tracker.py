@@ -18,6 +18,7 @@ import hashlib
 import importlib
 import importlib.util
 import os
+import subprocess
 import sys
 import threading
 from functools import lru_cache
@@ -172,6 +173,43 @@ class DependencyTracker:
         except (OSError, IOError):
             return None
 
+    def _get_committed_file_sha(self, relpath: str) -> Optional[str]:
+        """
+        Get the git blob hash for the committed version of a file.
+
+        This only returns a SHA for files that exist in the committed HEAD.
+        This ensures:
+        1. Ephemeral/generated files (not in git) are NOT tracked
+        2. Files modified during workflow are tracked with their committed state
+
+        Returns None if the file is not committed in HEAD.
+        """
+        # Check cache first
+        cache_key = f"git_sha:{relpath}"
+        if cache_key in self._path_cache:
+            return self._path_cache[cache_key]
+
+        try:
+            result = subprocess.run(
+                ['git', 'ls-tree', 'HEAD', '--', relpath],
+                cwd=self.rootdir,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Output format: "100644 blob <sha>\t<filename>"
+                parts = result.stdout.strip().split()
+                if len(parts) >= 3 and parts[1] == 'blob':
+                    sha = parts[2]
+                    self._path_cache[cache_key] = sha
+                    return sha
+        except Exception:
+            pass
+
+        self._path_cache[cache_key] = None
+        return None
+
     def _get_module_file(self, module) -> Optional[str]:
         """Get the file path for a module, if it's a local file."""
         if module is None:
@@ -227,7 +265,13 @@ class DependencyTracker:
             return False
 
     def _track_file(self, filepath: str, mode: str) -> None:
-        """Track a file read operation."""
+        """Track a file read operation.
+
+        Only tracks files that are committed in git (exist in HEAD).
+        This ensures:
+        1. Ephemeral/generated files (like result_images/) are NOT tracked
+        2. Files modified during workflow are tracked with their committed state
+        """
         if not self._active or not self._current_context:
             return
 
@@ -244,8 +288,10 @@ class DependencyTracker:
         if relpath.endswith('.py'):
             return
 
-        # Compute file hash
-        sha = self._compute_file_sha(filepath)
+        # Get the committed SHA from git HEAD
+        # This returns None for files not in git (ephemeral/generated)
+        # and returns the committed state for files modified during workflow
+        sha = self._get_committed_file_sha(relpath)
         if not sha:
             return
 

@@ -1,28 +1,31 @@
 #!/usr/bin/env python
 """
-Integration test runner for pytest-ezmon.
+NetDB Integration test runner for pytest-ezmon.
+
+This runs the same scenarios as the local integration tests, but uses NetDB
+(remote server communication) instead of local SQLite databases.
+
+Tests are isolated using unique job_ids, and all data is cleaned up after each
+test to ensure idempotency.
 
 Usage:
-    python run_integration_tests.py [OPTIONS]
+    python run_netdb_integration_tests.py [OPTIONS]
 
 Examples:
-    # Run all scenarios with current Python
-    python run_integration_tests.py
+    # Run all scenarios with default server
+    python run_netdb_integration_tests.py
+
+    # Run with specific server
+    python run_netdb_integration_tests.py --server https://ezmon.aloiz.ch
 
     # Run specific scenario
-    python run_integration_tests.py --scenario modify_math_utils
-
-    # Run with specific Python version (verifies version matches)
-    python run_integration_tests.py --python python3.7
-
-    # Install ezmon from PyPI instead of local source
-    python run_integration_tests.py --ezmon-source pypi
-
-    # List available scenarios
-    python run_integration_tests.py --list
+    python run_netdb_integration_tests.py --scenario modify_math_utils
 
     # Verbose output
-    python run_integration_tests.py -v
+    python run_netdb_integration_tests.py -v
+
+    # List available scenarios
+    python run_netdb_integration_tests.py --list
 """
 
 import argparse
@@ -32,8 +35,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import List, Set, Tuple, Optional
+
+import requests
 
 # Add parent directory to path to import ezmon for installation
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -55,63 +62,85 @@ def is_valid_ezmon_repo(path: Path) -> bool:
     return all((path / f).exists() for f in required_files)
 
 
-def parse_python_version(version_string: str) -> Tuple[int, int]:
-    """
-    Parse a Python version string and return (major, minor).
-
-    Examples:
-        "Python 3.7.7" -> (3, 7)
-        "3.10.12" -> (3, 10)
-    """
-    match = re.search(r'(\d+)\.(\d+)', version_string)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    raise ValueError(f"Could not parse Python version from: {version_string}")
-
-
-def get_python_version_tuple(python_executable: str) -> Tuple[int, int]:
-    """Get the (major, minor) version tuple from a Python executable."""
-    result = subprocess.run(
-        [python_executable, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to get Python version: {result.stderr}")
-    version_str = result.stdout.strip()
-    return parse_python_version(version_str)
-
-
 class Colors:
     """ANSI color codes for terminal output."""
     GREEN = '\033[92m'
     RED = '\033[91m'
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
+    CYAN = '\033[96m'
     BOLD = '\033[1m'
     END = '\033[0m'
 
     @classmethod
     def disable(cls):
-        cls.GREEN = cls.RED = cls.YELLOW = cls.BLUE = cls.BOLD = cls.END = ''
+        cls.GREEN = cls.RED = cls.YELLOW = cls.BLUE = cls.CYAN = cls.BOLD = cls.END = ''
 
 
-class IntegrationTestRunner:
-    """Runs integration tests for pytest-ezmon."""
+class NetDBClient:
+    """Simple client for NetDB RPC operations."""
+
+    def __init__(self, server_url: str, auth_token: Optional[str] = None):
+        self.server_url = server_url.rstrip("/")
+        self.auth_token = auth_token
+        self.session = requests.Session()
+        if auth_token:
+            self.session.headers["Authorization"] = f"Bearer {auth_token}"
+
+    def reset_job(self, repo_id: str, job_id: str) -> dict:
+        """Reset (delete) all data for a specific job."""
+        response = self.session.post(
+            f"{self.server_url}/api/rpc/job/reset",
+            headers={
+                "X-Repo-ID": repo_id,
+                "X-Job-ID": job_id,
+                "Content-Type": "application/json",
+            },
+            json={},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def health_check(self) -> bool:
+        """Check if the server is reachable."""
+        try:
+            response = self.session.get(
+                f"{self.server_url}/health",
+                timeout=10,
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+
+class NetDBIntegrationTestRunner:
+    """Runs NetDB integration tests for pytest-ezmon."""
+
+    # Use a test-specific repo to avoid polluting real data
+    REPO_ID = "integration-tests/pytest-ezmon"
 
     def __init__(
         self,
         python_executable: str = sys.executable,
-        expected_version: Optional[Tuple[int, int]] = None,
         verbose: bool = False,
-        ezmon_source: str = "auto",
+        server_url: str = "http://localhost:8004",
+        auth_token: Optional[str] = None,
     ):
         self.python = python_executable
-        self.expected_version = expected_version
         self.verbose = verbose
-        self.ezmon_source = ezmon_source
+        self.server_url = server_url
+        # Use provided token, env var, or default local testing token
+        self.auth_token = (
+            auth_token
+            or os.environ.get("TESTMON_AUTH_TOKEN")
+            or "ezmon-ci-test-token-2024"  # Default for local testing
+        )
         self.temp_dir: Optional[Path] = None
-        self.actual_version: Optional[Tuple[int, int]] = None
+        self.client = NetDBClient(server_url, self.auth_token)
+
+        # Generate a unique job_id for this test run to ensure isolation
+        self.run_id = f"test-{uuid.uuid4().hex[:8]}"
 
     def log(self, msg: str, level: str = "info"):
         """Print a log message."""
@@ -123,32 +152,48 @@ class IntegrationTestRunner:
             print(f"{Colors.RED}x{Colors.END} {msg}")
         elif level == "warning":
             print(f"{Colors.YELLOW}!{Colors.END} {msg}")
+        elif level == "netdb":
+            print(f"{Colors.CYAN}@{Colors.END} {msg}")
         elif level == "debug" and self.verbose:
             print(f"  {Colors.BOLD}->{Colors.END} {msg}")
 
-    def verify_python_version(self) -> Tuple[bool, str]:
-        """
-        Verify that the Python interpreter version matches expected.
-        Returns (success, message).
-        """
+    def get_job_id(self, scenario_name: str) -> str:
+        """Get a unique job_id for a scenario."""
+        return f"{self.run_id}-{scenario_name}"
+
+    def check_server_connectivity(self) -> Tuple[bool, str]:
+        """Check if the NetDB server is reachable."""
         try:
-            self.actual_version = get_python_version_tuple(self.python)
+            if self.client.health_check():
+                return True, f"Server reachable: {self.server_url}"
+            else:
+                return False, f"Server health check failed: {self.server_url}"
         except Exception as e:
-            return False, f"Failed to get Python version: {e}"
+            return False, f"Server connectivity error: {e}"
 
-        actual_str = f"{self.actual_version[0]}.{self.actual_version[1]}"
-
-        if self.expected_version:
-            expected_str = f"{self.expected_version[0]}.{self.expected_version[1]}"
-            if self.actual_version != self.expected_version:
-                return False, f"Version mismatch: expected {expected_str}, got {actual_str}"
-            return True, f"Version verified: {actual_str}"
-
-        return True, f"Version: {actual_str} (no specific version required)"
+    def reset_job_data(self, job_id: str) -> bool:
+        """Reset all data for a job. Returns True if successful."""
+        try:
+            result = self.client.reset_job(self.REPO_ID, job_id)
+            if result.get("success"):
+                self.log(f"Reset job data: {job_id}", "netdb")
+                return True
+            else:
+                self.log(f"Failed to reset job: {result}", "error")
+                return False
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                # Job doesn't exist yet, that's fine
+                return True
+            self.log(f"HTTP error resetting job: {e}", "error")
+            return False
+        except Exception as e:
+            self.log(f"Error resetting job: {e}", "error")
+            return False
 
     def setup_workspace(self) -> Path:
         """Create a temporary workspace with the sample project."""
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="ezmon_integration_"))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="ezmon_netdb_integration_"))
         workspace = self.temp_dir / "sample_project"
 
         self.log(f"Creating workspace: {workspace}", "debug")
@@ -198,41 +243,19 @@ class IntegrationTestRunner:
             pip = venv_path / "bin" / "pip"
             python_venv = venv_path / "bin" / "python"
 
-        # Verify venv Python version matches expected
-        venv_version = get_python_version_tuple(str(python_venv))
-        if self.expected_version and venv_version != self.expected_version:
-            raise RuntimeError(
-                f"Venv Python version mismatch: expected "
-                f"{self.expected_version[0]}.{self.expected_version[1]}, "
-                f"got {venv_version[0]}.{venv_version[1]}"
-            )
-        self.log(f"Venv Python version verified: {venv_version[0]}.{venv_version[1]}", "debug")
-
         # Upgrade pip
         subprocess.run(
             [str(pip), "install", "--upgrade", "pip"],
             capture_output=not self.verbose,
         )
 
-        # Determine ezmon installation source
-        if self.ezmon_source == "auto":
-            if is_valid_ezmon_repo(REPO_ROOT):
-                install_spec = str(REPO_ROOT)
-                self.log(f"Installing pytest-ezmon from local repo: {REPO_ROOT}", "debug")
-            else:
-                install_spec = "pytest-ezmon"
-                self.log("Installing pytest-ezmon from PyPI (no local repo found)", "debug")
-        elif self.ezmon_source == "pypi":
-            install_spec = "pytest-ezmon"
-            self.log("Installing pytest-ezmon from PyPI", "debug")
-        else:
-            # Assume it's a path
-            install_spec = self.ezmon_source
-            self.log(f"Installing pytest-ezmon from: {install_spec}", "debug")
+        # Install ezmon from local repo
+        install_spec = str(REPO_ROOT) if is_valid_ezmon_repo(REPO_ROOT) else "pytest-ezmon"
+        self.log(f"Installing pytest-ezmon from: {install_spec}", "debug")
 
         # Install ezmon and its dependencies
         result = subprocess.run(
-            [str(pip), "install", install_spec, "requests", "networkx", "pyvis"],
+            [str(pip), "install", install_spec, "requests"],
             capture_output=True,
             text=True,
         )
@@ -250,15 +273,16 @@ class IntegrationTestRunner:
         self,
         workspace: Path,
         python_venv: Path,
+        job_id: str,
         extra_args: List[str] = None
     ) -> Tuple[int, str, str]:
-        """Run pytest with ezmon and return (returncode, stdout, stderr)."""
+        """Run pytest with ezmon in NetDB mode."""
         cmd = [
             str(python_venv), "-m", "pytest",
             "--ezmon",
             "-v",
-            "--color=no",  # Disable colors for consistent regex parsing
-            "--tb=short",  # Shorter tracebacks for cleaner output
+            "--color=no",
+            "--tb=short",
             "tests/",
         ]
         if extra_args:
@@ -266,16 +290,19 @@ class IntegrationTestRunner:
 
         self.log(f"Running: {' '.join(cmd)}", "debug")
 
-        # Create isolated environment for integration tests
-        # Explicitly disable NetDB to use local SQLite databases
+        # Set up NetDB environment
         test_env = {
             **os.environ,
             "PYTHONPATH": str(workspace),
-            "TESTMON_NET_ENABLED": "false",  # Force local mode for integration tests
+            # Enable NetDB mode
+            "TESTMON_NET_ENABLED": "true",
+            "TESTMON_SERVER": self.server_url,
+            "REPO_ID": self.REPO_ID,
+            "JOB_ID": job_id,
+            "RUN_ID": self.run_id,
         }
-        # Remove any NetDB-related env vars that might interfere
-        for key in ["TESTMON_SERVER", "TESTMON_AUTH_TOKEN", "REPO_ID", "JOB_ID", "RUN_ID"]:
-            test_env.pop(key, None)
+        if self.auth_token:
+            test_env["TESTMON_AUTH_TOKEN"] = self.auth_token
 
         result = subprocess.run(
             cmd,
@@ -293,26 +320,6 @@ class IntegrationTestRunner:
 
         return result.returncode, result.stdout, result.stderr
 
-    def verify_pytest_python_version(self, stdout: str) -> Tuple[bool, str]:
-        """
-        Verify that pytest ran with the expected Python version.
-        Parses the pytest header line like "platform darwin -- Python 3.7.7, pytest-7.4.4"
-        """
-        match = re.search(r'Python (\d+)\.(\d+)\.(\d+)', stdout)
-        if not match:
-            return False, "Could not find Python version in pytest output"
-
-        pytest_version = (int(match.group(1)), int(match.group(2)))
-
-        if self.expected_version and pytest_version != self.expected_version:
-            return False, (
-                f"Pytest Python version mismatch: expected "
-                f"{self.expected_version[0]}.{self.expected_version[1]}, "
-                f"got {pytest_version[0]}.{pytest_version[1]}"
-            )
-
-        return True, f"Pytest Python: {pytest_version[0]}.{pytest_version[1]}"
-
     def apply_modification(self, workspace: Path, mod: Modification):
         """Apply a single modification to the workspace."""
         file_path = workspace / mod.file
@@ -324,9 +331,8 @@ class IntegrationTestRunner:
             new_content = content.replace(mod.target, mod.content, 1)
             file_path.write_text(new_content)
             self.log(f"Modified: {mod.file}", "debug")
-            # Debug: show what changed
             if self.verbose:
-                self.log(f"  Changed '{mod.target}' to '{mod.content}'", "debug")
+                self.log(f"  Changed '{mod.target[:50]}...' to '{mod.content[:50]}...'", "debug")
 
         elif mod.action == "append":
             with open(file_path, "a") as f:
@@ -342,27 +348,21 @@ class IntegrationTestRunner:
             file_path.unlink()
             self.log(f"Deleted: {mod.file}", "debug")
 
-        # Force filesystem sync and wait for mtime to update
+        # Force filesystem sync
         os.sync()
-        import time
-        time.sleep(0.1)  # Ensure filesystem mtime is updated
+        time.sleep(0.1)
 
     def parse_test_results(self, stdout: str) -> Tuple[Set[str], int]:
         """
-        Parse pytest output to determine which individual tests were selected/deselected.
+        Parse pytest output to determine which tests were selected/deselected.
         Returns (selected_tests, deselected_count).
-
-        Ezmon tracks at the method level, so we verify individual test selection.
         """
         selected_tests = set()
         deselected_count = 0
 
-        # Match test results like "tests/test_math_utils.py::TestAdd::test_positive_numbers PASSED"
-        # Capture the full test path
         for match in re.finditer(r'(tests/test_\w+\.py::\S+)\s+(PASSED|FAILED|ERROR|SKIPPED)', stdout):
             selected_tests.add(match.group(1))
 
-        # Match deselected count: "X deselected"
         deselect_match = re.search(r'(\d+) deselected', stdout)
         if deselect_match:
             deselected_count = int(deselect_match.group(1))
@@ -371,29 +371,31 @@ class IntegrationTestRunner:
 
     def run_scenario(self, scenario: Scenario) -> Tuple[bool, str]:
         """
-        Run a single test scenario.
+        Run a single test scenario with NetDB.
         Returns (success, message).
         """
-        self.log(f"Running scenario: {Colors.BOLD}{scenario.name}{Colors.END}")
+        job_id = self.get_job_id(scenario.name)
+        self.log(f"Running scenario: {Colors.BOLD}{scenario.name}{Colors.END} (job: {job_id})")
         self.log(f"  {scenario.description}", "debug")
 
         try:
+            # Reset any existing data for this job first
+            self.reset_job_data(job_id)
+
             # Setup
             workspace = self.setup_workspace()
             python_venv = self.create_venv(workspace)
 
             # Initial run - build the ezmon database
             self.log("Running initial pytest --ezmon (building database)...", "debug")
-            returncode, stdout, stderr = self.run_pytest_ezmon(workspace, python_venv)
+            returncode, stdout, stderr = self.run_pytest_ezmon(workspace, python_venv, job_id)
 
             if returncode not in (0, 5):  # 0 = all passed, 5 = no tests collected
                 return False, f"Initial test run failed: {stderr}"
 
-            # Verify pytest used correct Python version
-            version_ok, version_msg = self.verify_pytest_python_version(stdout)
-            if not version_ok:
-                return False, version_msg
-            self.log(version_msg, "debug")
+            # Check for NetDB confirmation in output
+            if "Using NetDB" not in stdout and "NetDB" not in stderr:
+                self.log("Warning: NetDB mode may not be active", "warning")
 
             # Apply modifications
             for mod in scenario.modifications:
@@ -414,15 +416,14 @@ class IntegrationTestRunner:
 
             # Run again after modifications
             self.log("Running pytest --ezmon after modifications...", "debug")
-            returncode, stdout, stderr = self.run_pytest_ezmon(workspace, python_venv)
+            returncode, stdout, stderr = self.run_pytest_ezmon(workspace, python_venv, job_id)
 
-            # Parse results - returns individual test names
+            # Parse results
             selected_tests, deselected_count = self.parse_test_results(stdout)
 
             # Verify expectations
             errors = []
 
-            # Check expected selected tests
             for expected in scenario.expected_selected:
                 if expected not in selected_tests:
                     errors.append(f"Expected {expected} to be SELECTED but it wasn't")
@@ -430,7 +431,6 @@ class IntegrationTestRunner:
             if errors:
                 self.log(f"Selected: {', '.join(sorted(selected_tests)) or 'none'}", "debug")
 
-            # Check expected deselected tests
             for expected in scenario.expected_deselected:
                 if expected in selected_tests:
                     errors.append(f"Expected {expected} to be DESELECTED but it was selected")
@@ -443,25 +443,14 @@ class IntegrationTestRunner:
             if errors:
                 return False, "; ".join(errors)
 
-            # Format summary: show just test names (without full path) for readability
             selected_names = [t.split("::")[-1] for t in sorted(selected_tests)]
             return True, f"Selected: {selected_names or 'none'}, Deselected: {deselected_count}"
 
         finally:
+            # Clean up workspace and remote data
             self.cleanup_workspace()
-
-    def get_python_version(self) -> str:
-        """Get the exact Python version from the executable."""
-        try:
-            result = subprocess.run(
-                [self.python, "--version"],
-                capture_output=True,
-                text=True,
-            )
-            # Output is like "Python 3.10.12"
-            return result.stdout.strip() or result.stderr.strip()
-        except Exception as e:
-            return f"Unknown ({e})"
+            # Reset job data to ensure idempotency
+            self.reset_job_data(job_id)
 
     def run_all_scenarios(self, scenario_filter: Optional[str] = None) -> bool:
         """Run all (or filtered) scenarios and report results."""
@@ -474,22 +463,18 @@ class IntegrationTestRunner:
                 return False
             scenarios_to_run = {scenario_filter: SCENARIOS[scenario_filter]}
 
-        # Verify Python version before running any scenarios
-        version_ok, version_msg = self.verify_python_version()
-        if not version_ok:
-            self.log(version_msg, "error")
+        # Check server connectivity first
+        server_ok, server_msg = self.check_server_connectivity()
+        if not server_ok:
+            self.log(server_msg, "error")
             return False
 
-        python_version = self.get_python_version()
-
-        print(f"\n{Colors.BOLD}Running {len(scenarios_to_run)} integration test(s){Colors.END}\n")
+        print(f"\n{Colors.BOLD}Running {len(scenarios_to_run)} NetDB integration test(s){Colors.END}\n")
         print(f"Python executable: {self.python}")
-        print(f"Python version: {python_version}")
-        if self.expected_version:
-            print(f"Expected version: {self.expected_version[0]}.{self.expected_version[1]} {Colors.GREEN}(verified){Colors.END}")
-        print(f"Ezmon source: {self.ezmon_source}")
-        if self.ezmon_source == "auto" and is_valid_ezmon_repo(REPO_ROOT):
-            print(f"  (detected local repo: {REPO_ROOT})")
+        print(f"NetDB server: {self.server_url}")
+        print(f"Repo ID: {self.REPO_ID}")
+        print(f"Run ID: {self.run_id}")
+        print(f"Auth token: {'configured' if self.auth_token else 'NOT SET (may fail)'}")
         print()
         print("-" * 60)
 
@@ -510,16 +495,16 @@ class IntegrationTestRunner:
         failed = len(results) - passed
 
         if failed == 0:
-            print(f"\n{Colors.GREEN}{Colors.BOLD}All {passed} scenario(s) passed!{Colors.END}")
+            print(f"\n{Colors.GREEN}{Colors.BOLD}All {passed} NetDB scenario(s) passed!{Colors.END}")
             return True
         else:
-            print(f"\n{Colors.RED}{Colors.BOLD}{failed}/{len(results)} scenario(s) failed{Colors.END}")
+            print(f"\n{Colors.RED}{Colors.BOLD}{failed}/{len(results)} NetDB scenario(s) failed{Colors.END}")
             return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Integration test runner for pytest-ezmon",
+        description="NetDB integration test runner for pytest-ezmon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -529,18 +514,18 @@ def main():
         help="Python executable to use (default: current Python)",
     )
     parser.add_argument(
-        "--expect-version",
-        help="Expected Python version (e.g., '3.7'). Test fails if version doesn't match.",
+        "--server", "-s",
+        default="http://localhost:8004",
+        help="NetDB server URL (default: http://localhost:8004 for local testing)",
     )
     parser.add_argument(
-        "--scenario", "-s",
+        "--token", "-t",
+        default="ezmon-ci-test-token-2024",  # Default CI token for local testing
+        help="Auth token (default: local testing token)",
+    )
+    parser.add_argument(
+        "--scenario",
         help="Run only this scenario (default: all)",
-    )
-    parser.add_argument(
-        "--ezmon-source", "-e",
-        default="auto",
-        help="Where to install ezmon from: 'auto' (detect local repo or use PyPI), "
-             "'pypi' (always use PyPI), or a path to a local repo (default: auto)",
     )
     parser.add_argument(
         "--list", "-l",
@@ -570,20 +555,11 @@ def main():
             print(f"    {scenario.description}\n")
         return 0
 
-    # Parse expected version if provided
-    expected_version = None
-    if args.expect_version:
-        try:
-            expected_version = parse_python_version(args.expect_version)
-        except ValueError as e:
-            print(f"{Colors.RED}Error: {e}{Colors.END}")
-            return 1
-
-    runner = IntegrationTestRunner(
+    runner = NetDBIntegrationTestRunner(
         python_executable=args.python,
-        expected_version=expected_version,
         verbose=args.verbose,
-        ezmon_source=args.ezmon_source,
+        server_url=args.server,
+        auth_token=args.token,
     )
 
     success = runner.run_all_scenarios(args.scenario)
