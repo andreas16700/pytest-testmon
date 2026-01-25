@@ -197,10 +197,22 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                     }}
                                 />
                                 <div className="flex flex-col">
-                                    <span className="font-semibold">Run #{run.id}</span>
+                                    <div className="flex items-center gap-2">
+                                        <span className="font-semibold">Run #{run.id}</span>
+                                        {run.tests_total != null ? (
+                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700">
+                                                {run.tests_total - (run.tests_skipped || 0)} ran
+                                                {run.tests_skipped > 0 && `, ${run.tests_skipped} skipped`}
+                                            </span>
+                                        ) : (
+                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700">
+                                                no data
+                                            </span>
+                                        )}
+                                    </div>
                                     <span className="text-[10px] text-gray-400">
                                         {new Date(run.created).toLocaleString()}
-                                        {run.repo_run_id && <span className="ml-2 text-gray-500">(GH: {run.repo_run_id})</span>}
+                                        {run.repo_run_id && <span className="ml-1 text-gray-500">(GH: {run.repo_run_id})</span>}
                                     </span>
                                 </div>
                             </label>

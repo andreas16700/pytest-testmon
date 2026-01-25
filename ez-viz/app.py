@@ -615,11 +615,19 @@ def get_run_infos(db_path):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        # Get both internal id and repo_run_id
+        # Get run data with stats from run_infos table
         cursor.execute("""
-            SELECT id, repo_run_id, create_date
-            FROM run_uid
-            ORDER BY create_date DESC
+            SELECT
+                ru.id,
+                ru.repo_run_id,
+                ru.create_date,
+                ri.tests_all,
+                ri.tests_saved,
+                ri.run_time_all,
+                ri.run_time_saved
+            FROM run_uid ru
+            LEFT JOIN run_infos ri ON ru.id = ri.run_uid
+            ORDER BY ru.create_date DESC
         """)
         rows = cursor.fetchall()
 
@@ -629,7 +637,11 @@ def get_run_infos(db_path):
             {
                 "id": row[0],  # Always use internal id for uniqueness
                 "repo_run_id": row[1],  # External ID for reference (may be shared across matrix jobs)
-                "created": row[2]
+                "created": row[2],
+                "tests_total": row[3],  # Total tests in this run
+                "tests_skipped": row[4],  # Tests skipped (saved) by ezmon
+                "time_total": row[5],  # Total test time
+                "time_saved": row[6],  # Time saved by skipping
             }
             for row in rows
         ]
