@@ -80,18 +80,98 @@ def get_logger(name):
 logger = get_logger(__name__)
 
 
-def get_system_packages(ignore=None):
+def is_local_package(pkg_name: str, rootdir: str) -> bool:
+    """
+    Check if a package name corresponds to a local project package.
+
+    This handles the case where a package is installed (e.g., pip install -e .)
+    but is actually the project being tested. For example, when testing
+    matplotlib, 'matplotlib' should NOT be treated as an external dependency
+    because matplotlib IS the local project.
+
+    We detect this by checking if there's a Python package directory
+    in the project that matches the package name.
+    """
+    if not rootdir:
+        return False
+
+    # Normalize package name (pip uses - but directories use _)
+    normalized_name = pkg_name.replace('-', '_').lower()
+
+    # Look for a package directory matching this name anywhere in the project
+    # Common patterns:
+    # - src/packagename/
+    # - lib/packagename/
+    # - packagename/
+    search_dirs = ['', 'src', 'lib', 'source', 'packages']
+
+    for search_dir in search_dirs:
+        if search_dir:
+            pkg_path = os.path.join(rootdir, search_dir, pkg_name)
+            pkg_path_normalized = os.path.join(rootdir, search_dir, normalized_name)
+        else:
+            pkg_path = os.path.join(rootdir, pkg_name)
+            pkg_path_normalized = os.path.join(rootdir, normalized_name)
+
+        # Check both original and normalized names
+        for path in [pkg_path, pkg_path_normalized]:
+            if os.path.isdir(path):
+                # Check for regular package (with __init__.py)
+                init_file = os.path.join(path, '__init__.py')
+                if os.path.exists(init_file):
+                    return True
+
+                # Check for namespace package (Python 3.3+)
+                # A directory with Python files or subdirectories with __init__.py
+                try:
+                    for entry in os.listdir(path):
+                        entry_path = os.path.join(path, entry)
+                        if entry.endswith('.py'):
+                            return True
+                        if os.path.isdir(entry_path):
+                            sub_init = os.path.join(entry_path, '__init__.py')
+                            if os.path.exists(sub_init):
+                                return True
+                except OSError:
+                    pass
+
+            # Also check for single-file modules
+            py_file = path + '.py'
+            if os.path.exists(py_file):
+                return True
+
+    return False
+
+
+def get_system_packages(ignore=None, rootdir=None):
+    """
+    Get system packages as a string, excluding ignored and local packages.
+
+    Args:
+        ignore: Set of package names to ignore
+        rootdir: Project root directory - packages found here are auto-ignored
+    """
     if not ignore:
-        ignore = set(("pytest-ezmon", "pytest-ezmon"))
-    return ", ".join(
-        sorted(
-            {
-                f"{package} {version}"
-                for (package, version) in get_system_packages_raw()
-                if not package in ignore
-            }
-        )
-    )
+        ignore = set(("pytest-ezmon", "pytest-testmon"))
+    else:
+        ignore = set(ignore)
+
+    packages = []
+    local_packages_found = []  # Debug: track which packages were detected as local
+    for package, version in get_system_packages_raw():
+        if package in ignore:
+            continue
+        # Skip local packages (the project being tested)
+        if rootdir and is_local_package(package, rootdir):
+            local_packages_found.append(package)
+            continue
+        packages.append(f"{package} {version}")
+
+    # Debug output
+    if rootdir:
+        logger.info(f"get_system_packages: rootdir={rootdir}, local_packages={local_packages_found}")
+
+    return ", ".join(sorted(set(packages)))
 
 
 def drop_patch_version(system_packages):

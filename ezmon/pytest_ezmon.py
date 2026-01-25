@@ -159,7 +159,11 @@ def init_testmon_data(config: Config):
     )
     ignore_dependencies = config.getini("testmon_ignore_dependencies")
 
-    system_packages = get_system_packages(ignore=ignore_dependencies)
+    # Pass rootdir to auto-detect and exclude local packages (the project being tested)
+    system_packages = get_system_packages(
+        ignore=ignore_dependencies,
+        rootdir=config.rootdir.strpath
+    )
 
     
     testmon_data = TestmonData(
