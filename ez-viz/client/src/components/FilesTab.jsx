@@ -1,21 +1,17 @@
-import React from "react";
+import React, { useState } from "react";
 import FileItem from "./FileItem.jsx";
 import SearchBox from "./SearchBox.jsx";
+import FilesDependencyGraphView from "./FilesDependencyGraphView.jsx";
 
 function FilesTab({currentRepo, currentJob, currentRun, allFiles, search, setSearch, showFileDetails}) {
+    const [showGraph, setShowGraph] = useState(false);
 
     const handleShowGraph = () => {
         if (!currentRepo || !currentJob || !currentRun) {
             console.error("Cannot show graph: Missing repo/job/run info");
             return;
         }
-
-        try {
-            const graphUrl = `/api/dependencyGraph/${currentRepo}/${currentJob}/${currentRun}`;
-            window.open(graphUrl, "_blank", "noopener, noreferrer");
-        } catch (error) {
-            console.error("Failed to open dependency graph:", error);
-        }
+        setShowGraph(!showGraph);
     };
 
     const filteredFiles = allFiles.map((runData) => ({
@@ -41,7 +37,7 @@ function FilesTab({currentRepo, currentJob, currentRun, allFiles, search, setSea
                         onClick={handleShowGraph}
                         style={{
                             padding: "8px 16px",
-                            backgroundColor: "#007bff",
+                            backgroundColor: showGraph ? "#6c757d" : "#007bff",
                             color: "white",
                             border: "none",
                             borderRadius: "4px",
@@ -49,10 +45,22 @@ function FilesTab({currentRepo, currentJob, currentRun, allFiles, search, setSea
                             fontSize: "14px"
                         }}
                     >
-                        Show Dependency Graph
+                        {showGraph ? "Hide Dependency Graph" : "Show Dependency Graph"}
                     </button>
                 </div>
             </div>
+
+            {showGraph && (
+                <div style={{ marginBottom: "24px" }}>
+                    <FilesDependencyGraphView
+                        repoId={currentRepo}
+                        jobId={currentJob}
+                        runId={currentRun}
+                        onOpenFile={showFileDetails}
+                        height={500}
+                    />
+                </div>
+            )}
 
             <div className="grid gap-3">
                 {filteredFiles.flatMap((runData) =>
