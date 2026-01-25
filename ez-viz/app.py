@@ -3385,6 +3385,73 @@ def rpc_job_reset():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/rpc/file_dependencies/delete_pattern", methods=["POST"])
+@rpc_auth_required
+def rpc_file_dependencies_delete_pattern():
+    """
+    Delete file dependencies matching a pattern.
+
+    This is used to clean up spurious file dependencies (e.g., result_images/)
+    that were incorrectly tracked.
+    """
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    pattern = request.args.get("pattern")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not pattern:
+        return jsonify({"error": "Missing required parameters (repo_id, job_id, pattern)"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"success": True, "deleted": 0, "message": "Database does not exist"})
+
+        conn = sqlite3.connect(str(db_path), timeout=60)
+
+        # Count before deletion
+        count_before = conn.execute(
+            "SELECT COUNT(*) FROM file_dependency WHERE filename LIKE ?",
+            (pattern,)
+        ).fetchone()[0]
+
+        # Get IDs of file dependencies to delete
+        ids_to_delete = [
+            row[0] for row in conn.execute(
+                "SELECT id FROM file_dependency WHERE filename LIKE ?",
+                (pattern,)
+            )
+        ]
+
+        if ids_to_delete:
+            # Delete from test_execution_file_dependency first (foreign key)
+            placeholders = ",".join("?" * len(ids_to_delete))
+            conn.execute(
+                f"DELETE FROM test_execution_file_dependency WHERE file_dependency_id IN ({placeholders})",
+                ids_to_delete
+            )
+
+            # Delete from file_dependency
+            conn.execute(
+                f"DELETE FROM file_dependency WHERE id IN ({placeholders})",
+                ids_to_delete
+            )
+
+            conn.commit()
+
+        conn.close()
+
+        log.info("rpc_file_dependencies_delete_pattern deleted %d entries matching '%s' for repo_id=%s job_id=%s",
+                 count_before, pattern, repo_id, job_id)
+
+        return jsonify({"success": True, "deleted": count_before, "pattern": pattern})
+
+    except Exception as e:
+        log_exception("rpc_file_dependencies_delete_pattern", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/rpc/file_dependencies/list", methods=["GET"])
 @rpc_auth_required
 def rpc_file_dependencies_list():
