@@ -37,14 +37,18 @@ def _is_docstring_node(node) -> bool:
     Docstrings appear as the first statement in module/class/function bodies
     and are represented as Expr(value=Constant(value='...')).
     """
+    import sys
+
     if not isinstance(node, ast.Expr):
         return False
     # Python 3.8+: Constant node
     if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
         return True
-    # Python 3.7: Str node (deprecated but still supported)
-    if hasattr(ast, 'Str') and isinstance(node.value, ast.Str):
-        return True
+    # Python 3.7: ast.Str node (deprecated in 3.8, removed in 3.14)
+    # Only check on Python < 3.12 to avoid DeprecationWarning
+    if sys.version_info < (3, 12):
+        if hasattr(ast, 'Str') and isinstance(node.value, ast.Str):
+            return True
     return False
 
 
