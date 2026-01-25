@@ -57,10 +57,20 @@ Fingerprints:
 **Fingerprint creation process:**
 ```
 Source File → AST Parse → Extract Blocks → For each block:
-  1. Strip comment lines
-  2. Calculate CRC32(code_content)
-  3. Store (start_line, end_line, checksum, function_name)
+  1. Convert block to AST representation (strips # comments automatically)
+  2. Strip docstrings from AST representation
+  3. Calculate CRC32(normalized_ast_content)
+  4. Store (start_line, end_line, checksum, function_name)
 ```
+
+**What affects fingerprints:**
+| Change Type | Affects Fingerprint | Triggers Tests |
+|-------------|---------------------|----------------|
+| `# comment` lines | No (stripped by AST parser) | No |
+| `"""docstring"""` | No (explicitly stripped) | No |
+| Code logic changes | Yes | Yes |
+| Function signature | Yes | Yes |
+| Import statements | Yes (module-level) | Yes |
 
 ### Test Selection Flow
 
@@ -252,7 +262,8 @@ def match_fingerprint(module: Module, fingerprint):
 This approach:
 - **Catches removals/modifications**: Any change to a block invalidates the fingerprint
 - **Allows additions**: New code blocks don't invalidate existing fingerprints
-- **Ignores comments**: Comment-only changes don't trigger re-runs
+- **Ignores comments**: `# comment` lines are stripped by Python's AST parser
+- **Ignores docstrings**: `"""docstring"""` content is explicitly stripped from fingerprints
 
 ## Method-Level Fingerprinting
 

@@ -152,6 +152,96 @@ def foo():
         assert result.strip() == ""
 
 
+class TestDocstringStripping:
+    """Tests for docstring stripping before checksum calculation.
+
+    Docstrings should NOT affect fingerprints because:
+    1. They don't change code behavior
+    2. Documentation changes shouldn't trigger test re-runs
+    """
+
+    def test_module_docstring_stripped(self):
+        """Module docstrings should not affect checksums."""
+        code_with_docstring = '''
+"""Module docstring."""
+
+def foo():
+    return 42
+'''
+        code_without_docstring = '''
+def foo():
+    return 42
+'''
+        m1 = Module(source_code=code_with_docstring)
+        m2 = Module(source_code=code_without_docstring)
+        assert m1.checksums == m2.checksums
+
+    def test_function_docstring_stripped(self):
+        """Function docstrings should not affect checksums."""
+        code_with_docstring = '''
+def foo():
+    """This function does something."""
+    return 42
+'''
+        code_without_docstring = '''
+def foo():
+    return 42
+'''
+        m1 = Module(source_code=code_with_docstring)
+        m2 = Module(source_code=code_without_docstring)
+        assert m1.checksums == m2.checksums
+
+    def test_class_docstring_stripped(self):
+        """Class docstrings should not affect checksums."""
+        code_with_docstring = '''
+class Foo:
+    """This class does something."""
+
+    def method(self):
+        return 42
+'''
+        code_without_docstring = '''
+class Foo:
+    def method(self):
+        return 42
+'''
+        m1 = Module(source_code=code_with_docstring)
+        m2 = Module(source_code=code_without_docstring)
+        assert m1.checksums == m2.checksums
+
+    def test_different_docstrings_same_checksum(self):
+        """Changing only the docstring should not change the checksum."""
+        code_v1 = '''
+def foo():
+    """Version 1 docstring."""
+    return 42
+'''
+        code_v2 = '''
+def foo():
+    """Completely different docstring with more details about the function."""
+    return 42
+'''
+        m1 = Module(source_code=code_v1)
+        m2 = Module(source_code=code_v2)
+        assert m1.checksums == m2.checksums
+
+    def test_logic_change_still_detected(self):
+        """Actual code changes should still be detected even with docstrings."""
+        code_v1 = '''
+def foo():
+    """Same docstring."""
+    return 42
+'''
+        code_v2 = '''
+def foo():
+    """Same docstring."""
+    return 43  # Changed!
+'''
+        m1 = Module(source_code=code_v1)
+        m2 = Module(source_code=code_v2)
+        assert m1.checksums != m2.checksums
+
+
 class TestChecksums:
     """Tests for checksum calculation and conversion."""
 

@@ -31,6 +31,23 @@ def debug_blob_to_code(blob):
     return blob.split(";\n")
 
 
+def _is_docstring_node(node) -> bool:
+    """Check if an AST node is a docstring (Expr containing a Constant string).
+
+    Docstrings appear as the first statement in module/class/function bodies
+    and are represented as Expr(value=Constant(value='...')).
+    """
+    if not isinstance(node, ast.Expr):
+        return False
+    # Python 3.8+: Constant node
+    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+        return True
+    # Python 3.7: Str node (deprecated but still supported)
+    if hasattr(ast, 'Str') and isinstance(node.value, ast.Str):
+        return True
+    return False
+
+
 def _strip_comment_lines(text: str) -> str:
     """Remove lines that are comments (after leading whitespace, start with '#')."""
     kept = []
@@ -168,6 +185,12 @@ class Module:
                 transform_into_block = (
                     class_name in ("AsyncFunctionDef", "FunctionDef", "Module")
                 ) and field_name == "body"
+                # Strip docstrings from class bodies (they're in 'body' field)
+                # Class bodies aren't transformed into blocks, but we still want
+                # to ignore docstrings for fingerprint stability
+                if class_name == "ClassDef" and field_name == "body":
+                    if isinstance(field_value, list) and field_value and _is_docstring_node(field_value[0]):
+                        field_value = field_value[1:]  # Skip the docstring
                 fields.append(
                     (
                         field_name,
@@ -182,9 +205,14 @@ class Module:
             return f"{class_name}({', '.join((field_value for field_name, field_value in fields))})"
         if isinstance(node, list):
             representations = []
-            for i, item in enumerate(node):
+            # Skip docstrings at the start of bodies (into_block=True means we're in a body)
+            # Docstrings are the first Expr(Constant(str)) in module/class/function bodies
+            items_to_process = node
+            if into_block and node and _is_docstring_node(node[0]):
+                items_to_process = node[1:]  # Skip the docstring
+            for i, item in enumerate(items_to_process):
                 representations.append(
-                    self.dump_and_block(item, _next_lineno(node, i, end))
+                    self.dump_and_block(item, _next_lineno(items_to_process, i, end))
                 )
             if into_block and node:
                 # Use last child's end_lineno only if end is not available (None)
