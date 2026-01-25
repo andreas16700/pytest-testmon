@@ -342,6 +342,15 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         # where the fsha is not in database.
         new_changed_file_data = self.db.fetch_unknown_files(files_fshas, self.exec_id)
 
+        # Debug: Log changed files
+        if new_changed_file_data:
+            from ezmon.common import logger
+            logger.info(f"DEBUG: {len(new_changed_file_data)} files marked as changed")
+            for f in sorted(new_changed_file_data)[:10]:  # Show first 10
+                logger.info(f"DEBUG:   changed file: {f}")
+            if len(new_changed_file_data) > 10:
+                logger.info(f"DEBUG:   ... and {len(new_changed_file_data) - 10} more")
+
         # Get the mhashes for the files from above
         files_mhashes = collect_mhashes(self.source_tree, new_changed_file_data)
 
