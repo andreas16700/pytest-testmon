@@ -30,51 +30,78 @@ jobs:
       - name: Ensure deploy state dir
         run: mkdir -p "${{ env.DEPLOY_STATE_DIR }}"
 
-      - name: Detect backend changes since last success
+      - name: Detect changes since last success
         id: changes
         shell: bash
         run: |
           set -euo pipefail
           CURRENT_COMMIT=$(git rev-parse HEAD)
-          LAST_SUCCESS_FILE="${{ env.DEPLOY_STATE_DIR }}/backend-success"
+          LAST_SUCCESS_FILE="${{ env.DEPLOY_STATE_DIR }}/deploy-success"
           LAST_SUCCESS=""
           if [[ -f "$LAST_SUCCESS_FILE" ]]; then
             LAST_SUCCESS=$(cat "$LAST_SUCCESS_FILE" || true)
           fi
 
-          # Patterns that affect backend runtime
-          # - python, gunicorn/pm2/ecosystem/configs, templates/static for Flask
-          # Note: requirements.txt is at ez-viz/requirements.txt, not repo root
-          CHANGED_FILES=""
+          # First deploy - everything needs to run
           if [[ -z "$LAST_SUCCESS" ]]; then
-            echo "No previous successful deploy; treating as changed."
-            CHANGED_FILES="(first deploy)"
-          else
-            CHANGED_FILES=$(git diff --name-only "$LAST_SUCCESS" "$CURRENT_COMMIT" | \
-              grep -E '\.(py)$|requirements\.txt$|^ecosystem\.config\.(cjs|js)$|^app\.py$|^templates/|^static/' || true)
+            echo "No previous successful deploy; treating as first deploy."
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+            echo "any_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          if [[ -n "$CHANGED_FILES" ]]; then
+          # Get all changed files
+          ALL_CHANGES=$(git diff --name-only "$LAST_SUCCESS" "$CURRENT_COMMIT" || true)
+
+          if [[ -z "$ALL_CHANGES" ]]; then
+            echo "📊 No changes since last successful deployment"
+            echo "backend=false" >> "$GITHUB_OUTPUT"
+            echo "frontend=false" >> "$GITHUB_OUTPUT"
+            echo "deps=false" >> "$GITHUB_OUTPUT"
+            echo "any_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Changed files since last deploy:"
+          echo "$ALL_CHANGES" | sed 's/^/  - /'
+
+          # Backend changes (Python code) - requires PM2 restart
+          BACKEND_CHANGES=$(echo "$ALL_CHANGES" | \
+            grep -E '\.(py)$|^ecosystem\.config\.(cjs|js)$|^templates/|^static/' || true)
+          if [[ -n "$BACKEND_CHANGES" ]]; then
             echo "backend=true" >> "$GITHUB_OUTPUT"
-            echo "Changed files:"
-            echo "$CHANGED_FILES" | sed 's/^/  - /'
+            echo "🐍 Backend changes detected"
           else
             echo "backend=false" >> "$GITHUB_OUTPUT"
-            echo "📊 No backend changes since last successful deployment"
           fi
 
-          # Did requirements.txt change? (file is at ez-viz/requirements.txt)
-          if [[ -z "$LAST_SUCCESS" ]]; then
-            echo "deps=true" >> "$GITHUB_OUTPUT"
+          # Frontend changes (React build) - served directly, no restart needed
+          FRONTEND_CHANGES=$(echo "$ALL_CHANGES" | grep -E 'client/dist/' || true)
+          if [[ -n "$FRONTEND_CHANGES" ]]; then
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+            echo "⚛️  Frontend changes detected"
           else
-            if git diff --name-only "$LAST_SUCCESS" "$CURRENT_COMMIT" | grep -q 'requirements\.txt$'; then
-              echo "deps=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "deps=false" >> "$GITHUB_OUTPUT"
-            fi
+            echo "frontend=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Prepare venv & deps (if needed)
+          # Dependency changes
+          if echo "$ALL_CHANGES" | grep -q 'requirements\.txt$'; then
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+            echo "📦 Dependencies changed"
+          else
+            echo "deps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Any deployment-relevant changes?
+          if [[ -n "$BACKEND_CHANGES" ]] || [[ -n "$FRONTEND_CHANGES" ]]; then
+            echo "any_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare venv & deps (if backend changed)
         if: steps.changes.outputs.backend == 'true'
         shell: bash
         run: |
@@ -94,7 +121,7 @@ jobs:
             echo "📦 requirements.txt unchanged — skipping pip install"
           fi
 
-      - name: PM2 start or graceful reload
+      - name: PM2 start or graceful reload (if backend changed)
         if: steps.changes.outputs.backend == 'true'
         shell: bash
         run: |
@@ -116,8 +143,14 @@ jobs:
 
           pm2 save
 
+      - name: Log frontend-only deploy
+        if: steps.changes.outputs.frontend == 'true' && steps.changes.outputs.backend == 'false'
+        run: |
+          echo "⚛️  Frontend-only changes - files deployed via git pull"
+          echo "   No PM2 restart needed (Flask serves static files directly)"
+
       - name: Health check
-        if: steps.changes.outputs.backend == 'true'
+        if: steps.changes.outputs.any_changes == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -141,8 +174,8 @@ jobs:
             ELAPSED=$((ELAPSED+SLEEP))
           done
 
-      - name: Mark backend success
-        if: steps.changes.outputs.backend == 'true' && success()
+      - name: Mark deployment success
+        if: steps.changes.outputs.any_changes == 'true' && success()
         run: |
-          git rev-parse HEAD > "${{ env.DEPLOY_STATE_DIR }}/backend-success"
+          git rev-parse HEAD > "${{ env.DEPLOY_STATE_DIR }}/deploy-success"
           echo "✅ Deployment marker updated"
