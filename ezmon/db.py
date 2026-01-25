@@ -419,6 +419,10 @@ class DB:  # pylint: disable=too-many-public-methods
             return
 
         with self.con as con:
+            # Ensure the dependency_graph table exists (for databases created
+            # before this feature was added)
+            con.executescript(self._create_dependency_graph_statement())
+
             # Use INSERT OR IGNORE to handle duplicates gracefully
             con.executemany(
                 """INSERT OR IGNORE INTO dependency_graph

@@ -615,17 +615,18 @@ def get_run_infos(db_path):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        # Adjust table/column names if needed
+        # Get both internal id and repo_run_id, use internal id as fallback
         cursor.execute("""
-            SELECT repo_run_id, create_date
+            SELECT id, repo_run_id, create_date
             FROM run_uid
             ORDER BY create_date DESC
         """)
         rows = cursor.fetchall()
 
-        # rows: [(12, '2025-12-22 18:01:23'), (11, '2025-12-22 17:50:01'), ...]
+        # Use repo_run_id if available, otherwise use internal id
+        # This ensures runs without external IDs (local runs) can still be identified
         runs = [
-            {"id": row[0], "created": row[1]}
+            {"id": row[1] if row[1] is not None else row[0], "created": row[2]}
             for row in rows
         ]
         return runs
@@ -1473,11 +1474,19 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
     cur = conn.cursor()
 
     # Get the run_uid for this run_id
+    # First try repo_run_id (external CI run ID), then try direct id match
+    # (for local runs without external IDs)
     run_uid_row = cur.execute(
         "SELECT id FROM run_uid WHERE repo_run_id = ?", (run_id,)
     ).fetchone()
 
-    # If no specific run_uid found, try to get the latest one
+    # If not found by repo_run_id, try direct id match
+    if not run_uid_row:
+        run_uid_row = cur.execute(
+            "SELECT id FROM run_uid WHERE id = ?", (run_id,)
+        ).fetchone()
+
+    # If still not found, fall back to latest
     if not run_uid_row:
         run_uid_row = cur.execute("SELECT MAX(id) as id FROM run_uid").fetchone()
 
