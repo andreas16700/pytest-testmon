@@ -615,7 +615,7 @@ def get_run_infos(db_path):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        # Get both internal id and repo_run_id, use internal id as fallback
+        # Get both internal id and repo_run_id
         cursor.execute("""
             SELECT id, repo_run_id, create_date
             FROM run_uid
@@ -623,10 +623,14 @@ def get_run_infos(db_path):
         """)
         rows = cursor.fetchall()
 
-        # Use repo_run_id if available, otherwise use internal id
-        # This ensures runs without external IDs (local runs) can still be identified
+        # Always use internal id for uniqueness (handles matrix jobs with same repo_run_id)
+        # Include repo_run_id for display/reference when available
         runs = [
-            {"id": row[1] if row[1] is not None else row[0], "created": row[2]}
+            {
+                "id": row[0],  # Always use internal id for uniqueness
+                "repo_run_id": row[1],  # External ID for reference (may be shared across matrix jobs)
+                "created": row[2]
+            }
             for row in rows
         ]
         return runs

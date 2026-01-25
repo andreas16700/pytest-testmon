@@ -197,9 +197,10 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                     }}
                                 />
                                 <div className="flex flex-col">
-                                    <span className="font-semibold">{run.id}</span>
+                                    <span className="font-semibold">Run #{run.id}</span>
                                     <span className="text-[10px] text-gray-400">
                                         {new Date(run.created).toLocaleString()}
+                                        {run.repo_run_id && <span className="ml-2 text-gray-500">(GH: {run.repo_run_id})</span>}
                                     </span>
                                 </div>
                             </label>
