@@ -321,6 +321,7 @@ def changed_message(
 
 def pytest_unconfigure(config):
     # Close and commit database FIRST (flush all changes to disk)
+    logger.info("pytest_configure function!")
     if hasattr(config, "testmon_data"):
         try:
             if hasattr(config.testmon_data, 'db') and hasattr(config.testmon_data.db, 'con'):
@@ -349,7 +350,9 @@ def pytest_unconfigure(config):
     # Upload if sync is enabled - AFTER database is committed and closed
     if should_sync():
         testmon_file = get_testmon_file(config)
-        graph_file = testmon_file.parent / "dependency_graph.html"
+        graph_file = testmon_file.parent / f"dependency_graph_{os.getenv('RUN_ID')}.html"
+        logger.info(f"Testmon file path: {testmon_file}")
+        logger.info(f"Graph File Path: {graph_file}")
         # Give file system time to flush
         time.sleep(0.2)
         
@@ -636,7 +639,10 @@ class TestmonSelect:
 
         if self.config.getoption("ezmon_graph"):
             root_dir = self.config.rootdir.strpath
+            logger.info(f"Root Directory: {root_dir}")
             logger.info("Generating dependency graph...")
+            run_id = os.getenv("RUN_ID")
+            logger.info(f"Run ID: {run_id}")
             ezmon_graph.generate_graph(root_dir)
 
     @pytest.hookimpl(trylast=True)

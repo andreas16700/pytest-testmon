@@ -44,6 +44,8 @@ def get_imports(file_path):
                 for alias in node.names:
                     imports.add(f"{node.module}.{alias.name}")
                 imports.add(node.module)
+
+    logger.info(f"The list of imports: {list(imports)}")
     return list(imports)
 
 def generate_graph(root_dir, output_file="dependency_graph.html"):
@@ -63,6 +65,7 @@ def generate_graph(root_dir, output_file="dependency_graph.html"):
 
     logger.info(f"Scanning project at {root_dir}.")
     data = scan_project(root_dir)
+    logger.info(f"Scanned Project Data: {data}")
 
     logger.info("Building graph...")
     G = nx.DiGraph()
@@ -121,6 +124,7 @@ def generate_graph(root_dir, output_file="dependency_graph.html"):
     net.from_nx(G)
     net.show_buttons(filter_=['physics'])
 
+    output_file = f"dependency_graph_{os.getenv('RUN_ID')}.html"
     output_path = os.path.join(root_dir, output_file)
     net.save_graph(output_path)
     logger.info(f"Dependency graph saved to: {output_path}")
