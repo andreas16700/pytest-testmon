@@ -266,11 +266,16 @@ class IntegrationTestRunner:
 
         self.log(f"Running: {' '.join(cmd)}", "debug")
 
-        # Inherit environment (including NetDB settings if present)
+        # Create isolated environment for integration tests
+        # Explicitly disable NetDB to use local SQLite databases
         test_env = {
             **os.environ,
             "PYTHONPATH": str(workspace),
+            "TESTMON_NET_ENABLED": "false",  # Force local mode for integration tests
         }
+        # Remove any NetDB-related env vars that might interfere
+        for key in ["TESTMON_SERVER", "TESTMON_AUTH_TOKEN", "REPO_ID", "JOB_ID", "RUN_ID"]:
+            test_env.pop(key, None)
 
         result = subprocess.run(
             cmd,
