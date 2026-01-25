@@ -1509,7 +1509,15 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
         (run_uid,),
     )
 
-    for row in cur.fetchall():
+    rows = cur.fetchall()
+
+    # If dependency_graph table exists but has no data for this run,
+    # fall back to legacy approach (for runs before graph collection was added)
+    if not rows:
+        conn.close()
+        return _get_file_dependencies_legacy(repo_id, job_id, run_id)
+
+    for row in rows:
         source = row["source_file"]
         edge_type = row["edge_type"]
 
