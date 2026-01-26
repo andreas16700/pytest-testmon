@@ -618,6 +618,144 @@ export TESTMON_AUTH_TOKEN=your-service-token
 - Existing `server_sync.py` upload/download still works
 - All visualization endpoints unchanged (read same SQLite files)
 
+## Parallel Execution (pytest-xdist) Support
+
+Ezmon fully supports parallel test execution with pytest-xdist (`pytest -n auto` or `pytest -n <workers>`).
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       CONTROLLER PROCESS                          │
+│                                                                   │
+│  pytest_configure()                                               │
+│    └─► init_testmon_data() → TestmonData()                       │
+│          └─► determine_stable() → computes stable_test_names     │
+│                                                                   │
+│  pytest_configure_node() [for each worker]                        │
+│    └─► Passes via workerinput:                                   │
+│          • exec_id                                                │
+│          • stable_test_names                                      │
+│          • files_of_interest                                      │
+│          • changed_packages                                       │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│   WORKER gw0    │ │   WORKER gw1    │ │   WORKER gw2    │
+│                 │ │                 │ │                 │
+│ init_testmon_   │ │ init_testmon_   │ │ init_testmon_   │
+│ data() detects  │ │ data() detects  │ │ data() detects  │
+│ workerinput →   │ │ workerinput →   │ │ workerinput →   │
+│ TestmonData.    │ │ TestmonData.    │ │ TestmonData.    │
+│ for_worker()    │ │ for_worker()    │ │ for_worker()    │
+│                 │ │                 │ │                 │
+│ Uses pre-       │ │ Uses pre-       │ │ Uses pre-       │
+│ computed        │ │ computed        │ │ computed        │
+│ stability data  │ │ stability data  │ │ stability data  │
+└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
+         │                   │                   │
+         └───────────────────┴───────────────────┘
+                             │
+                             ▼
+                   Coverage data flows back
+                   to controller via xdist
+```
+
+### The Problem: Collection Mismatch Race Condition
+
+When running with xdist, each worker process independently calls `pytest_collection_modifyitems` to determine which tests to run. If workers compute different `stable_test_names` sets, xdist raises:
+
+```
+Different tests were collected between gw0 and gw1. The difference is: ...
+```
+
+**Root cause**: Workers were independently calling `determine_stable()` which reads from the database. If:
+1. The controller is still writing to the database while workers start
+2. Workers read the database at different times
+3. SQLite WAL mode gives each reader a snapshot from when they started
+
+Then workers could see different database states and compute different `stable_test_names`.
+
+### The Solution: Controller-to-Worker Data Synchronization
+
+Following the original pytest-testmon's approach, ezmon now:
+
+1. **Controller computes stability once** in `init_testmon_data()` before workers spawn
+2. **Controller passes pre-computed data** to workers via `pytest_configure_node()`:
+   ```python
+   # In TestmonXdistSync.pytest_configure_node()
+   node.workerinput["testmon_exec_id"] = testmon_data.exec_id
+   node.workerinput["testmon_stable_test_names"] = list(testmon_data.stable_test_names)
+   node.workerinput["testmon_files_of_interest"] = list(testmon_data.files_of_interest)
+   node.workerinput["testmon_changed_packages"] = list(testmon_data.changed_packages)
+   ```
+3. **Workers use pre-computed data** instead of recomputing:
+   ```python
+   # In init_testmon_data()
+   if running_as == "worker" and "testmon_exec_id" in config.workerinput:
+       testmon_data = TestmonData.for_worker(
+           rootdir=config.rootdir.strpath,
+           exec_id=workerinput["testmon_exec_id"],
+           stable_test_names=workerinput["testmon_stable_test_names"],
+           ...
+       )
+   ```
+
+### Key Components
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| `TestmonXdistSync` | `pytest_ezmon.py` | Passes stability data from controller to workers |
+| `TestmonData.for_worker()` | `testmon_core.py` | Creates worker TestmonData using pre-computed data |
+| `get_running_as()` | `pytest_ezmon.py` | Detects "controller", "worker", or "single" mode |
+
+### TrackedFile Serialization Fix
+
+Xdist uses execnet to serialize data between processes. The `TrackedFile` namedtuple couldn't be serialized:
+
+```
+execnet.gateway_base.DumpError: can't serialize <class 'ezmon.dependency_tracker.TrackedFile'>
+```
+
+**Fix**: Convert `TrackedFile` namedtuples to plain `(path, sha)` tuples before storing in `nodes_files_lines`:
+```python
+# In testmon_core.py
+if files:
+    file_deps_key = f"__file_deps__{test_name}"
+    nodes_files_lines[test_name][file_deps_key] = {(tf.path, tf.sha) for tf in files}
+```
+
+### Testing
+
+Parallel execution is tested in `integration_tests/test_parallel_execution.py`:
+
+| Test | Mode | Description |
+|------|------|-------------|
+| `test_sequential_baseline` | Local SQLite | Verifies sequential works as baseline |
+| `test_parallel_small_subset` | Local SQLite | Tests parallel with small test set |
+| `test_parallel_coverage_saved` | Local SQLite | Verifies coverage saved from parallel workers |
+| `test_parallel_netdb_basic` | NetDB | Tests parallel with network database |
+| `test_parallel_netdb_coverage_collection` | NetDB | Verifies NetDB coverage collection in parallel |
+
+Run parallel tests:
+```bash
+pytest integration_tests/test_parallel_execution.py -v
+```
+
+### Usage
+
+```bash
+# Run tests in parallel with ezmon
+pytest --ezmon -n auto
+
+# Or with specific worker count
+pytest --ezmon -n 4
+```
+
+Both local SQLite and NetDB modes support parallel execution.
+
 ## Visualization Frontend (ez-viz)
 
 The Flask-based frontend (`ez-viz/app.py`) provides:

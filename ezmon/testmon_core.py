@@ -247,6 +247,48 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.stable_files = None
         self.failing_tests = None
 
+    @classmethod
+    def for_worker(cls, rootdir, exec_id, stable_test_names, files_of_interest, changed_packages):
+        """Create a TestmonData instance for xdist workers using pre-computed controller data.
+
+        Workers receive stability data from the controller via workerinput to avoid
+        race conditions where workers independently compute different stable_test_names
+        by reading the database at different times.
+
+        Args:
+            rootdir: Project root directory
+            exec_id: Execution ID from the controller
+            stable_test_names: Set/list of test names the controller computed as stable
+            files_of_interest: List of files being tracked
+            changed_packages: Set/list of packages that changed
+
+        Returns:
+            TestmonData instance configured for worker use
+        """
+        instance = object.__new__(cls)
+        instance.rootdir = rootdir
+        instance.environment = "default"
+        instance.source_tree = SourceTree(rootdir=rootdir)
+
+        # Open database in readonly mode - workers only read coverage data
+        instance.db = create_database(rootdir, readonly=True)
+
+        # Use pre-computed data from controller
+        instance.exec_id = exec_id
+        instance.files_of_interest = list(files_of_interest) if files_of_interest else []
+        instance.changed_packages = set(changed_packages) if changed_packages else set()
+        instance.system_packages_change = bool(changed_packages)
+
+        # Convert stable_test_names from list to set (xdist serializes sets as lists)
+        instance.stable_test_names = set(stable_test_names) if stable_test_names else set()
+        instance.stable_files = set()
+        instance.unstable_test_names = set()
+        instance.unstable_files = set()
+        instance.all_files = {}
+        instance.failing_tests = []
+
+        return instance
+
     @property
     def new_db(self):
         return self.db.file_created

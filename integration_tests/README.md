@@ -299,6 +299,51 @@ register(Scenario(
 - Ezmon uses AST-based fingerprinting, so modifications must change actual code structure, not just comments!
 - Use full test paths like `tests/test_file.py::TestClass::test_method` for expected_selected/deselected
 
+## Parallel Execution Tests (pytest-xdist)
+
+The `test_parallel_execution.py` file contains integration tests for parallel test execution with pytest-xdist.
+
+### Tests
+
+| Test | Mode | Description |
+|------|------|-------------|
+| `test_sequential_baseline` | Local SQLite | Verifies sequential execution works as baseline |
+| `test_parallel_small_subset` | Local SQLite | Tests parallel execution with a small test subset |
+| `test_parallel_coverage_saved` | Local SQLite | Verifies coverage data is saved from parallel workers |
+| `test_parallel_netdb_basic` | NetDB | Tests parallel execution with network database |
+| `test_parallel_netdb_coverage_collection` | NetDB | Verifies coverage collection works in parallel NetDB mode |
+
+### Running Parallel Tests
+
+```bash
+# Run all parallel execution tests
+pytest integration_tests/test_parallel_execution.py -v
+
+# Run only local SQLite tests
+pytest integration_tests/test_parallel_execution.py::TestParallelExecution -v
+
+# Run only NetDB tests (requires server access)
+pytest integration_tests/test_parallel_execution.py::TestParallelExecutionNetDB -v
+```
+
+### The Race Condition Problem
+
+When using pytest-xdist, workers independently compute which tests to deselect. If workers see different database states (due to SQLite WAL snapshots), they compute different `stable_test_names` sets, causing:
+
+```
+Different tests were collected between gw0 and gw1. The difference is: ...
+```
+
+### The Solution
+
+Ezmon solves this by having the controller compute stability once and pass pre-computed data to workers via `workerinput`:
+
+1. Controller calls `determine_stable()` in `init_testmon_data()`
+2. `TestmonXdistSync.pytest_configure_node()` passes `exec_id`, `stable_test_names`, etc. to workers
+3. Workers use `TestmonData.for_worker()` with pre-computed data instead of recomputing
+
+See `ARCHITECTURE.md` for detailed documentation.
+
 ## Supported Python Versions
 
 - Python 3.7

@@ -153,6 +153,25 @@ def get_testmon_file(config: Config) -> Path:
 
 
 def init_testmon_data(config: Config):
+    running_as = get_running_as(config)
+
+    # Workers receive pre-computed stability data from the controller via workerinput
+    # This prevents race conditions where workers independently compute different stable_test_names
+    if running_as == "worker" and hasattr(config, "workerinput"):
+        workerinput = config.workerinput
+        if "testmon_exec_id" in workerinput:
+            # Create TestmonData for worker using controller's pre-computed data
+            testmon_data = TestmonData.for_worker(
+                rootdir=config.rootdir.strpath,
+                exec_id=workerinput["testmon_exec_id"],
+                stable_test_names=workerinput.get("testmon_stable_test_names", set()),
+                files_of_interest=workerinput.get("testmon_files_of_interest", []),
+                changed_packages=workerinput.get("testmon_changed_packages", set()),
+            )
+            config.testmon_data = testmon_data
+            return
+
+    # Controller or single process: compute stability normally
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
     )
@@ -164,13 +183,13 @@ def init_testmon_data(config: Config):
         rootdir=config.rootdir.strpath
     )
 
-    
+
     testmon_data = TestmonData(
         rootdir=config.rootdir.strpath,
         database=None,
         environment=environment,
         system_packages=system_packages,
-        readonly=get_running_as(config) == "worker",
+        readonly=False,  # Controller/single always writes
     )
     testmon_data.determine_stable(bool(None))
     config.testmon_data = testmon_data
@@ -462,8 +481,39 @@ class TestmonCollect:
 
 
 class TestmonXdistSync:
+    """Synchronizes testmon data between xdist controller and workers.
+
+    This class ensures all workers receive the same pre-computed stability data
+    from the controller, preventing race conditions where workers independently
+    compute different stable_test_names from varying database states.
+    """
     def __init__(self):
         self.await_nodes = 0
+
+    def pytest_configure_node(self, node):
+        """Pass stability data from controller to workers during xdist initialization.
+
+        Called by the controller for each worker node before it starts.
+        We pass the pre-computed exec_id, stable_test_names, and other data
+        so workers all use the same deselection criteria.
+        """
+        running_as = get_running_as(node.config)
+        if running_as != "controller":
+            return
+
+        if hasattr(node.config, "testmon_data") and hasattr(node, "workerinput"):
+            testmon_data = node.config.testmon_data
+            # Pass all data workers need to avoid recomputing stability
+            node.workerinput["testmon_exec_id"] = testmon_data.exec_id
+            node.workerinput["testmon_stable_test_names"] = list(
+                testmon_data.stable_test_names or set()
+            )
+            node.workerinput["testmon_files_of_interest"] = list(
+                testmon_data.files_of_interest or []
+            )
+            node.workerinput["testmon_changed_packages"] = list(
+                getattr(testmon_data, "changed_packages", set()) or set()
+            )
 
     def pytest_testnodeready(self, node):  # pylint: disable=unused-argument
         self.await_nodes += 1
