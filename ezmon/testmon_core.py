@@ -273,11 +273,11 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             for filename, covered in nodes_files_lines[context].items():
                 # Handle special keys for file and external dependencies
                 if filename.startswith("__file_deps__"):
-                    # covered is actually a set of TrackedFile namedtuples
-                    for tracked_file in covered:
+                    # covered is a set of (path, sha) tuples
+                    for path, sha in covered:
                         deps_n_outcomes["file_deps"].append({
-                            "filename": tracked_file.path,
-                            "sha": tracked_file.sha,
+                            "filename": path,
+                            "sha": sha,
                         })
                     continue
                 elif filename.startswith("__external_deps__"):
@@ -789,9 +789,10 @@ class TestmonCollector:
 
             # Store file dependencies in a special key
             # These will be handled specially in get_tests_fingerprints
+            # Convert TrackedFile namedtuples to plain tuples for xdist serialization
             if files:
                 file_deps_key = f"__file_deps__{test_name}"
-                nodes_files_lines[test_name][file_deps_key] = files
+                nodes_files_lines[test_name][file_deps_key] = {(tf.path, tf.sha) for tf in files}
 
             # Store external imports for granular package tracking
             if all_external_imports:

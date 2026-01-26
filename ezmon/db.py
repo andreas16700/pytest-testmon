@@ -22,6 +22,13 @@ class TestmonDbException(Exception):
 
 
 def connect(datafile, readonly=False):
+    # In xdist worker mode (readonly=True), wait for controller to create the DB
+    if readonly:
+        import time
+        for _ in range(50):  # Wait up to 5 seconds
+            if os.path.exists(datafile):
+                break
+            time.sleep(0.1)
     return sqlite3.connect(
         f"file:{datafile}{'?mode=ro' if readonly else ''}", uri=True, timeout=60
     )
