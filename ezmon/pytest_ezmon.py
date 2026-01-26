@@ -124,6 +124,17 @@ def pytest_addoption(parser):
         help="Generate an interactive dependency graph (dependency_graph.html) of the project."
     )
 
+    group.addoption(
+        "--ezmon-no-reorder",
+        action="store_true",
+        dest="ezmon_no_reorder",
+        help=(
+            "Disable duration-based test reordering. "
+            "Tests will run in their original collection order. "
+            "Useful when test suites have inter-test dependencies or state pollution issues."
+        ),
+    )
+
     parser.addini("environment_expression", "environment expression", default="")
     parser.addini(
         "testmon_ignore_dependencies",
@@ -664,7 +675,10 @@ class TestmonSelect:
         print("Prioritized tests are", prioritized)
 
         # 3) Normal selected: duration priority (your existing testmon behavior)
-        sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
+        # Skip reordering if --ezmon-no-reorder is set
+        no_reorder = config.getoption("ezmon_no_reorder", False)
+        if not no_reorder:
+            sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
 
         selected = forced + prioritized + normal_selected
 
@@ -681,7 +695,9 @@ class TestmonSelect:
                 logger.info(f" Prioritized {len(prioritized)} tests from priority list")
         else:
             # 3) In noselect mode: also prioritize deselected by duration
-            sort_items_by_duration(deselected, self.testmon_data.avg_durations)
+            # Skip reordering if --ezmon-no-reorder is set
+            if not no_reorder:
+                sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
