@@ -85,10 +85,11 @@ class NetDB:
         session = requests.Session()
 
         # Configure retry strategy with exponential backoff
+        # Include Cloudflare error codes (520-524) which indicate transient origin issues
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
+            status_forcelist=[429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
             allowed_methods=["GET", "POST"],
         )
         adapter = HTTPAdapter(
