@@ -51,6 +51,14 @@ class DependencyTracker:
 
     Usage:
         tracker = DependencyTracker(rootdir="/path/to/project")
+
+        # Collection-time tracking (captures import-time file reads):
+        tracker.start_collection_tracking()
+        tracker.set_collection_context("tests/test_a.py")
+        # ... test file imported, modules load, file reads happen ...
+        collection_deps = tracker.stop_collection_tracking()
+
+        # Test execution tracking:
         tracker.start("test_name")
         # ... test runs ...
         files, local_imports, external_imports = tracker.stop()
@@ -73,6 +81,12 @@ class DependencyTracker:
 
         # State
         self._active = False
+
+        # Collection-time tracking state
+        # Tracks file reads that happen during test collection (import time)
+        self._collection_mode = False
+        self._collection_context: Optional[str] = None  # Current test file being collected
+        self._collection_file_deps: Dict[str, Set[TrackedFile]] = {}  # {test_file: set of TrackedFile}
 
         # Cache for path checks
         self._path_cache: Dict[str, Optional[str]] = {}
@@ -267,12 +281,22 @@ class DependencyTracker:
     def _track_file(self, filepath: str, mode: str) -> None:
         """Track a file read operation.
 
+        Handles two modes:
+        1. Collection mode: File reads during import time are associated with
+           the test file being collected.
+        2. Test execution mode: File reads during test run are associated with
+           the specific test.
+
         Only tracks files that are committed in git (exist in HEAD).
         This ensures:
         1. Ephemeral/generated files (like result_images/) are NOT tracked
         2. Files modified during workflow are tracked with their committed state
         """
-        if not self._active or not self._current_context:
+        # Check if we should track this read
+        in_collection_mode = self._collection_mode and self._collection_context
+        in_test_mode = self._active and self._current_context
+
+        if not in_collection_mode and not in_test_mode:
             return
 
         # Only track read operations
@@ -295,11 +319,18 @@ class DependencyTracker:
         if not sha:
             return
 
+        tracked_file = TrackedFile(path=relpath, sha=sha)
+
         with self._lock:
-            if self._current_context in self._tracked_files:
-                self._tracked_files[self._current_context].add(
-                    TrackedFile(path=relpath, sha=sha)
-                )
+            # Collection mode: associate with test file being collected
+            if in_collection_mode:
+                if self._collection_context in self._collection_file_deps:
+                    self._collection_file_deps[self._collection_context].add(tracked_file)
+
+            # Test execution mode: associate with current test
+            if in_test_mode:
+                if self._current_context in self._tracked_files:
+                    self._tracked_files[self._current_context].add(tracked_file)
 
     def _track_import(self, module, name: str) -> None:
         """Track a module import."""
@@ -334,7 +365,9 @@ class DependencyTracker:
         # Call original open first
         result = self._original_open(file, mode, *args, **kwargs)
 
-        if self._active:
+        # Track in either collection mode or test execution mode
+        should_track = self._active or (self._collection_mode and self._collection_context)
+        if should_track:
             # Handle both str and Path objects (os.PathLike)
             if isinstance(file, str):
                 filepath = file
@@ -574,6 +607,88 @@ class DependencyTracker:
 
         return None
 
+    def _install_hooks(self) -> None:
+        """Install tracking hooks for open() and import."""
+        if self._original_open is None:
+            self._original_open = builtins.open
+            builtins.open = self._tracking_open
+
+        if self._original_import is None:
+            self._original_import = builtins.__import__
+            builtins.__import__ = self._tracking_import
+
+        if self._original_import_module is None:
+            self._original_import_module = importlib.import_module
+            importlib.import_module = self._tracking_import_module
+
+    # =========================================================================
+    # Collection-time tracking methods
+    # These capture file reads that happen during test collection (import time)
+    # =========================================================================
+
+    def start_collection_tracking(self) -> None:
+        """
+        Start tracking file reads during test collection phase.
+
+        This should be called early in pytest_configure, before test collection
+        begins. File reads that happen during module imports will be captured
+        and associated with the test file being collected.
+        """
+        with self._lock:
+            self._collection_mode = True
+            self._collection_file_deps = {}
+            self._install_hooks()
+
+    def set_collection_context(self, test_file: str) -> None:
+        """
+        Set the current test file being collected.
+
+        Called when pytest starts collecting a test module. Any file reads
+        that happen while collecting this module (including imports) will
+        be associated with this test file.
+
+        Args:
+            test_file: Relative path to the test file (e.g., "tests/test_a.py")
+        """
+        with self._lock:
+            self._collection_context = test_file
+            if test_file not in self._collection_file_deps:
+                self._collection_file_deps[test_file] = set()
+
+    def clear_collection_context(self) -> None:
+        """Clear the collection context after a test file is done being collected."""
+        with self._lock:
+            self._collection_context = None
+
+    def stop_collection_tracking(self) -> Dict[str, Set[TrackedFile]]:
+        """
+        Stop collection tracking and return collected file dependencies.
+
+        Returns:
+            Dict mapping test file paths to sets of TrackedFile dependencies
+            that were read during that test file's collection/import.
+        """
+        with self._lock:
+            self._collection_mode = False
+            self._collection_context = None
+            result = self._collection_file_deps.copy()
+            self._collection_file_deps = {}
+
+            # Only restore hooks if no test-time tracking is active
+            if not self._active and not self._tracked_files:
+                self._restore_hooks()
+
+            return result
+
+    def get_collection_file_deps(self) -> Dict[str, Set[TrackedFile]]:
+        """Get the current collection file dependencies without stopping tracking."""
+        with self._lock:
+            return {k: v.copy() for k, v in self._collection_file_deps.items()}
+
+    # =========================================================================
+    # Test execution tracking methods
+    # =========================================================================
+
     def start(self, context: str, test_file: Optional[str] = None) -> None:
         """
         Start tracking dependencies for a test context.
@@ -593,18 +708,7 @@ class DependencyTracker:
                 self._test_files[context] = test_file
 
             if not self._active:
-                # Hook builtins.open
-                self._original_open = builtins.open
-                builtins.open = self._tracking_open
-
-                # Hook builtins.__import__
-                self._original_import = builtins.__import__
-                builtins.__import__ = self._tracking_import
-
-                # Hook importlib.import_module
-                self._original_import_module = importlib.import_module
-                importlib.import_module = self._tracking_import_module
-
+                self._install_hooks()
                 self._active = True
 
     def stop(self) -> Tuple[Set[TrackedFile], Set[str], Set[str], Optional[str]]:

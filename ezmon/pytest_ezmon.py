@@ -409,6 +409,32 @@ class TestmonCollect:
         self.cov_plugin = cov_plugin
         self._sessionstarttime = time.time()
 
+        # Collection-time file dependency tracking
+        # Maps test files to file dependencies read during import
+        self._collection_file_deps = {}
+
+        # Start collection-time tracking to capture import-time file reads
+        self.testmon.dependency_tracker.start_collection_tracking()
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collectstart(self, collector):
+        """Called when pytest starts collecting from a collector.
+
+        For test modules (files), this sets the collection context so that
+        file reads during import are associated with this test file.
+        """
+        # Only track Module collectors (test files), not Session or Package
+        if hasattr(collector, 'path') and hasattr(collector, 'fspath'):
+            # It's a Module or similar file-based collector
+            try:
+                test_file = cached_relpath(
+                    str(collector.path),
+                    str(collector.config.rootdir)
+                )
+                self.testmon.dependency_tracker.set_collection_context(test_file)
+            except (AttributeError, ValueError):
+                pass
+
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
     def pytest_pycollect_makeitem(
         self, collector, name, obj
@@ -426,6 +452,9 @@ class TestmonCollect:
     def pytest_collection_modifyitems(
         self, session, config, items
     ):  # pylint: disable=unused-argument
+        # Stop collection tracking and get collected file dependencies
+        self._collection_file_deps = self.testmon.dependency_tracker.stop_collection_tracking()
+
         should_sync = not session.testsfailed and self._running_as in (
             "single",
             "controller",
@@ -459,13 +488,46 @@ class TestmonCollect:
         self.reports[report.nodeid][report.when] = report
         if report.when == "teardown" and hasattr(report, "nodes_files_lines"):
             if report.nodes_files_lines:
+                # Merge collection-time file dependencies into coverage data
+                nodes_files_lines = self._merge_collection_file_deps(
+                    report.nodes_files_lines
+                )
+
                 test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
-                    report.nodes_files_lines, self.reports
+                    nodes_files_lines, self.reports
                 )
                 self.testmon_data.save_test_execution_file_fps(
                     test_executions_fingerprints,
-                    nodes_files_lines=report.nodes_files_lines,
+                    nodes_files_lines=nodes_files_lines,
                 )
+
+    def _merge_collection_file_deps(self, nodes_files_lines):
+        """Merge collection-time file dependencies into coverage data.
+
+        Collection-time deps are associated with test files (e.g., "tests/test_a.py").
+        This method adds them to the appropriate individual test contexts.
+        """
+        if not self._collection_file_deps:
+            return nodes_files_lines
+
+        for test_nodeid, data in nodes_files_lines.items():
+            # Extract test file from nodeid (e.g., "tests/test_a.py::test_func" -> "tests/test_a.py")
+            test_file = test_nodeid.split("::")[0] if "::" in test_nodeid else test_nodeid
+
+            # Get collection-time file deps for this test file
+            collection_deps = self._collection_file_deps.get(test_file, set())
+
+            if collection_deps:
+                # Add to the special __file_deps__ key
+                file_deps_key = f"__file_deps__{test_nodeid}"
+                if file_deps_key not in data:
+                    data[file_deps_key] = set()
+
+                # Merge collection-time deps
+                for tracked_file in collection_deps:
+                    data[file_deps_key].add((tracked_file.path, tracked_file.sha))
+
+        return nodes_files_lines
 
     def pytest_keyboard_interrupt(self, excinfo):  # pylint: disable=unused-argument
         if self._running_as == "single":

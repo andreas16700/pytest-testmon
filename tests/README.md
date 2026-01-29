@@ -76,7 +76,16 @@ python integration_tests/test_all_versions.py
 
 # List available scenarios
 python integration_tests/run_integration_tests.py --list
+
+# Run file dependency tracking test (import-time reads)
+python integration_tests/test_file_dependency_indirect.py
 ```
+
+### File Dependency Tracking Test
+
+The `test_file_dependency_indirect.py` test verifies that non-Python file dependencies are tracked correctly, even when files are read at module import time (not during test execution).
+
+See `docs/file-dependency-tracking.md` for detailed documentation on how file dependency tracking works.
 
 ## Python Version Compatibility
 

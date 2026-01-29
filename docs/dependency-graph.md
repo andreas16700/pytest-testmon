@@ -2,6 +2,8 @@
 
 This document describes the dependency graph feature in pytest-ezmon, which tracks and visualizes file-to-file import relationships discovered during test execution.
 
+> **Related:** For non-Python file dependency tracking (JSON, YAML, config files, etc.), see [file-dependency-tracking.md](./file-dependency-tracking.md).
+
 ## Overview
 
 The dependency graph captures actual runtime import relationships between files, providing a more accurate view of dependencies than static analysis. This data is collected during test execution and can be visualized in the ez-viz UI.
@@ -10,12 +12,15 @@ The dependency graph captures actual runtime import relationships between files,
 
 ### Data Collection
 
-During test execution, ezmon's `TestmonCollector` tracks which files import which other files:
+During test execution, ezmon's `DependencyTracker` hooks into Python's import system and file I/O to capture dependencies:
 
 1. When a test file runs, ezmon records which Python modules it imports
 2. For each imported module, transitive imports are also recorded
 3. External package dependencies (numpy, pytest, etc.) are tracked separately
-4. All edges are deduplicated to avoid redundant data
+4. Non-Python file reads (JSON, YAML, etc.) are captured via `builtins.open` hook
+5. All edges are deduplicated to avoid redundant data
+
+> **Note:** The same `DependencyTracker` class handles both the dependency graph (import tracking) and file dependency tracking (file read tracking). See [file-dependency-tracking.md](./file-dependency-tracking.md) for details on file dependencies.
 
 **Edge Types:**
 - `local`: File-to-file import (e.g., `test_foo.py` → `src/foo.py`)
