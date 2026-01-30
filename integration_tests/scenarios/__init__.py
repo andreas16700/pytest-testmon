@@ -622,7 +622,7 @@ register(Scenario(
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_import_only_module_level",
-    description="Module-level change - ALL tests importing the module are selected",
+    description="Module-level change - ALL tests importing the module are selected, tests in OTHER files are NOT",
     modifications=[
         Modification(
             file="src/import_only.py",
@@ -635,7 +635,27 @@ register(Scenario(
     # import the module, and module-level code changes affect the module-level block
     # that ALL importers depend on (captured during collection).
     expected_selected=ALL_IMPORT_TESTS,
-    expected_deselected=[],
+    # CRITICAL: Tests in OTHER test files that do NOT import import_only.py
+    # should NOT be selected. This verifies cross-file isolation.
+    expected_deselected=[
+        # Tests from test_calculator.py - imports calculator.py, not import_only.py
+        TEST_CALC_ADD,
+        TEST_CALC_SUBTRACT,
+        TEST_CALC_MULTIPLY,
+        # Tests from test_formatter.py - imports formatter.py, not import_only.py
+        TEST_FMT_UPPER,
+        TEST_FMT_LOWER,
+        TEST_FMT_TITLE,
+        # Tests from test_math_utils.py - imports math_utils.py, not import_only.py
+        TEST_MATH_ADD_POS,
+        TEST_MATH_ADD_NEG,
+        TEST_MATH_ADD_MIX,
+        # Tests from test_string_utils.py - imports string_utils.py, not import_only.py
+        TEST_STR_UPPER_LOW,
+        TEST_STR_UPPER_MIX,
+        TEST_STR_LOWER_UP,
+        TEST_STR_LOWER_MIX,
+    ],
 ))
 
 
