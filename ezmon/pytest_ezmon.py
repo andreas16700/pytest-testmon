@@ -135,6 +135,17 @@ def pytest_addoption(parser):
         ),
     )
 
+    group.addoption(
+        "--ezmon-coverage-lines",
+        action="store_true",
+        dest="ezmon_coverage_lines",
+        help=(
+            "Store per-test, per-file coverage line data in the database. "
+            "This is disabled by default as it significantly increases database size. "
+            "Enable for debugging or detailed coverage analysis."
+        ),
+    )
+
     parser.addini("environment_expression", "environment expression", default="")
     parser.addini(
         "testmon_ignore_dependencies",
@@ -223,6 +234,7 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
         )
 
     if should_collect:
+        store_coverage_lines = config.getoption("ezmon_coverage_lines", False)
         config.pluginmanager.register(
             TestmonCollect(
                 TestmonCollector(
@@ -232,6 +244,7 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
                 ),
                 config.testmon_data,
                 running_as=get_running_as(config),
+                store_coverage_lines=store_coverage_lines,
             ),
             "TestmonCollect",
         )
@@ -399,10 +412,11 @@ def pytest_unconfigure(config):
 
 
 class TestmonCollect:
-    def __init__(self, testmon, testmon_data, running_as="single", cov_plugin=None):
+    def __init__(self, testmon, testmon_data, running_as="single", cov_plugin=None, store_coverage_lines=False):
         self.testmon_data: TestmonData = testmon_data
         self.testmon: TestmonCollector = testmon
         self._running_as = running_as
+        self._store_coverage_lines = store_coverage_lines
 
         self.reports = defaultdict(lambda: {})
         self.raw_test_names = []
@@ -512,7 +526,7 @@ class TestmonCollect:
                 )
                 self.testmon_data.save_test_execution_file_fps(
                     test_executions_fingerprints,
-                    nodes_files_lines=nodes_files_lines,
+                    nodes_files_lines=nodes_files_lines if self._store_coverage_lines else None,
                 )
 
     def _merge_collection_deps(self, nodes_files_lines):
@@ -600,7 +614,10 @@ class TestmonCollect:
             test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
                 nodes_files_lines, self.reports
             )
-            self.testmon_data.save_test_execution_file_fps(test_executions_fingerprints , nodes_files_lines=nodes_files_lines,)
+            self.testmon_data.save_test_execution_file_fps(
+                test_executions_fingerprints,
+                nodes_files_lines=nodes_files_lines if self._store_coverage_lines else None,
+            )
             self.testmon.close()
 
     def pytest_sessionfinish(self, session):  # pylint: disable=unused-argument
