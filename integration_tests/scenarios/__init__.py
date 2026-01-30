@@ -11,51 +11,67 @@ Each scenario defines:
 IMPORTANT: Ezmon uses AST-based fingerprinting, so modifications must
 change the code structure, not just comments!
 
-## Method-Level Fingerprinting
+## Block-Based Fingerprinting
 
-Ezmon tracks dependencies at the METHOD level, not just file level. When you
-modify a specific function, only tests that actually execute that function
-will be re-run.
+Ezmon tracks dependencies at the BLOCK level. For each module, there are two types of blocks:
 
-## Coverage Context Limitation
+1. **Module-Level Block**: Contains AST of module with function bodies REPLACED by placeholders.
+   Represents imports, class definitions, function signatures, module-level code.
 
-Due to a fundamental limitation in coverage.py's dynamic context tracking,
-only the FIRST test to execute a code path gets recorded as depending on
-that code. Subsequent tests calling the same code (under different contexts)
-don't get the dependency recorded.
+2. **Function Body Blocks**: Each function/method body is a separate block containing
+   the implementation code.
 
-This affects both:
-1. Tests across different files (first file to import gets the dependency)
-2. Tests within the same file (first test to call function gets the dependency)
+When a function BODY changes:
+- Module-level block: UNCHANGED (function signature is the same)
+- Function body block: CHANGED
 
-For example:
-- test_calculator.py::TestCalculator::test_add runs FIRST and calls add()
-  → Gets math_utils.add() dependency recorded
-- test_calculator.py::TestCalculatorHistory::test_history_recording runs LATER
-  and also calls add() → Does NOT get math_utils.add() dependency recorded
+Therefore, only tests that EXECUTE that function are affected. Tests that merely
+IMPORT the module but don't call the function are NOT affected.
 
-## Individual Test Dependencies (based on execution order)
+## Two-Phase Tracking
 
-test_calculator.py (runs first, gets math_utils dependency):
-  TestCalculator::test_add → add()
-  TestCalculator::test_subtract → subtract()
-  TestCalculator::test_multiply → multiply()
-  TestCalculator::test_divide → divide()
-  TestCalculator::test_divide_by_zero → divide()
-  TestCalculator::test_unknown_operator → (no math function)
-  TestCalculatorHistory::test_history_recording → (add traced already, no dep)
-  TestCalculatorHistory::test_clear_history → clear_history()
+### Collection Phase (per test file)
+- Coverage captures lines executed during import (module-level code)
+- Import tracker captures module imports and file reads
+- This becomes the BASELINE for all tests in that file
 
-test_formatter.py (runs second, gets string_utils dependency):
-  TestFormatter::test_upper_style → uppercase()
-  TestFormatter::test_lower_style → lowercase()
-  TestFormatter::test_title_style → capitalize()
-  TestFormatter::test_default_style → (uppercase traced already, no dep)
-  TestFormatter::test_unknown_style → (no string function)
-  TestFormatterStyleChange::test_change_style → set_style()
+### Execution Phase (per test)
+- Coverage captures lines executed during the test
+- Import tracker captures dynamic imports and file reads
+- Merged with collection baseline
 
-test_math_utils.py / test_string_utils.py:
-  → Only depend on themselves (source deps already traced by earlier tests)
+## Per-Test Coverage
+
+Ezmon uses TEST_BATCH_SIZE=1 to ensure each test gets accurate coverage.
+Coverage is erased after each test, so every test that calls a function
+gets that function recorded as a dependency.
+
+## Test Dependencies
+
+test_calculator.py:
+  TestCalculator::test_add → calls add()
+  TestCalculator::test_subtract → calls subtract()
+  TestCalculator::test_multiply → calls multiply()
+  TestCalculator::test_divide → calls divide()
+  TestCalculator::test_divide_by_zero → calls divide()
+  TestCalculator::test_unknown_operator → no math function calls (module-level only)
+  TestCalculatorHistory::test_history_recording → calls add()
+  TestCalculatorHistory::test_clear_history → calls clear_history()
+
+test_formatter.py:
+  TestFormatter::test_upper_style → calls uppercase()
+  TestFormatter::test_lower_style → calls lowercase()
+  TestFormatter::test_title_style → calls capitalize()
+  TestFormatter::test_default_style → calls uppercase() (default style)
+  TestFormatter::test_unknown_style → no string function calls (module-level only)
+  TestFormatterStyleChange::test_change_style → calls set_style(), uppercase(), lowercase()
+
+## Key Principle
+
+Tests are only affected by changes to code blocks they EXECUTE.
+If a test imports a module but doesn't call a specific function:
+- When that function's BODY changes → test is NOT affected
+- When module-level code changes (imports, signatures) → test IS affected
 """
 
 from dataclasses import dataclass, field
@@ -162,14 +178,15 @@ def register(scenario: Scenario) -> Scenario:
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify math_utils.add()
-# Tests that call add() are selected via method-level tracking.
-# Tests that call OTHER math functions (subtract, multiply, divide) have
-# method-level tracking for those specific functions, so they're NOT selected.
-# Tests with ONLY module-level deps (no method calls) ARE selected.
+# Tests that call add() are selected via block-level tracking.
+# Tests that call OTHER math functions have those function body blocks in
+# their fingerprints, but NOT the add() body block, so they're NOT selected.
+# Tests that don't call ANY math function only have the module-level block,
+# which is UNCHANGED when a function body changes, so they're NOT selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_math_utils",
-    description="Change math_utils.add() - tests calling add() + module-level deps selected",
+    description="Change math_utils.add() body - only tests calling add() selected",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -178,35 +195,38 @@ register(Scenario(
             content="result = a + b\n    return result",
         )
     ],
-    # Selected: tests that call add(), OR have module-level dep only
+    # Selected: only tests that actually EXECUTE add()
     expected_selected=[
         TEST_CALC_ADD,       # calls add() via calculator
         TEST_CALC_HISTORY,   # calls add() via calc.calculate(2, '+', 3)
         TEST_CALC_CLEAR,     # calls add() via calc.calculate(2, '+', 3)
-        TEST_CALC_UNKNOWN_OP,# doesn't call any math func -> module-level dep
         TEST_MATH_ADD_POS,   # calls add() directly
         TEST_MATH_ADD_NEG,   # calls add() directly
         TEST_MATH_ADD_MIX,   # calls add() directly
     ],
-    # Deselected: tests that have method-level tracking for OTHER math functions only
+    # Deselected: tests that don't execute add()
+    # - Tests calling OTHER math functions: have those body blocks, not add() body
+    # - test_unknown_operator: only has module-level block (unchanged by body change)
     expected_deselected=[
         TEST_CALC_SUBTRACT,    # only calls subtract()
         TEST_CALC_MULTIPLY,    # only calls multiply()
         TEST_CALC_DIVIDE,      # only calls divide()
         TEST_CALC_DIVIDE_ZERO, # only calls divide()
+        TEST_CALC_UNKNOWN_OP,  # no math function calls, only module-level dep
     ],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify string_utils.uppercase()
-# Tests that call uppercase() are selected via method-level tracking.
-# Tests that call OTHER string functions have method-level tracking for those,
-# so they're NOT selected. Tests with ONLY module-level deps ARE selected.
+# Tests that call uppercase() are selected via block-level tracking.
+# Tests that call OTHER string functions have those body blocks, not uppercase().
+# Tests that don't call ANY string function only have module-level block,
+# which is UNCHANGED when a function body changes.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_string_utils",
-    description="Change string_utils.uppercase() - tests calling uppercase() + module-level deps selected",
+    description="Change string_utils.uppercase() body - only tests calling uppercase() selected",
     modifications=[
         Modification(
             file="src/string_utils.py",
@@ -215,19 +235,21 @@ register(Scenario(
             content="upper_result = s.upper()\n    return upper_result",
         )
     ],
-    # Selected: tests that call uppercase(), OR have module-level dep only
+    # Selected: only tests that actually EXECUTE uppercase()
     expected_selected=[
         TEST_FMT_UPPER,      # calls uppercase() via formatter
         TEST_FMT_DEFAULT,    # default style is "upper", calls uppercase()
         TEST_FMT_CHANGE,     # calls both uppercase() and lowercase()
-        TEST_FMT_UNKNOWN,    # doesn't call any string func -> module-level dep
         TEST_STR_UPPER_LOW,  # calls uppercase() directly
         TEST_STR_UPPER_MIX,  # calls uppercase() directly
     ],
-    # Deselected: tests that have method-level tracking for OTHER string functions only
+    # Deselected: tests that don't execute uppercase()
+    # - Tests calling OTHER string functions: have those body blocks, not uppercase() body
+    # - test_unknown_style: only has module-level block (unchanged by body change)
     expected_deselected=[
         TEST_FMT_LOWER,   # only calls lowercase()
         TEST_FMT_TITLE,   # only calls capitalize()
+        TEST_FMT_UNKNOWN, # no string function calls, only module-level dep
     ],
 ))
 
@@ -344,12 +366,12 @@ def test_another_new():
 
 # -----------------------------------------------------------------------------
 # Scenario: Multiple modifications
-# Modify subtract() and lowercase() - tests calling these + module-level deps selected
-# This demonstrates precise method-level tracking with multiple changes.
+# Modify subtract() and lowercase() body - only tests executing those functions selected.
+# Tests with only module-level deps are NOT selected (module-level block unchanged).
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="multiple_modifications",
-    description="Change subtract() and lowercase() - tests calling these + module-level deps selected",
+    description="Change subtract() and lowercase() bodies - only tests calling them selected",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -364,29 +386,29 @@ register(Scenario(
             content="lower_result = s.lower()\n    return lower_result",
         ),
     ],
-    # Selected: tests calling subtract() or lowercase(), OR module-level deps only
+    # Selected: only tests that actually EXECUTE subtract() or lowercase()
     expected_selected=[
         # Tests calling subtract()
         TEST_CALC_SUBTRACT,
         TEST_MATH_SUB_POS,
         TEST_MATH_SUB_NEG,
-        # Tests with module-level dep on math_utils (no math function calls)
-        TEST_CALC_UNKNOWN_OP,
         # Tests calling lowercase()
         TEST_FMT_LOWER,
         TEST_FMT_CHANGE,  # calls both uppercase() and lowercase()
         TEST_STR_LOWER_UP,
         TEST_STR_LOWER_MIX,
-        # Tests with module-level dep on string_utils (no string function calls)
-        TEST_FMT_UNKNOWN,
     ],
-    # Deselected: tests with method-level tracking for OTHER functions only
+    # Deselected: tests that don't execute subtract() or lowercase()
+    # - Tests calling OTHER functions: have those body blocks, not subtract()/lowercase()
+    # - Tests with module-level only: unchanged by body changes
     expected_deselected=[
         TEST_CALC_ADD,        # only calls add()
         TEST_CALC_MULTIPLY,   # only calls multiply()
         TEST_CALC_DIVIDE,     # only calls divide()
+        TEST_CALC_UNKNOWN_OP, # only module-level dep
         TEST_FMT_UPPER,       # only calls uppercase()
         TEST_FMT_TITLE,       # only calls capitalize()
+        TEST_FMT_UNKNOWN,     # only module-level dep
     ],
 ))
 
@@ -589,6 +611,35 @@ register(Scenario(
 
 
 # -----------------------------------------------------------------------------
+# Module-level change affecting all importers
+# When MODULE-LEVEL code changes (constants, imports, class definitions),
+# ALL tests that import the module should be selected - even tests that
+# don't call any functions from the module.
+#
+# This is different from function body changes:
+# - Function body change → only tests calling that function are selected
+# - Module-level change → ALL tests importing the module are selected
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_import_only_module_level",
+    description="Module-level change - ALL tests importing the module are selected",
+    modifications=[
+        Modification(
+            file="src/import_only.py",
+            action="replace",
+            target='MODULE_CONSTANT = "import_only_module"',
+            content='MODULE_CONSTANT = "import_only_module_changed"',
+        )
+    ],
+    # ALL tests in test_import_only.py should be selected because they all
+    # import the module, and module-level code changes affect the module-level block
+    # that ALL importers depend on (captured during collection).
+    expected_selected=ALL_IMPORT_TESTS,
+    expected_deselected=[],
+))
+
+
+# -----------------------------------------------------------------------------
 # Globals Pattern Test Constants
 # Testing functions that use globals from a separate module
 # -----------------------------------------------------------------------------
@@ -629,6 +680,17 @@ ALL_GLOBALS_TESTS = [
     TEST_GLOBALS_PROC_BATCHES, TEST_GLOBALS_PROC_SINGLE,
 ]
 
+# test_dynamic_loader.py tests (dynamic imports via importlib.import_module)
+TEST_DYNAMIC_MATH_ADD = "tests/test_dynamic_loader.py::TestDynamicMathImport::test_dynamic_add"
+TEST_DYNAMIC_COMPUTE = "tests/test_dynamic_loader.py::TestDynamicMathImport::test_compute_with_dynamic_import"
+TEST_DYNAMIC_CAPITALIZE = "tests/test_dynamic_loader.py::TestDynamicStringImport::test_dynamic_capitalize"
+TEST_DYNAMIC_FORMAT = "tests/test_dynamic_loader.py::TestDynamicStringImport::test_format_with_dynamic_import"
+
+ALL_DYNAMIC_TESTS = [
+    TEST_DYNAMIC_MATH_ADD, TEST_DYNAMIC_COMPUTE,
+    TEST_DYNAMIC_CAPITALIZE, TEST_DYNAMIC_FORMAT,
+]
+
 
 # -----------------------------------------------------------------------------
 # Globals Pattern (Transitive Dependencies)
@@ -661,4 +723,125 @@ register(Scenario(
     # all transitively depend on app_globals.py through globals_consumer.py
     expected_selected=ALL_GLOBALS_TESTS,
     expected_deselected=[],
+))
+
+
+# =============================================================================
+# DYNAMIC IMPORT SCENARIOS
+# These test that importlib.import_module() with string arguments is tracked
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Scenario: Modify math_utils.add() and verify dynamic imports are tracked
+# Tests that use importlib.import_module("src.math_utils") AND call add()
+# should be selected when math_utils.add() body changes.
+# Tests with only module-level deps are NOT selected.
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_dynamic_import_dependency",
+    description="Dynamic imports - only tests calling add() selected when add() body changes",
+    modifications=[
+        Modification(
+            file="src/math_utils.py",
+            action="replace",
+            target="return a + b",
+            content="sum_result = a + b\n    return sum_result",
+        )
+    ],
+    # Tests that actually EXECUTE add() should be selected
+    expected_selected=[
+        TEST_DYNAMIC_MATH_ADD,   # calls get_math_add() which uses importlib.import_module and calls add()
+        TEST_DYNAMIC_COMPUTE,    # calls compute_with_dynamic_import() which uses importlib.import_module and calls add()
+        # Also include regular tests that call add()
+        TEST_CALC_ADD,
+        TEST_CALC_HISTORY,
+        TEST_CALC_CLEAR,
+        TEST_MATH_ADD_POS,
+        TEST_MATH_ADD_NEG,
+        TEST_MATH_ADD_MIX,
+    ],
+    expected_deselected=[
+        # Dynamic string import tests that use string_utils, not math_utils
+        TEST_DYNAMIC_CAPITALIZE,
+        TEST_DYNAMIC_FORMAT,
+        # Tests with only module-level dep (don't execute add())
+        TEST_CALC_UNKNOWN_OP,
+    ],
+))
+
+
+# =============================================================================
+# COLLECTION-TIME EXECUTION SCENARIOS
+# Tests for functions executed at module level during collection
+# =============================================================================
+
+# test_collection_executed.py tests
+TEST_COLL_USES_COMPUTED = "tests/test_collection_executed.py::TestUsingComputedValues::test_uses_computed_value"
+TEST_COLL_USES_STRING = "tests/test_collection_executed.py::TestUsingComputedValues::test_uses_computed_string"
+TEST_COLL_USES_BOTH = "tests/test_collection_executed.py::TestUsingComputedValues::test_uses_both_computed"
+TEST_COLL_USES_STATIC = "tests/test_collection_executed.py::TestUsingStaticConstant::test_uses_static_constant"
+TEST_COLL_COMPUTED_PLUS_STATIC = "tests/test_collection_executed.py::TestUsingStaticConstant::test_computed_plus_static"
+TEST_COLL_CALLS_HELPER = "tests/test_collection_executed.py::TestCallingHelper::test_calls_helper"
+TEST_COLL_NOT_CALLS_HELPER = "tests/test_collection_executed.py::TestCallingHelper::test_does_not_call_helper"
+
+ALL_COLLECTION_EXECUTED_TESTS = [
+    TEST_COLL_USES_COMPUTED, TEST_COLL_USES_STRING, TEST_COLL_USES_BOTH,
+    TEST_COLL_USES_STATIC, TEST_COLL_COMPUTED_PLUS_STATIC,
+    TEST_COLL_CALLS_HELPER, TEST_COLL_NOT_CALLS_HELPER,
+]
+
+
+# -----------------------------------------------------------------------------
+# Scenario: Modify compute_constant() which is executed at module level
+# Since COMPUTED_VALUE = compute_constant() runs during collection,
+# ALL tests in that file depend on compute_constant() body.
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_collection_time_function",
+    description="Collection-time execution - ALL tests selected when module-level executed function changes",
+    modifications=[
+        Modification(
+            file="src/collection_executed.py",
+            action="replace",
+            target="def compute_constant():\n    \"\"\"A function that might be called at module level during import.\n\n    If a test file does:\n        COMPUTED_VALUE = compute_constant()\n    at module level, then all tests in that file depend on this function.\n    \"\"\"\n    return 42",
+            content="def compute_constant():\n    \"\"\"A function that might be called at module level during import.\n\n    If a test file does:\n        COMPUTED_VALUE = compute_constant()\n    at module level, then all tests in that file depend on this function.\n    \"\"\"\n    result = 42\n    return result",
+        )
+    ],
+    # ALL tests in test_collection_executed.py should be selected because
+    # compute_constant() is executed at module level (during collection).
+    # This makes it a common dependency for ALL tests in the file.
+    expected_selected=ALL_COLLECTION_EXECUTED_TESTS,
+    expected_deselected=[],
+))
+
+
+# -----------------------------------------------------------------------------
+# Scenario: Modify helper_not_at_module_level() which is NOT executed at module level
+# Since this function is only called inside test_calls_helper(), only that
+# test should be selected when the function body changes.
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="modify_helper_not_collection_time",
+    description="Non-collection function - only test that calls it selected",
+    modifications=[
+        Modification(
+            file="src/collection_executed.py",
+            action="replace",
+            target="def helper_not_at_module_level():\n    \"\"\"A function NOT called at module level in any test file.\n\n    Only tests that explicitly call this function depend on it.\n    \"\"\"\n    return \"helper_result\"",
+            content="def helper_not_at_module_level():\n    \"\"\"A function NOT called at module level in any test file.\n\n    Only tests that explicitly call this function depend on it.\n    \"\"\"\n    result = \"helper_result\"\n    return result",
+        )
+    ],
+    # ONLY test_calls_helper should be selected because it's the only test
+    # that actually calls helper_not_at_module_level().
+    # Other tests don't call it (even though the module is imported).
+    expected_selected=[TEST_COLL_CALLS_HELPER],
+    expected_deselected=[
+        # These tests don't call helper_not_at_module_level()
+        TEST_COLL_USES_COMPUTED,
+        TEST_COLL_USES_STRING,
+        TEST_COLL_USES_BOTH,
+        TEST_COLL_USES_STATIC,
+        TEST_COLL_COMPUTED_PLUS_STATIC,
+        TEST_COLL_NOT_CALLS_HELPER,
+    ],
 ))

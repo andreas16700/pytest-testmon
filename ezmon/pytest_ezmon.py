@@ -409,19 +409,24 @@ class TestmonCollect:
         self.cov_plugin = cov_plugin
         self._sessionstarttime = time.time()
 
-        # Collection-time file dependency tracking
-        # Maps test files to file dependencies read during import
-        self._collection_file_deps = {}
+        # Collection-time dependency tracking
+        # Maps test files to dependencies captured during import
+        self._collection_file_deps = {}  # {test_file: set of TrackedFile}
+        self._collection_local_imports = {}  # {test_file: set of module paths}
+        self._collection_external_imports = {}  # {test_file: set of package names}
+        self._collection_coverage = {}  # {test_file: {module_path: set of lines}}
 
-        # Start collection-time tracking to capture import-time file reads
+        # Start collection-time tracking to capture import-time dependencies
         self.testmon.dependency_tracker.start_collection_tracking()
+        # Start collection-time coverage to capture which lines are executed during import
+        self.testmon.setup_collection_coverage()
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_collectstart(self, collector):
         """Called when pytest starts collecting from a collector.
 
         For test modules (files), this sets the collection context so that
-        file reads during import are associated with this test file.
+        file reads and line execution during import are associated with this test file.
         """
         # Only track Module collectors (test files), not Session or Package
         if hasattr(collector, 'path') and hasattr(collector, 'fspath'):
@@ -432,6 +437,8 @@ class TestmonCollect:
                     str(collector.config.rootdir)
                 )
                 self.testmon.dependency_tracker.set_collection_context(test_file)
+                # Also switch coverage context to track which lines are executed
+                self.testmon.set_collection_coverage_context(test_file)
             except (AttributeError, ValueError):
                 pass
 
@@ -452,8 +459,15 @@ class TestmonCollect:
     def pytest_collection_modifyitems(
         self, session, config, items
     ):  # pylint: disable=unused-argument
-        # Stop collection tracking and get collected file dependencies
-        self._collection_file_deps = self.testmon.dependency_tracker.stop_collection_tracking()
+        # Stop collection tracking and get collected dependencies
+        (
+            self._collection_file_deps,
+            self._collection_local_imports,
+            self._collection_external_imports,
+        ) = self.testmon.dependency_tracker.stop_collection_tracking()
+
+        # Get collection-time coverage (lines executed during import)
+        self._collection_coverage = self.testmon.get_collection_coverage()
 
         should_sync = not session.testsfailed and self._running_as in (
             "single",
@@ -489,7 +503,7 @@ class TestmonCollect:
         if report.when == "teardown" and hasattr(report, "nodes_files_lines"):
             if report.nodes_files_lines:
                 # Merge collection-time file dependencies into coverage data
-                nodes_files_lines = self._merge_collection_file_deps(
+                nodes_files_lines = self._merge_collection_deps(
                     report.nodes_files_lines
                 )
 
@@ -501,31 +515,81 @@ class TestmonCollect:
                     nodes_files_lines=nodes_files_lines,
                 )
 
-    def _merge_collection_file_deps(self, nodes_files_lines):
-        """Merge collection-time file dependencies into coverage data.
+    def _merge_collection_deps(self, nodes_files_lines):
+        """Merge collection-time dependencies into coverage data.
 
-        Collection-time deps are associated with test files (e.g., "tests/test_a.py").
-        This method adds them to the appropriate individual test contexts.
+        Collection-time deps (file reads, imports, and line coverage) are associated
+        with test files (e.g., "tests/test_a.py"). This method adds them to the
+        appropriate individual test contexts so all tests in a file share the file's
+        import-time dependencies.
+
+        Key insight: We track both:
+        1. Which modules each test file imports (via dependency_tracker) - not affected by caching
+        2. What lines are executed during import (via coverage.py) - only first importer gets this
+
+        Due to Python's module caching, only the first test file to import a module gets
+        coverage data. We propagate that coverage to all other test files that import
+        the same module.
         """
-        if not self._collection_file_deps:
+        has_file_deps = bool(self._collection_file_deps)
+        has_collection_coverage = bool(self._collection_coverage)
+        has_local_imports = bool(self._collection_local_imports)
+        has_external_imports = bool(self._collection_external_imports)
+
+        if not (has_file_deps or has_collection_coverage or has_local_imports or has_external_imports):
             return nodes_files_lines
+
+        # Build a module -> coverage mapping from all collection coverage data
+        # This captures coverage from the first test file to import each module
+        module_coverage = {}  # {module_path: set of lines}
+        if has_collection_coverage:
+            for test_file, modules in self._collection_coverage.items():
+                for module_path, lines in modules.items():
+                    if module_path not in module_coverage:
+                        module_coverage[module_path] = lines.copy()
+                    else:
+                        # Merge in case different test files covered different lines
+                        module_coverage[module_path].update(lines)
 
         for test_nodeid, data in nodes_files_lines.items():
             # Extract test file from nodeid (e.g., "tests/test_a.py::test_func" -> "tests/test_a.py")
             test_file = test_nodeid.split("::")[0] if "::" in test_nodeid else test_nodeid
 
-            # Get collection-time file deps for this test file
-            collection_deps = self._collection_file_deps.get(test_file, set())
+            # Merge collection-time file deps (non-Python files read during import)
+            if has_file_deps:
+                collection_file_deps = self._collection_file_deps.get(test_file, set())
+                if collection_file_deps:
+                    file_deps_key = f"__file_deps__{test_nodeid}"
+                    if file_deps_key not in data:
+                        data[file_deps_key] = set()
+                    for tracked_file in collection_file_deps:
+                        data[file_deps_key].add((tracked_file.path, tracked_file.sha))
 
-            if collection_deps:
-                # Add to the special __file_deps__ key
-                file_deps_key = f"__file_deps__{test_nodeid}"
-                if file_deps_key not in data:
-                    data[file_deps_key] = set()
+            # Merge collection-time coverage for modules this test file imports
+            # This handles both:
+            # 1. Direct coverage (test file was first to import)
+            # 2. Propagated coverage (another test file imported first, but this one also imports)
+            if has_local_imports or has_collection_coverage:
+                # Get modules this test file imports
+                imported_modules = self._collection_local_imports.get(test_file, set())
 
-                # Merge collection-time deps
-                for tracked_file in collection_deps:
-                    data[file_deps_key].add((tracked_file.path, tracked_file.sha))
+                for module_path in imported_modules:
+                    # Get coverage for this module (from whichever test file captured it)
+                    if module_path in module_coverage:
+                        lines = module_coverage[module_path]
+                        if module_path in data:
+                            data[module_path].update(lines)
+                        else:
+                            data[module_path] = lines.copy()
+
+            # Merge collection-time external imports
+            if has_external_imports:
+                collection_external_imports = self._collection_external_imports.get(test_file, set())
+                if collection_external_imports:
+                    ext_deps_key = f"__external_deps__{test_nodeid}"
+                    if ext_deps_key not in data:
+                        data[ext_deps_key] = set()
+                    data[ext_deps_key].update(collection_external_imports)
 
         return nodes_files_lines
 

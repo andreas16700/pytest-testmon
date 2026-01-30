@@ -142,6 +142,9 @@ class NetDBIntegrationTestRunner:
         # Generate a unique job_id for this test run to ensure isolation
         self.run_id = f"test-{uuid.uuid4().hex[:8]}"
 
+        # Track all job_ids used during this test run for cleanup
+        self._used_job_ids: Set[str] = set()
+
     def log(self, msg: str, level: str = "info"):
         """Print a log message."""
         if level == "info":
@@ -171,25 +174,39 @@ class NetDBIntegrationTestRunner:
         except Exception as e:
             return False, f"Server connectivity error: {e}"
 
-    def reset_job_data(self, job_id: str) -> bool:
-        """Reset all data for a job. Returns True if successful."""
-        try:
-            result = self.client.reset_job(self.REPO_ID, job_id)
-            if result.get("success"):
-                self.log(f"Reset job data: {job_id}", "netdb")
-                return True
-            else:
-                self.log(f"Failed to reset job: {result}", "error")
-                return False
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                # Job doesn't exist yet, that's fine
-                return True
-            self.log(f"HTTP error resetting job: {e}", "error")
-            return False
-        except Exception as e:
-            self.log(f"Error resetting job: {e}", "error")
-            return False
+    def reset_job_data(self, job_id: str, retries: int = 3, quiet: bool = False) -> bool:
+        """Reset all data for a job. Returns True if successful.
+
+        Args:
+            job_id: The job ID to reset
+            retries: Number of retry attempts on failure
+            quiet: If True, don't log success (used for cleanup)
+        """
+        last_error = None
+        for attempt in range(retries):
+            try:
+                result = self.client.reset_job(self.REPO_ID, job_id)
+                if result.get("success"):
+                    if not quiet:
+                        self.log(f"Reset job data: {job_id}", "netdb")
+                    return True
+                else:
+                    last_error = f"Server returned: {result}"
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    # Job doesn't exist yet, that's fine
+                    return True
+                last_error = f"HTTP error: {e}"
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+            except Exception as e:
+                last_error = f"Error: {e}"
+
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+
+        self.log(f"Failed to reset job {job_id} after {retries} attempts: {last_error}", "error")
+        return False
 
     def setup_workspace(self) -> Path:
         """Create a temporary workspace with the sample project."""
@@ -375,6 +392,9 @@ class NetDBIntegrationTestRunner:
         Returns (success, message).
         """
         job_id = self.get_job_id(scenario.name)
+        # Track this job_id for global cleanup
+        self._used_job_ids.add(job_id)
+
         self.log(f"Running scenario: {Colors.BOLD}{scenario.name}{Colors.END} (job: {job_id})")
         self.log(f"  {scenario.description}", "debug")
 
@@ -452,6 +472,27 @@ class NetDBIntegrationTestRunner:
             # Reset job data to ensure idempotency
             self.reset_job_data(job_id)
 
+    def cleanup_all_jobs(self) -> int:
+        """Clean up all job data used during this test run.
+
+        Returns the number of jobs that failed to clean up.
+        """
+        failed = 0
+        if not self._used_job_ids:
+            return 0
+
+        self.log(f"Final cleanup: removing {len(self._used_job_ids)} job(s) from NetDB...", "debug")
+        for job_id in self._used_job_ids:
+            if not self.reset_job_data(job_id, retries=3, quiet=True):
+                failed += 1
+
+        if failed > 0:
+            self.log(f"Failed to clean up {failed} job(s)", "warning")
+        else:
+            self.log(f"Cleaned up {len(self._used_job_ids)} job(s)", "debug")
+
+        return failed
+
     def run_all_scenarios(self, scenario_filter: Optional[str] = None) -> bool:
         """Run all (or filtered) scenarios and report results."""
         scenarios_to_run = SCENARIOS
@@ -479,15 +520,19 @@ class NetDBIntegrationTestRunner:
         print("-" * 60)
 
         results = []
-        for name, scenario in scenarios_to_run.items():
-            success, message = self.run_scenario(scenario)
-            results.append((name, success, message))
+        try:
+            for name, scenario in scenarios_to_run.items():
+                success, message = self.run_scenario(scenario)
+                results.append((name, success, message))
 
-            if success:
-                self.log(f"{name}: {message}", "success")
-            else:
-                self.log(f"{name}: {message}", "error")
-            print()
+                if success:
+                    self.log(f"{name}: {message}", "success")
+                else:
+                    self.log(f"{name}: {message}", "error")
+                print()
+        finally:
+            # Always perform final cleanup of all jobs, even if tests are interrupted
+            self.cleanup_all_jobs()
 
         # Summary
         print("-" * 60)

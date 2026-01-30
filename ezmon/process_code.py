@@ -340,19 +340,22 @@ def create_fingerprint_source(source_code, lines, ext="py"):
 
 
 def create_fingerprint(module, covered_lines) -> [int]:
+    """Create a fingerprint from the blocks that contain covered lines.
+
+    With collection-time coverage tracking, we always have actual line numbers
+    for code executed during module import. This gives us precise fingerprinting -
+    only the blocks that were actually executed are included.
+    """
     blocks: [Block] = module.blocks
     method_reprs = []
 
-    # Special case: line 0 means "module was imported but no code executed"
-    # This happens when a test imports a module that was already loaded.
-    # In this case, include ALL blocks because the test depends on the entire module.
-    # Any change to any function in the module should trigger the test.
-    if covered_lines == {0} and blocks:
-        for block in blocks:
-            method_reprs.append(block.code)
+    # Filter out line 0 if present (legacy, should not happen with collection coverage)
+    covered_lines = {line for line in covered_lines if line > 0}
+
+    if not covered_lines:
         return methods_to_checksums(method_reprs)
 
-    # Normal case: find blocks that contain covered lines
+    # Find blocks that contain covered lines
     line_index = 0
     sorted_lines = sorted(covered_lines)
 

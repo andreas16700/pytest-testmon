@@ -7,85 +7,116 @@ This directory contains unit tests for pytest-ezmon, verifying the core fingerpr
 ```
 tests/
 ├── conftest.py             # Shared fixtures
-├── test_process_code.py    # Unit tests for fingerprint generation (24 tests)
+├── test_process_code.py    # Unit tests for fingerprint generation (29 tests)
 └── README.md               # This file
 
 integration_tests/          # Separate directory for integration tests
-├── run_integration_tests.py    # Main integration test runner
-├── test_all_versions.py        # Multi-version test script
-├── scenarios/                  # Declarative test scenarios
+├── run_integration_tests.py        # Main integration test runner (16 scenarios)
+├── test_file_dependency_indirect.py # File/import dependency tracking test
+├── test_parallel_execution.py      # Parallel execution tests (pytest-xdist)
+├── test_all_versions.py            # Multi-version test script
+├── scenarios/                      # Declarative test scenarios
 │   └── __init__.py
-├── sample_project/             # Example project with clear dependencies
-└── README.md                   # Integration test documentation
+├── sample_project/                 # Example project with clear dependencies
+└── README.md                       # Integration test documentation
 ```
 
-## Running Unit Tests
+## Running All Tests
 
-### Quick Start
+### Quick Commands
 
 ```bash
-# Run all unit tests
+# Unit tests
 pytest tests/ -v
 
-# Run with coverage
-pytest tests/ -v --cov=ezmon --cov-report=term-missing
+# Integration tests (normal mode)
+python integration_tests/run_integration_tests.py
+
+# Integration tests (NetDB mode)
+python integration_tests/run_integration_tests.py --netdb
+
+# Parallel execution tests
+pytest integration_tests/test_parallel_execution.py -v
+
+# File dependency tracking test
+python integration_tests/test_file_dependency_indirect.py
 ```
 
-### Specific Tests
+### Full Test Suite
 
 ```bash
-# Run fingerprint tests only
-pytest tests/test_process_code.py -v
-
-# Run a specific test
-pytest tests/test_process_code.py::test_module_blocks -v
+# Run everything
+pytest tests/ -v && \
+python integration_tests/run_integration_tests.py && \
+python integration_tests/run_integration_tests.py --netdb && \
+pytest integration_tests/test_parallel_execution.py -v && \
+python integration_tests/test_file_dependency_indirect.py
 ```
 
 ## Unit Tests (test_process_code.py)
 
-These tests verify the core fingerprinting logic:
+29 tests verifying the core fingerprinting logic:
 
-| Test | Description |
-|------|-------------|
-| `test_module_blocks` | Module creates correct block structure |
-| `test_function_blocks` | Function bodies extracted as separate blocks |
-| `test_class_method_blocks` | Class methods tracked correctly |
-| `test_nested_function_blocks` | Nested functions handled properly |
-| `test_comment_stripping` | Comments stripped before checksum |
-| `test_fingerprint_matching` | Fingerprints match/mismatch correctly |
-| `test_changed_function_body` | Function body changes detected |
-| `test_changed_module_level` | Module-level changes detected |
-| `test_added_function` | New functions don't break existing fingerprints |
-| `test_removed_function` | Removed functions properly invalidate fingerprints |
+| Category | Tests |
+|----------|-------|
+| Block Extraction | Function blocks, class methods, nested functions, async functions |
+| Comment Stripping | Single-line, indented, inline comments |
+| Docstring Stripping | Module, function, class docstrings |
+| Checksums | Identical code, whitespace handling, blob roundtrip |
+| Fingerprint Matching | Unchanged code, changed functions, added/removed functions |
+| Module Checksums | Constant changes, import changes |
+| Error Handling | Syntax errors, non-Python files |
 
 ## Integration Tests
 
-For integration tests that verify end-to-end selection behavior, see `integration_tests/README.md`.
+### Main Scenarios (run_integration_tests.py)
 
-Integration tests use:
-- A sample project with clear dependency chains
-- Declarative scenarios that modify code and verify selection
-- Multi-version Python testing (3.7-3.13)
+16 scenarios testing end-to-end selection behavior:
+
+| Scenario | Description |
+|----------|-------------|
+| `modify_math_utils` | Change shared utility, verify dependent tests selected |
+| `modify_string_utils` | Change string utility, verify correct selection |
+| `modify_calculator_only` | Change class, verify only class tests selected |
+| `modify_test_only` | Change test file, verify only that test selected |
+| `no_changes` | No changes, verify no tests selected |
+| `add_new_test` | Add new test, verify it runs |
+| `multiple_modifications` | Multiple file changes, verify all affected selected |
+| `modify_nested_class_method` | Nested class changes |
+| `modify_static_method` | Static method changes |
+| `modify_generator` | Generator function changes |
+| `modify_decorator` | Decorator changes |
+| `modify_context_manager` | Context manager changes |
+| `modify_config_file` | Non-Python file changes |
+| `modify_uncalled_method` | Unused method changes |
+| `modify_globals` | Global variable changes |
+
+### Parallel Execution Tests (test_parallel_execution.py)
+
+5 tests verifying pytest-xdist integration:
+
+- `test_sequential_baseline` - Sequential execution works
+- `test_parallel_small_subset` - Parallel execution with few workers
+- `test_parallel_coverage_saved` - Coverage data saved correctly in parallel
+- `test_parallel_netdb_basic` - Parallel + NetDB works
+- `test_parallel_netdb_coverage_collection` - Coverage collected in parallel NetDB mode
+
+### File Dependency Test (test_file_dependency_indirect.py)
+
+Tests collection-time dependency tracking:
+
+1. Creates project where `__init__.py` reads config file at import time
+2. Verifies config file is recorded as dependency
+3. Verifies changing config file triggers test re-runs
+
+### NetDB Mode
+
+NetDB mode tests the network database functionality where test data is stored on a remote server instead of locally.
 
 ```bash
-# Run all integration scenarios
-python integration_tests/run_integration_tests.py
-
-# Run across all Python versions
-python integration_tests/test_all_versions.py
-
-# List available scenarios
-python integration_tests/run_integration_tests.py --list
-
-# Run file dependency tracking test (import-time reads)
-python integration_tests/test_file_dependency_indirect.py
+# Run integration tests in NetDB mode
+python integration_tests/run_integration_tests.py --netdb
 ```
-
-### File Dependency Tracking Test
-
-The `test_file_dependency_indirect.py` test verifies that non-Python file dependencies are tracked correctly, even when files are read at module import time (not during test execution).
-
-See `docs/file-dependency-tracking.md` for detailed documentation on how file dependency tracking works.
 
 ## Python Version Compatibility
 
@@ -93,4 +124,7 @@ Tests are designed to work with:
 - Python 3.7, 3.8, 3.9, 3.10, 3.11, 3.12, 3.13
 - pytest 5.x, 6.x, 7.x, 8.x, 9.x
 
-Some edge cases may behave differently across versions due to AST changes.
+## Documentation
+
+- `docs/file-dependency-tracking.md` - Comprehensive documentation on dependency tracking
+- `docs/dependency-graph.md` - Dependency graph visualization feature

@@ -12,7 +12,6 @@ captured even when:
 - Modules are imported but no code is executed from them
 """
 
-import ast
 import builtins
 import hashlib
 import importlib
@@ -83,10 +82,12 @@ class DependencyTracker:
         self._active = False
 
         # Collection-time tracking state
-        # Tracks file reads that happen during test collection (import time)
+        # Tracks file reads and imports that happen during test collection (import time)
         self._collection_mode = False
         self._collection_context: Optional[str] = None  # Current test file being collected
         self._collection_file_deps: Dict[str, Set[TrackedFile]] = {}  # {test_file: set of TrackedFile}
+        self._collection_local_imports: Dict[str, Set[str]] = {}  # {test_file: set of local module paths}
+        self._collection_external_imports: Dict[str, Set[str]] = {}  # {test_file: set of external package names}
 
         # Cache for path checks
         self._path_cache: Dict[str, Optional[str]] = {}
@@ -333,20 +334,34 @@ class DependencyTracker:
                     self._tracked_files[self._current_context].add(tracked_file)
 
     def _track_import(self, module, name: str) -> None:
-        """Track a module import."""
-        if not self._active or not self._current_context:
+        """Track a module import.
+
+        Tracks imports in two modes:
+        - Collection mode: imports during test file collection (module load time)
+        - Execution mode: imports during test execution (dynamic imports)
+        """
+        # Determine tracking mode
+        in_execution_mode = self._active and self._current_context
+        in_collection_mode = self._collection_mode and self._collection_context
+
+        if not in_execution_mode and not in_collection_mode:
             return
 
         # Get module file path
         relpath = self._get_module_file(module)
 
         with self._lock:
-            context = self._current_context
-
             if relpath:
                 # Local module
-                if context in self._tracked_local_imports:
-                    self._tracked_local_imports[context].add(relpath)
+                if in_execution_mode:
+                    context = self._current_context
+                    if context in self._tracked_local_imports:
+                        self._tracked_local_imports[context].add(relpath)
+                if in_collection_mode:
+                    test_file = self._collection_context
+                    if test_file not in self._collection_local_imports:
+                        self._collection_local_imports[test_file] = set()
+                    self._collection_local_imports[test_file].add(relpath)
             else:
                 # External module (or built-in)
                 # Get the actual module name from the module object for accuracy
@@ -357,8 +372,15 @@ class DependencyTracker:
                     # This handles the case where the project being tested is pip-installed
                     # (e.g., matplotlib tests importing matplotlib.pyplot)
                     if pkg_name and not pkg_name.startswith('_') and not self._is_local_package(pkg_name):
-                        if context in self._tracked_external_imports:
-                            self._tracked_external_imports[context].add(pkg_name)
+                        if in_execution_mode:
+                            context = self._current_context
+                            if context in self._tracked_external_imports:
+                                self._tracked_external_imports[context].add(pkg_name)
+                        if in_collection_mode:
+                            test_file = self._collection_context
+                            if test_file not in self._collection_external_imports:
+                                self._collection_external_imports[test_file] = set()
+                            self._collection_external_imports[test_file].add(pkg_name)
 
     def _tracking_open(self, file, mode='r', *args, **kwargs):
         """Replacement for builtins.open that tracks file access."""
@@ -388,7 +410,9 @@ class DependencyTracker:
         """Replacement for builtins.__import__ that tracks imports."""
         result = self._original_import(name, globals, locals, fromlist, level)
 
-        if self._active:
+        # Track in either collection mode or test execution mode
+        should_track = self._active or (self._collection_mode and self._collection_context)
+        if should_track:
             try:
                 # Track the main module
                 self._track_import(result, name)
@@ -422,162 +446,15 @@ class DependencyTracker:
         """Replacement for importlib.import_module that tracks imports."""
         result = self._original_import_module(name, package)
 
-        if self._active:
+        # Track in either collection mode or test execution mode
+        should_track = self._active or (self._collection_mode and self._collection_context)
+        if should_track:
             try:
                 self._track_import(result, name)
             except Exception:
                 pass
 
         return result
-
-    def get_test_file_imports(self, test_file: Optional[str] = None) -> Set[str]:
-        """
-        Get all project modules imported by a test file.
-
-        This is called AFTER coverage runs to check which imports from the
-        test file weren't captured by coverage (because the module was already
-        loaded before the test ran).
-
-        Uses AST parsing to find import statements directly.
-
-        Args:
-            test_file: Relative path to the test file
-
-        Returns:
-            Set of relative paths to project modules imported by the test file
-        """
-        if not test_file:
-            return set()
-
-        # Use AST-based import detection (same as get_module_imports)
-        return self.get_module_imports(test_file)
-
-    def get_module_imports(self, module_path: str) -> Set[str]:
-        """
-        Get all project modules imported by a given module.
-
-        This enables tracking transitive dependencies:
-        - Test imports module_a
-        - module_a imports module_b (e.g., a globals file)
-        - Therefore, test depends on module_b
-
-        Uses AST parsing to find import statements, which catches imports of
-        primitive values (like global constants) that namespace inspection misses.
-
-        Args:
-            module_path: Relative path to the module (e.g., 'src/globals_consumer.py')
-
-        Returns:
-            Set of relative paths to project modules imported by this module
-        """
-        imports = set()
-
-        # Read and parse the module's source code
-        abs_path = os.path.join(self.rootdir, module_path)
-        if not os.path.exists(abs_path):
-            return imports
-
-        try:
-            with open(abs_path, 'r', encoding='utf-8') as f:
-                source = f.read()
-            tree = ast.parse(source)
-        except (SyntaxError, UnicodeDecodeError, OSError):
-            return imports
-
-        # Extract module names from import statements
-        imported_modules = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imported_modules.add(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imported_modules.add(node.module)
-
-        # Resolve each imported module to a file path
-        for module_name in imported_modules:
-            # Try to find the module file
-            module_file = self._resolve_module_to_file(module_name)
-            if module_file:
-                relpath = self._is_in_project(module_file)
-                if relpath and relpath != module_path:
-                    imports.add(relpath)
-
-        return imports
-
-    def get_module_external_imports(self, module_path: str) -> Set[str]:
-        """
-        Get all external package names imported by a given module.
-
-        This enables tracking external dependencies from module-level imports:
-        - Test imports src/external_deps.py
-        - external_deps.py imports 'requests', 'numpy' at module level
-        - Therefore, test depends on 'requests' and 'numpy' packages
-
-        Uses AST parsing to find import statements, which catches imports
-        that happen at module load time (before test-specific tracking starts).
-
-        Args:
-            module_path: Relative path to the module (e.g., 'src/external_deps.py')
-
-        Returns:
-            Set of external package names (top-level, e.g., 'requests', 'numpy')
-        """
-        external_imports = set()
-
-        # Read and parse the module's source code
-        abs_path = os.path.join(self.rootdir, module_path)
-        if not os.path.exists(abs_path):
-            return external_imports
-
-        try:
-            with open(abs_path, 'r', encoding='utf-8') as f:
-                source = f.read()
-            tree = ast.parse(source)
-        except (SyntaxError, UnicodeDecodeError, OSError):
-            return external_imports
-
-        # Extract module names from import statements
-        imported_modules = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imported_modules.add(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imported_modules.add(node.module)
-
-        # Filter for external packages (not local, not stdlib)
-        for module_name in imported_modules:
-            # Get top-level package name
-            pkg_name = self._get_package_name(module_name)
-
-            # Skip private modules
-            if pkg_name.startswith('_'):
-                continue
-
-            # Check if the top-level package is a local project package
-            # This handles pip-installed projects being tested (e.g., matplotlib tests)
-            if self._is_local_package(pkg_name):
-                continue
-
-            # Check if it's a local project module (file-based check)
-            module_file = self._resolve_module_to_file(module_name)
-            if module_file:
-                relpath = self._is_in_project(module_file)
-                if relpath:
-                    # It's a local module, skip
-                    continue
-
-            # Check if it's stdlib
-            if self._is_stdlib_module(module_name):
-                continue
-
-            # Check if the top-level package is installed (exists in sys.modules or can be found)
-            if pkg_name in sys.modules or self._is_installed_package(pkg_name):
-                external_imports.add(pkg_name)
-
-        return external_imports
 
     @lru_cache(maxsize=256)
     def _is_installed_package(self, pkg_name: str) -> bool:
@@ -628,15 +505,17 @@ class DependencyTracker:
 
     def start_collection_tracking(self) -> None:
         """
-        Start tracking file reads during test collection phase.
+        Start tracking file reads and imports during test collection phase.
 
         This should be called early in pytest_configure, before test collection
-        begins. File reads that happen during module imports will be captured
-        and associated with the test file being collected.
+        begins. File reads and imports that happen during module imports will
+        be captured and associated with the test file being collected.
         """
         with self._lock:
             self._collection_mode = True
             self._collection_file_deps = {}
+            self._collection_local_imports = {}
+            self._collection_external_imports = {}
             self._install_hooks()
 
     def set_collection_context(self, test_file: str) -> None:
@@ -644,8 +523,8 @@ class DependencyTracker:
         Set the current test file being collected.
 
         Called when pytest starts collecting a test module. Any file reads
-        that happen while collecting this module (including imports) will
-        be associated with this test file.
+        and imports that happen while collecting this module will be
+        associated with this test file.
 
         Args:
             test_file: Relative path to the test file (e.g., "tests/test_a.py")
@@ -654,36 +533,56 @@ class DependencyTracker:
             self._collection_context = test_file
             if test_file not in self._collection_file_deps:
                 self._collection_file_deps[test_file] = set()
+            if test_file not in self._collection_local_imports:
+                self._collection_local_imports[test_file] = set()
+            if test_file not in self._collection_external_imports:
+                self._collection_external_imports[test_file] = set()
 
     def clear_collection_context(self) -> None:
         """Clear the collection context after a test file is done being collected."""
         with self._lock:
             self._collection_context = None
 
-    def stop_collection_tracking(self) -> Dict[str, Set[TrackedFile]]:
+    def stop_collection_tracking(self) -> tuple:
         """
-        Stop collection tracking and return collected file dependencies.
+        Stop collection tracking and return collected dependencies.
 
         Returns:
-            Dict mapping test file paths to sets of TrackedFile dependencies
-            that were read during that test file's collection/import.
+            Tuple of three dicts:
+            - file_deps: {test_file: set of TrackedFile} - file read dependencies
+            - local_imports: {test_file: set of str} - local module import paths
+            - external_imports: {test_file: set of str} - external package names
         """
         with self._lock:
             self._collection_mode = False
             self._collection_context = None
-            result = self._collection_file_deps.copy()
+
+            file_deps = self._collection_file_deps.copy()
+            local_imports = self._collection_local_imports.copy()
+            external_imports = self._collection_external_imports.copy()
+
             self._collection_file_deps = {}
+            self._collection_local_imports = {}
+            self._collection_external_imports = {}
 
             # Only restore hooks if no test-time tracking is active
             if not self._active and not self._tracked_files:
                 self._restore_hooks()
 
-            return result
+            return file_deps, local_imports, external_imports
 
     def get_collection_file_deps(self) -> Dict[str, Set[TrackedFile]]:
         """Get the current collection file dependencies without stopping tracking."""
         with self._lock:
             return {k: v.copy() for k, v in self._collection_file_deps.items()}
+
+    def get_collection_imports(self) -> tuple:
+        """Get the current collection imports without stopping tracking."""
+        with self._lock:
+            return (
+                {k: v.copy() for k, v in self._collection_local_imports.items()},
+                {k: v.copy() for k, v in self._collection_external_imports.items()}
+            )
 
     # =========================================================================
     # Test execution tracking methods

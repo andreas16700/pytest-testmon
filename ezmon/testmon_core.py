@@ -42,7 +42,7 @@ from ezmon.dependency_tracker import DependencyTracker, file_sha_to_checksum
 
 T = TypeVar("T")
 
-TEST_BATCH_SIZE = 250
+TEST_BATCH_SIZE = 1
 
 CHECKUMS_ARRAY_TYPE = "I"
 DB_FILENAME = ".testmondata"
@@ -627,6 +627,10 @@ class TestmonCollector:
         # Store dependency graph edges: (source_file, target_file, target_package, edge_type)
         self._graph_edges = set()
 
+        # Collection-time coverage tracking
+        self._collection_cov: Coverage = None
+        self._collection_context: str = None  # Current test file being collected
+
     def start_cov(self):
         if not self.cov._started:
             TestmonCollector.coverage_stack.append(self.cov)
@@ -685,6 +689,63 @@ class TestmonCollector:
             TestmonCollector.coverage_stack[-1].stop()
 
         self.start_cov()
+
+    def setup_collection_coverage(self):
+        """Setup coverage for tracking collection-time code execution.
+
+        This captures which lines are executed when test files are imported,
+        giving us precise line coverage for collection-time dependencies.
+        """
+        params = {
+            "include": [os.path.join(self.rootdir, "*")],
+            "omit": {
+                os.path.join(value, "*")
+                for key, value in sysconfig.get_paths().items()
+                if key.endswith("lib")
+            },
+        }
+        self._collection_cov = Coverage(data_file=None, config_file=False, **params)
+        self._collection_cov._warn_no_data = False
+        self._collection_cov.start()
+
+    def set_collection_coverage_context(self, test_file: str):
+        """Switch collection coverage context to a test file.
+
+        Called when pytest starts collecting a test module.
+        """
+        if self._collection_cov is None:
+            return
+        self._collection_context = test_file
+        self._collection_cov.switch_context(test_file)
+
+    def get_collection_coverage(self) -> dict:
+        """Stop collection coverage and return coverage data per test file.
+
+        Returns:
+            Dict mapping test_file -> {module_path -> set of line numbers}
+        """
+        if self._collection_cov is None:
+            return {}
+
+        self._collection_cov.stop()
+        cov_data = self._collection_cov.get_data()
+
+        # Build per-test-file coverage data
+        collection_coverage = {}  # {test_file: {module_path: set(lines)}}
+
+        for file in cov_data.measured_files():
+            relfilename = cached_relpath(file, self.rootdir)
+            contexts_by_lineno = cov_data.contexts_by_lineno(file)
+
+            for lineno, contexts in contexts_by_lineno.items():
+                for context in contexts:
+                    if context:  # Skip empty context
+                        collection_coverage.setdefault(context, {}).setdefault(
+                            relfilename, set()
+                        ).add(lineno)
+
+        self._collection_cov = None
+        return collection_coverage
 
     def start_testmon(self, test_name, next_test_name=None):
         self._next_test_name = next_test_name
@@ -759,74 +820,29 @@ class TestmonCollector:
         """Merge tracked file and import dependencies into coverage data.
 
         Also collects dependency graph edges for visualization.
+
+        Note: Collection-time imports (module-level imports that happen during test
+        file collection) are tracked separately by the dependency tracker and merged
+        in pytest_ezmon.py via _merge_collection_deps(). This method handles:
+        - Runtime imports (dynamic imports during test execution)
+        - File reads during test execution
+        - Building dependency graph edges from runtime data
         """
         for test_name, (files, local_imports, external_imports, test_file) in self._tracked_deps.items():
             if test_name not in nodes_files_lines:
                 nodes_files_lines[test_name] = {}
 
-            # Make a mutable copy of external_imports to add discovered deps
-            all_external_imports = set(external_imports) if external_imports else set()
-
-            # Add local imports that were captured during runtime
-            # These are imports that happened DURING the test execution
+            # Build graph edges for local imports captured during runtime
+            # Note: We no longer add {0} as a fallback - coverage.py tracks the actual
+            # lines executed when functions are called. Collection-time imports are
+            # handled by _merge_collection_deps with precise line coverage.
             for local_import in local_imports:
-                if local_import not in nodes_files_lines[test_name]:
-                    nodes_files_lines[test_name][local_import] = {0}
+                if test_file:
+                    self._graph_edges.add((test_file, local_import, None, 'local'))
 
-            # Track transitive module-level imports
-            #
-            # IMPORTANT: When Python imports a module, it executes that module's
-            # top-level code, which includes any import statements in that module.
-            # This means if test T imports module M1, and M1 imports M2, then
-            # Python executes M2's module-level code as part of loading M1.
-            #
-            # Therefore, T depends on M2's module-level code even if T never
-            # calls any functions from M2. Changes to M2's module-level code
-            # (imports, constants, class definitions, etc.) could affect T.
-            #
-            # We track this by:
-            # 1. Getting direct imports from the test file
-            # 2. For each direct import, getting its transitive imports
-            # 3. Adding module-level fingerprints (line 0) for any modules
-            #    that coverage.py didn't track (because no code was called)
-            # 4. Extracting external package dependencies from each module
-            if test_file:
-                # Get direct imports from the test file using AST parsing
-                test_file_imports = self.dependency_tracker.get_test_file_imports(test_file)
-
-                # Also get external imports from the test file itself
-                test_file_external = self.dependency_tracker.get_module_external_imports(test_file)
-                all_external_imports.update(test_file_external)
-
-                # Collect graph edges: test_file -> imported modules
-                for imported_module in test_file_imports:
-                    # Graph edge: test file imports local module
-                    self._graph_edges.add((test_file, imported_module, None, 'local'))
-
-                    # Add the directly imported module if not already tracked
-                    if imported_module not in nodes_files_lines[test_name]:
-                        nodes_files_lines[test_name][imported_module] = {0}
-
-                    # Get transitive imports (modules that imported_module imports)
-                    transitive_imports = self.dependency_tracker.get_module_imports(imported_module)
-                    for transitive_import in transitive_imports:
-                        # Graph edge: imported module imports another module
-                        self._graph_edges.add((imported_module, transitive_import, None, 'local'))
-
-                        # Add if NOT already tracked by coverage
-                        if transitive_import not in nodes_files_lines[test_name]:
-                            nodes_files_lines[test_name][transitive_import] = {0}
-
-                    # Extract external package dependencies from this module
-                    # This catches imports like 'import requests' at module level
-                    module_external = self.dependency_tracker.get_module_external_imports(imported_module)
-                    for pkg in module_external:
-                        # Graph edge: module imports external package
-                        self._graph_edges.add((imported_module, None, pkg, 'external'))
-                    all_external_imports.update(module_external)
-
-                # Graph edges: test file imports external packages
-                for pkg in test_file_external:
+            # Build graph edges for external imports
+            if test_file and external_imports:
+                for pkg in external_imports:
                     self._graph_edges.add((test_file, None, pkg, 'external'))
 
             # Store file dependencies in a special key
@@ -837,9 +853,9 @@ class TestmonCollector:
                 nodes_files_lines[test_name][file_deps_key] = {(tf.path, tf.sha) for tf in files}
 
             # Store external imports for granular package tracking
-            if all_external_imports:
+            if external_imports:
                 ext_deps_key = f"__external_deps__{test_name}"
-                nodes_files_lines[test_name][ext_deps_key] = all_external_imports
+                nodes_files_lines[test_name][ext_deps_key] = set(external_imports)
 
         return nodes_files_lines
 
