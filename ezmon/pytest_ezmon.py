@@ -3,10 +3,13 @@
 Main module of ezmon pytest plugin.
 """
 import time
+import sqlite3
 import xmlrpc.client
 import os
+import json
+import shutil
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import date, timedelta
 
 from pathlib import Path
@@ -29,6 +32,7 @@ from ezmon.testmon_core import (
     get_test_execution_module_name,
     cached_relpath,
 )
+from ezmon.dependency_tracker import DependencyTracker
 from ezmon import configure
 from ezmon.common import get_logger, get_system_packages
 
@@ -41,7 +45,6 @@ def pytest_addoption(parser):
     group = parser.getgroup(
         "automatically select tests affected by changes (pytest-ezmon)"
     )
-
     group.addoption(
         "--ezmon",
         action="store_true",
@@ -118,13 +121,6 @@ def pytest_addoption(parser):
     )
 
     group.addoption(
-        "--ezmon-graph",
-        action="store_true",
-        dest="ezmon_graph",
-        help="Generate an interactive dependency graph (dependency_graph.html) of the project."
-    )
-
-    group.addoption(
         "--ezmon-no-reorder",
         action="store_true",
         dest="ezmon_no_reorder",
@@ -157,6 +153,17 @@ def pytest_addoption(parser):
     parser.addini("tmnet_api_key", "ezmon api key")
 
 
+def pytest_load_initial_conftests(early_config, parser, args):
+    # Start dependency tracking before conftest/package imports.
+    if "--ezmon" not in args:
+        return
+    rootpath = getattr(early_config, "rootpath", None)
+    rootdir = str(rootpath) if rootpath else os.getcwd()
+    tracker = DependencyTracker(rootdir)
+    tracker.start_collection_tracking()
+    early_config._ezmon_early_tracker = tracker
+
+
 def testmon_options(config):
     result = []
     for label in [
@@ -167,6 +174,76 @@ def testmon_options(config):
         if config.getoption(label):
             result.append(label.replace("testmon_", ""))
     return result
+
+
+_TIMING_BUFFER = defaultdict(list)
+
+
+def _timing_log_for_actor(actor, event, **fields):
+    timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
+    if not timing_dir:
+        return
+    payload = {
+        "event": event,
+        "actor": actor,
+        "ts": time.time(),
+        "mono": time.monotonic(),
+    }
+    if fields:
+        payload.update(fields)
+    # For diagnosing hangs, allow immediate flush of timing events.
+    if (
+        os.environ.get("EZMON_XDIST_TIMING_FLUSH_ALL")
+        or (actor == "controller" and os.environ.get("EZMON_XDIST_TIMING_FLUSH_CONTROLLER"))
+    ):
+        try:
+            os.makedirs(timing_dir, exist_ok=True)
+            path = os.path.join(timing_dir, f"{actor}.jsonl")
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload) + "\n")
+        except Exception:
+            return
+        return
+    _TIMING_BUFFER[str(actor)].append(payload)
+
+
+def _flush_timing_logs(timing_dir: str):
+    if not timing_dir:
+        return
+    try:
+        os.makedirs(timing_dir, exist_ok=True)
+        # Ensure the timeline viewer is available alongside timing logs.
+        src = os.path.join(os.path.dirname(__file__), "..", "scripts", "timing_timeline.html")
+        src = os.path.abspath(src)
+        dest = os.path.join(timing_dir, "timing_timeline.html")
+        if os.path.exists(src):
+            try:
+                if (not os.path.exists(dest)) or (os.path.getmtime(src) > os.path.getmtime(dest)):
+                    shutil.copyfile(src, dest)
+            except Exception:
+                pass
+        for actor, events in _TIMING_BUFFER.items():
+            path = os.path.join(timing_dir, f"{actor}.jsonl")
+            with open(path, "a", encoding="utf-8") as handle:
+                for payload in events:
+                    handle.write(json.dumps(payload) + "\n")
+    except Exception:
+        return
+
+
+def _timing_log(config, event, **fields):
+    if config is None:
+        return
+    actor = getattr(config, "workerid", None)
+    if not actor and hasattr(config, "workerinput"):
+        try:
+            actor = config.workerinput.get("workerid")  # xdist sets this in workerinput
+        except Exception:
+            actor = None
+    if not actor:
+        running_as = get_running_as(config)
+        actor = "controller" if running_as == "controller" else "single"
+    _timing_log_for_actor(actor, event, **fields)
 
 
 
@@ -180,20 +257,56 @@ def init_testmon_data(config: Config):
     # Workers receive pre-computed stability data from the controller via workerinput
     # This prevents race conditions where workers independently compute different stable_test_names
     if running_as == "worker" and hasattr(config, "workerinput"):
+        _timing_log(config, "worker_init_testmon_start")
+        _timing_log(config, "worker_start")
         workerinput = config.workerinput
+        _timing_log(config, "worker_received_start")
+        payload_dir = os.environ.get("EZMON_WORKER_PAYLOAD_DIR")
+        if payload_dir:
+            worker_id = getattr(config, "workerid", "worker")
+            worker_path = os.path.join(payload_dir, str(worker_id))
+            os.makedirs(worker_path, exist_ok=True)
+            def _jsonable(value):
+                if isinstance(value, dict):
+                    return {str(k): _jsonable(v) for k, v in value.items()}
+                if isinstance(value, set):
+                    return [_jsonable(v) for v in value]
+                if isinstance(value, tuple):
+                    return [_jsonable(v) for v in value]
+                if isinstance(value, list):
+                    return [_jsonable(v) for v in value]
+                return value
+            try:
+                with open(os.path.join(worker_path, "received.json"), "w", encoding="utf-8") as f:
+                    json.dump(_jsonable(workerinput), f)
+            except Exception as exc:
+                logger.warning(f"Failed to write workerinput for {worker_id}: {exc}")
         if "testmon_exec_id" in workerinput:
             # Create TestmonData for worker using controller's pre-computed data
+            # Workers receive unstable_test_names (tests to RUN) - much smaller than stable
+            _timing_log(config, "worker_apply_input_start")
             testmon_data = TestmonData.for_worker(
                 rootdir=config.rootdir.strpath,
                 exec_id=workerinput["testmon_exec_id"],
-                stable_test_names=workerinput.get("testmon_stable_test_names", set()),
+                unstable_test_names=workerinput.get("testmon_unstable_test_names", set()),
                 files_of_interest=workerinput.get("testmon_files_of_interest", []),
                 changed_packages=workerinput.get("testmon_changed_packages", set()),
+                explicitly_nocollect_files=workerinput.get("testmon_explicitly_nocollect_files", []),
+                min_collected_files=workerinput.get("testmon_min_collected_files", []),
+                expected_imports=workerinput.get("testmon_expected_imports", []),
+                expected_reads=workerinput.get("testmon_expected_reads", []),
+                expected_packages=workerinput.get("testmon_expected_packages", []),
+                expected_files_list=workerinput.get("testmon_expected_files_list", []),
+                expected_packages_list=workerinput.get("testmon_expected_packages_list", []),
             )
             config.testmon_data = testmon_data
+            _timing_log(config, "worker_apply_input_end")
+            _timing_log(config, "worker_received_end")
+            _timing_log(config, "worker_init_testmon_end")
             return
 
     # Controller or single process: compute stability normally
+    _timing_log(config, "controller_init_start")
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
     )
@@ -213,8 +326,9 @@ def init_testmon_data(config: Config):
         system_packages=system_packages,
         readonly=False,  # Controller/single always writes
     )
-    testmon_data.determine_stable(bool(None))
+    testmon_data.determine_stable()
     config.testmon_data = testmon_data
+    _timing_log(config, "controller_init_end")
 
 
 def get_running_as(config):
@@ -230,21 +344,27 @@ def get_running_as(config):
 def register_plugins(config, should_select, should_collect, cov_plugin):
     if should_select or should_collect:
         config.pluginmanager.register(
-            TestmonSelect(config, config.testmon_data), "TestmonSelect"
+            TestmonSelect(config, config.testmon_data, running_as=get_running_as(config)), "TestmonSelect"
         )
 
-    if should_collect:
-        store_coverage_lines = config.getoption("ezmon_coverage_lines", False)
+    if should_select or should_collect:
         config.pluginmanager.register(
             TestmonCollect(
                 TestmonCollector(
                     config.rootdir.strpath,
                     testmon_labels=testmon_options(config),
                     cov_plugin=cov_plugin,
+                    expected_imports=getattr(config.testmon_data, "expected_imports", None),
+                    expected_reads=getattr(config.testmon_data, "expected_reads", None),
+                    expected_packages=getattr(config.testmon_data, "expected_packages", None),
+                    expected_files_list=getattr(config.testmon_data, "expected_files_list", None),
+                    expected_packages_list=getattr(config.testmon_data, "expected_packages_list", None),
+                    package_index=getattr(config.testmon_data, "package_code_map", None),
+                    dependency_tracker=getattr(config, "_ezmon_early_tracker", None),
                 ),
                 config.testmon_data,
                 running_as=get_running_as(config),
-                store_coverage_lines=store_coverage_lines,
+                config=config,
             ),
             "TestmonCollect",
         )
@@ -253,6 +373,7 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
 
 
 def pytest_configure(config):
+    _timing_log(config, "worker_configure_start")
     # Initialize defaults
     config.always_run_files = []
     config.prioritized_files = []
@@ -280,18 +401,49 @@ def pytest_configure(config):
     cov_plugin = None
     cov_plugin = config.pluginmanager.get_plugin("_cov")
 
+    _timing_log(config, "worker_header_collect_select_start")
     tm_conf = configure.header_collect_select(
         config, coverage_stack, cov_plugin=cov_plugin
+    )
+    _timing_log(
+        config,
+        "worker_header_collect_select_end",
+        select=tm_conf.select,
+        collect=tm_conf.collect,
     )
     config.testmon_config: TmConf = tm_conf
     if tm_conf.select or tm_conf.collect:
         try:
             init_testmon_data(config)
+            _timing_log(config, "worker_register_plugins_start")
             register_plugins(config, tm_conf.select, tm_conf.collect, cov_plugin)
+            _timing_log(config, "worker_register_plugins_end")
         except TestmonException as error:
             pytest.exit(str(error))
 
+    _timing_log(config, "worker_configure_end")
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_auto_num_workers(config):
+    """Cap xdist auto workers for very large test suites."""
+    if not config.pluginmanager.hasplugin("xdist"):
+        return None
+    testmon_data = getattr(config, "testmon_data", None)
+    if not testmon_data:
+        return None
+    try:
+        total_tests = len(testmon_data.all_tests or [])
+    except Exception:
+        return None
+    max_workers = int(os.environ.get("EZMON_XDIST_MAX_WORKERS", "8"))
+    if total_tests > 50000:
+        return min(os.cpu_count() or 4, max_workers)
+    return os.cpu_count() or 4
+
 def pytest_report_header(config):
+    if get_running_as(config) == "worker":
+        return ""
     tm_conf = config.testmon_config
 
     if tm_conf.collect or tm_conf.select:
@@ -333,6 +485,26 @@ def pytest_report_header(config):
     return tm_conf.message
 
 
+def pytest_sessionstart(session):
+    _timing_log(session.config, "worker_sessionstart_start")
+    _timing_log(session.config, "worker_sessionstart_end")
+
+
+def pytest_collectstart(collector):
+    _timing_log(collector.session.config, "worker_collectstart", nodeid=getattr(collector, "nodeid", None))
+
+
+def pytest_collectreport(report):
+    try:
+        count = len(report.result)
+    except Exception:
+        count = None
+    cfg = getattr(report, "config", None)
+    if cfg is None:
+        cfg = getattr(report, "session", None).config if getattr(report, "session", None) else None
+    _timing_log(cfg, "worker_collectreport", count=count, nodeid=getattr(report, "nodeid", None))
+
+
 def changed_message(
     config,
     environment,
@@ -366,35 +538,29 @@ def changed_message(
     return message
 
 def pytest_unconfigure(config):
+    running_as = get_running_as(config)
+    if running_as in ("single", "controller"):
+        _timing_log(config, "controller_unconfigure_start")
     # Close and commit database FIRST (flush all changes to disk)
-    logger.info("pytest_configure function!")
+    logger.info("pytest_unconfigure function!")
     if hasattr(config, "testmon_data"):
         try:
-            if hasattr(config.testmon_data, 'db') and hasattr(config.testmon_data.db, 'con'):
-                # 1. Commit changes
-                config.testmon_data.db.con.commit()
-                logger.info("💾 Database committed")
-                
-                # 2. CRITICAL: Close the connection to force WAL checkpoint
-                # This merges .testmondata-wal into .testmondata
-                config.testmon_data.db.con.close()
-                logger.info("🔒 SQLite connection closed (WAL checkpointed)")
-                
-                # Prevent double closing
-                config.testmon_data.db.con = None
-            
-            # Call the class method (even if empty)
-            config.testmon_data.close_connection()
-            
-        except Exception as e:
-            logger.warning(f"Failed to close testmon database: {e}")
+            if running_as in ("single", "controller"):
+                if hasattr(config.testmon_data, "db"):
+                    _timing_log(config, "controller_db_close_start")
+                    config.testmon_data.db.close()
+                    _timing_log(config, "controller_db_close_end")
+                    logger.info("💾 Database committed and closed (WAL checkpointed)")
+        except Exception as exc:
+            logger.warning(f"Failed to close testmon database: {exc}")
 
     # Only upload from main process (not xdist workers)
-    if get_running_as(config) not in ("single", "controller"):
+    if running_as not in ("single", "controller"):
         return
 
     # Upload if sync is enabled - AFTER database is committed and closed
     if should_sync():
+        _timing_log(config, "controller_upload_start")
         testmon_file = get_testmon_file(config)
         logger.info(f"Testmon file path: {testmon_file}")
         # Give file system time to flush
@@ -406,55 +572,154 @@ def pytest_unconfigure(config):
             upload_testmon_data(testmon_file, repo_name)
         else:
             logger.info("No testmon data to upload")
-
-        # Note: Dependency graph data is now collected automatically during
-        # test execution and stored in the database (no separate upload needed).
+        _timing_log(config, "controller_upload_end")
+    timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
+    if timing_dir:
+        _timing_log(config, "controller_flush_timing_start")
+        _flush_timing_logs(timing_dir)
+        _timing_log(config, "controller_flush_timing_end")
+    if running_as in ("single", "controller"):
+        _timing_log(config, "controller_unconfigure_end")
 
 
 class TestmonCollect:
-    def __init__(self, testmon, testmon_data, running_as="single", cov_plugin=None, store_coverage_lines=False):
+    """Collects test dependencies during test execution.
+
+    With the no-coverage model, we rely solely on the DependencyTracker
+    to identify file dependencies via import hooks.
+    """
+
+    def __init__(self, testmon, testmon_data, running_as="single", cov_plugin=None, config=None):
         self.testmon_data: TestmonData = testmon_data
         self.testmon: TestmonCollector = testmon
         self._running_as = running_as
-        self._store_coverage_lines = store_coverage_lines
+        self._config = config
 
-        self.reports = defaultdict(lambda: {})
+        self._outcomes = {}
         self.raw_test_names = []
-        self.cov_plugin = cov_plugin
         self._sessionstarttime = time.time()
+        self._file_nodes = defaultdict(dict)  # {test_file: {test_name: deps}}
+        self._file_tests = defaultdict(set)  # {test_file: set(test_name)}
+        self._worker_aggregate_files = {}
+        self._worker_batches = []
+        self._worker_batch_size = 5
+        self._file_index = {}
+        self._package_index = {}
+        self._path_encoder = testmon_data.path_encoder
+        # Aggregate hook timings (per worker/single)
+        self._timing_totals = defaultdict(float)
+        self._timing_counts = defaultdict(int)
+        self._write_queue = deque()
 
         # Collection-time dependency tracking
         # Maps test files to dependencies captured during import
         self._collection_file_deps = {}  # {test_file: set of TrackedFile}
         self._collection_local_imports = {}  # {test_file: set of module paths}
         self._collection_external_imports = {}  # {test_file: set of package names}
-        self._collection_coverage = {}  # {test_file: {module_path: set of lines}}
+        self._global_collection_stopped = False
+        self._active_collection_file = None
 
         # Start collection-time tracking to capture import-time dependencies
-        self.testmon.dependency_tracker.start_collection_tracking()
-        # Start collection-time coverage to capture which lines are executed during import
-        self.testmon.setup_collection_coverage()
+        if not getattr(self.testmon.dependency_tracker, "_collection_mode", False):
+            self.testmon.dependency_tracker.start_collection_tracking()
+
+        # Worker-specific tuning.
+        if running_as == "worker":
+            if config is not None:
+                worker_id = getattr(config, "workerid", "")
+                if isinstance(worker_id, str) and worker_id.startswith("gw"):
+                    try:
+                        worker_num = int(worker_id[2:])
+                        self._worker_batch_size = 3 + (worker_num % 5)
+                    except ValueError:
+                        pass
+            # Workers should not compute git SHAs; controller will fill them
+            self.testmon.dependency_tracker.set_compute_shas(False)
+            if getattr(self.testmon_data, "package_code_map", None):
+                self._package_index = dict(self.testmon_data.package_code_map)
+            # Workers still execute collection hooks; global and per-file
+            # baselines are captured directly by the dependency tracker.
+
+    def _enqueue_write(self, test_executions_fingerprints, failed_tests):
+        if self._running_as != "controller":
+            return
+        self._write_queue.append(("deps", test_executions_fingerprints, failed_tests))
+
+    def _enqueue_sync(self, retain):
+        if self._running_as != "controller":
+            return
+        self._write_queue.append(("sync", retain, None))
+
+    def _drain_write_queue(self):
+        if self._running_as != "controller":
+            return
+        if self._config is not None:
+            _timing_log(self._config, "controller_drain_queue_start", size=len(self._write_queue))
+        while self._write_queue:
+            kind, payload, failed_tests = self._write_queue[0]
+            try:
+                if kind == "deps":
+                    if payload:
+                        if self._config is not None:
+                            _timing_log(self._config, "controller_save_bitmap_start")
+                        self.testmon_data.save_test_deps_bitmap(payload)
+                        if self._config is not None:
+                            _timing_log(self._config, "controller_save_bitmap_end")
+                    for test_name in failed_tests or []:
+                        test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                        self.testmon_data.db.get_or_create_test_id(
+                            self.testmon_data.exec_id,
+                            test_name,
+                            duration=self._outcomes.get(test_name, {}).get("duration", 0.0),
+                            failed=True,
+                            test_file=test_file,
+                        )
+                elif kind == "sync":
+                    self.testmon_data.sync_db_fs_tests(retain=set(payload))
+            except sqlite3.OperationalError as exc:
+                if "database is locked" in str(exc):
+                    time.sleep(0.05)
+                    continue
+                raise
+            self._write_queue.popleft()
+        if self._config is not None:
+            _timing_log(self._config, "controller_drain_queue_end")
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_collectstart(self, collector):
         """Called when pytest starts collecting from a collector.
 
         For test modules (files), this sets the collection context so that
-        file reads and line execution during import are associated with this test file.
+        file reads and imports during collection are associated with this test file.
         """
-        # Only track Module collectors (test files), not Session or Package
-        if hasattr(collector, 'path') and hasattr(collector, 'fspath'):
-            # It's a Module or similar file-based collector
-            try:
-                test_file = cached_relpath(
-                    str(collector.path),
-                    str(collector.config.rootdir)
-                )
-                self.testmon.dependency_tracker.set_collection_context(test_file)
-                # Also switch coverage context to track which lines are executed
-                self.testmon.set_collection_coverage_context(test_file)
-            except (AttributeError, ValueError):
-                pass
+        # Freeze global tracking at the first collection event so global deps
+        # are strictly pre-test-file-collection dependencies.
+        if not self._global_collection_stopped:
+            self.testmon.dependency_tracker.stop_global_tracking()
+            self._global_collection_stopped = True
+
+        try:
+            path_str = str(collector.path)
+        except Exception:
+            return
+
+        if not path_str.endswith(".py"):
+            return
+        base = os.path.basename(path_str)
+        if base == "conftest.py":
+            return
+
+        try:
+            test_file = cached_relpath(
+                path_str,
+                str(collector.config.rootdir)
+            )
+            if self._active_collection_file and self._active_collection_file != test_file:
+                self.testmon.dependency_tracker.stop_file_tracking(self._active_collection_file)
+            self.testmon.dependency_tracker.start_file_tracking(test_file)
+            self._active_collection_file = test_file
+        except (AttributeError, ValueError):
+            pass
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
     def pytest_pycollect_makeitem(
@@ -473,31 +738,89 @@ class TestmonCollect:
     def pytest_collection_modifyitems(
         self, session, config, items
     ):  # pylint: disable=unused-argument
+        _timing_log(config, "collection_start", item_count=len(items))
         # Stop collection tracking and get collected dependencies
         (
             self._collection_file_deps,
             self._collection_local_imports,
             self._collection_external_imports,
         ) = self.testmon.dependency_tracker.stop_collection_tracking()
-
-        # Get collection-time coverage (lines executed during import)
-        self._collection_coverage = self.testmon.get_collection_coverage()
+        self._active_collection_file = None
 
         should_sync = not session.testsfailed and self._running_as in (
             "single",
             "controller",
         )
         if should_sync:
-            config.testmon_data.sync_db_fs_tests(retain=set(self.raw_test_names))
+            if self._running_as == "controller":
+                self._enqueue_sync(set(self.raw_test_names))
+                self._drain_write_queue()
+            else:
+                config.testmon_data.sync_db_fs_tests(retain=set(self.raw_test_names))
+        _timing_log(
+            config,
+            "collection_end",
+            item_count=len(items),
+            raw_count=len(self.raw_test_names),
+        )
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(
         self, item, nextitem
     ):  # pylint: disable=unused-argument
+        current_file = item.nodeid.split("::")[0] if "::" in item.nodeid else item.nodeid
+        if getattr(self, "_current_test_file", None) != current_file:
+            if getattr(self, "_current_test_file", None):
+                self.testmon.dependency_tracker.end_test_file(self._current_test_file)
+            self._current_test_file = current_file
+            self.testmon.dependency_tracker.start_test_file(current_file)
+            _timing_log(
+                item.session.config,
+                "worker_file_exec_start",
+                test_file=current_file,
+            )
+        if not getattr(self, "_seen_first_test", False):
+            self._seen_first_test = True
+            _timing_log(item.session.config, "worker_first_test_start")
+        self._file_tests[current_file].add(item.nodeid)
+        t0 = time.monotonic()
         self.testmon.start_testmon(item.nodeid, nextitem.nodeid if nextitem else None)
+        self._timing_totals["start_testmon"] += time.monotonic() - t0
+        self._timing_counts["start_testmon"] += 1
         result = yield
         if result.excinfo and issubclass(result.excinfo[0], BaseException):
             self.testmon.discard_current()
+        deps_payload = self.testmon.stop_testmon()
+        self._file_nodes[current_file][item.nodeid] = deps_payload
+        # Finalize when leaving a test file
+        if self._running_as in ("single", "controller"):
+            next_file = None
+            if nextitem is not None:
+                next_file = nextitem.nodeid.split("::")[0] if "::" in nextitem.nodeid else nextitem.nodeid
+            if nextitem is None or current_file != next_file:
+                t1 = time.monotonic()
+                self._finalize_test_file(current_file)
+                self._timing_totals["finalize_file"] += time.monotonic() - t1
+                self._timing_counts["finalize_file"] += 1
+        elif self._running_as == "worker":
+            next_file = None
+            if nextitem is not None:
+                next_file = nextitem.nodeid.split("::")[0] if "::" in nextitem.nodeid else nextitem.nodeid
+            if nextitem is None or current_file != next_file:
+                test_count = len(self._file_tests.get(current_file, []))
+                t1 = time.monotonic()
+                self._finalize_worker_test_file(current_file)
+                self._timing_totals["finalize_worker_file"] += time.monotonic() - t1
+                self._timing_counts["finalize_worker_file"] += 1
+                _timing_log(
+                    item.session.config,
+                    "worker_file_exec_end",
+                    test_file=current_file,
+                    test_count=test_count,
+                )
+        if getattr(self, "_seen_first_test", False) and not getattr(self, "_marked_first_test_end", False):
+            self._marked_first_test_end = True
+            _timing_log(item.session.config, "worker_first_test_end")
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):  # pylint: disable=unused-argument
@@ -505,133 +828,629 @@ class TestmonCollect:
 
         if call.when == "teardown":
             report = result.get_result()
-            report.nodes_files_lines = self.testmon.get_batch_coverage_data()
-            result.force_result(report)
+            if self._running_as == "worker":
+                pass
+            else:
+                pass
 
     @pytest.hookimpl
     def pytest_runtest_logreport(self, report):
+        outcome = self._outcomes.get(report.nodeid)
+        if outcome is None:
+            outcome = {"failed": False, "duration": 0.0}
+            self._outcomes[report.nodeid] = outcome
+        outcome["duration"] += getattr(report, "duration", 0.0) or 0.0
+        if report.outcome == "failed":
+            outcome["failed"] = True
+
         if self._running_as == "worker":
+            if report.when == "call" and self._worker_batches:
+                batch = self._worker_batches.pop(0)
+                props = getattr(report, "user_properties", None)
+                if props is None:
+                    report.user_properties = []
+                    props = report.user_properties
+                props.append(("ezmon_batch", batch))
             return
-
-        self.reports[report.nodeid][report.when] = report
-        if report.when == "teardown" and hasattr(report, "nodes_files_lines"):
-            if report.nodes_files_lines:
-                # Merge collection-time file dependencies into coverage data
-                nodes_files_lines = self._merge_collection_deps(
-                    report.nodes_files_lines
+        if self._running_as == "controller":
+            props = getattr(report, "user_properties", None) or []
+            for key, value in props:
+                if key != "ezmon_batch":
+                    continue
+                worker_id = (
+                    getattr(report, "worker_id", None)
+                    or getattr(report, "workerid", None)
+                    or "worker"
                 )
-
-                test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
-                    nodes_files_lines, self.reports
+                self._handle_worker_output(
+                    {
+                        "testmon_nodes_files_lines": {
+                            "__format__": "file_common_unique_v2",
+                            "batches": [value],
+                        }
+                    },
+                    worker_id,
                 )
-                self.testmon_data.save_test_execution_file_fps(
-                    test_executions_fingerprints,
-                    nodes_files_lines=nodes_files_lines if self._store_coverage_lines else None,
-                )
+            return
+        # Per-test deps are captured in pytest_runtest_protocol via stop_testmon.
 
     def _merge_collection_deps(self, nodes_files_lines):
-        """Merge collection-time dependencies into coverage data.
-
-        Collection-time deps (file reads, imports, and line coverage) are associated
-        with test files (e.g., "tests/test_a.py"). This method adds them to the
-        appropriate individual test contexts so all tests in a file share the file's
-        import-time dependencies.
-
-        Key insight: We track both:
-        1. Which modules each test file imports (via dependency_tracker) - not affected by caching
-        2. What lines are executed during import (via coverage.py) - only first importer gets this
-
-        Due to Python's module caching, only the first test file to import a module gets
-        coverage data. We propagate that coverage to all other test files that import
-        the same module.
-        """
+        """Merge collection-time dependencies into test data."""
+        t0 = time.monotonic()
         has_file_deps = bool(self._collection_file_deps)
-        has_collection_coverage = bool(self._collection_coverage)
         has_local_imports = bool(self._collection_local_imports)
         has_external_imports = bool(self._collection_external_imports)
 
-        if not (has_file_deps or has_collection_coverage or has_local_imports or has_external_imports):
+        # Include global baseline deps captured before per-file collection begins.
+        global_base_deps = getattr(self.testmon.dependency_tracker, "_checkpoint_local_imports", set())
+        global_file_deps = getattr(self.testmon.dependency_tracker, "_checkpoint_file_deps", set())
+        has_global_deps = bool(global_base_deps) or bool(global_file_deps)
+
+        if not (has_file_deps or has_local_imports or has_external_imports or has_global_deps):
+            self._timing_totals["merge_collection_deps"] += time.monotonic() - t0
+            self._timing_counts["merge_collection_deps"] += 1
             return nodes_files_lines
 
-        # Build a module -> coverage mapping from all collection coverage data
-        # This captures coverage from the first test file to import each module
-        module_coverage = {}  # {module_path: set of lines}
-        if has_collection_coverage:
-            for test_file, modules in self._collection_coverage.items():
-                for module_path, lines in modules.items():
-                    if module_path not in module_coverage:
-                        module_coverage[module_path] = lines.copy()
-                    else:
-                        # Merge in case different test files covered different lines
-                        module_coverage[module_path].update(lines)
-
         for test_nodeid, data in nodes_files_lines.items():
-            # Extract test file from nodeid (e.g., "tests/test_a.py::test_func" -> "tests/test_a.py")
+            if "deps" not in data:
+                data["deps"] = set()
+            if "file_deps" not in data:
+                data["file_deps"] = set()
+            if "external_deps" not in data:
+                data["external_deps"] = set()
+
             test_file = test_nodeid.split("::")[0] if "::" in test_nodeid else test_nodeid
 
-            # Merge collection-time file deps (non-Python files read during import)
             if has_file_deps:
                 collection_file_deps = self._collection_file_deps.get(test_file, set())
-                if collection_file_deps:
-                    file_deps_key = f"__file_deps__{test_nodeid}"
-                    if file_deps_key not in data:
-                        data[file_deps_key] = set()
-                    for tracked_file in collection_file_deps:
-                        data[file_deps_key].add((tracked_file.path, tracked_file.sha))
+                for tracked_file in collection_file_deps:
+                    data["file_deps"].add((tracked_file.path, tracked_file.sha))
 
-            # Merge collection-time coverage for modules this test file imports
-            # This handles both:
-            # 1. Direct coverage (test file was first to import)
-            # 2. Propagated coverage (another test file imported first, but this one also imports)
-            if has_local_imports or has_collection_coverage:
-                # Get modules this test file imports
+            if has_local_imports:
                 imported_modules = self._collection_local_imports.get(test_file, set())
+                if imported_modules:
+                    data["deps"].update(imported_modules)
 
-                for module_path in imported_modules:
-                    # Get coverage for this module (from whichever test file captured it)
-                    if module_path in module_coverage:
-                        lines = module_coverage[module_path]
-                        if module_path in data:
-                            data[module_path].update(lines)
-                        else:
-                            data[module_path] = lines.copy()
+            if global_base_deps:
+                data["deps"].update(global_base_deps)
 
-            # Merge collection-time external imports
+            if global_file_deps:
+                for tracked_file in global_file_deps:
+                    data["file_deps"].add((tracked_file.path, tracked_file.sha))
+
             if has_external_imports:
                 collection_external_imports = self._collection_external_imports.get(test_file, set())
                 if collection_external_imports:
-                    ext_deps_key = f"__external_deps__{test_nodeid}"
-                    if ext_deps_key not in data:
-                        data[ext_deps_key] = set()
-                    data[ext_deps_key].update(collection_external_imports)
+                    data["external_deps"].update(collection_external_imports)
 
+        self._timing_totals["merge_collection_deps"] += time.monotonic() - t0
+        self._timing_counts["merge_collection_deps"] += 1
         return nodes_files_lines
+
+    def _finalize_test_file(self, test_file: str) -> None:
+        """Compute common/unique deps for a test file and persist results."""
+        if self._config is not None:
+            _timing_log(self._config, "controller_finalize_file_start")
+        t0 = time.monotonic()
+        nodes = self._file_nodes.pop(test_file, {})
+        tests_in_file = self._file_tests.pop(test_file, set())
+        if not nodes:
+            nodes = {}
+
+        succeeded = {}
+        for test_name in tests_in_file or nodes.keys():
+            deps = nodes.get(test_name)
+            if deps is None:
+                deps = {"deps": {test_file}, "file_deps": set(), "external_deps": set()}
+            outcome = self._outcomes.get(test_name, {"failed": False, "duration": 0.0})
+            if outcome.get("failed"):
+                # Mark failed tests but do not update deps
+                self.testmon_data.db.get_or_create_test_id(
+                    self.testmon_data.exec_id,
+                    test_name,
+                    duration=outcome.get("duration"),
+                    failed=True,
+                    test_file=test_file,
+                )
+            else:
+                succeeded[test_name] = deps
+
+        if not succeeded:
+            self._timing_totals["finalize_test_file_body"] += time.monotonic() - t0
+            self._timing_counts["finalize_test_file_body"] += 1
+            if self._config is not None:
+                _timing_log(self._config, "controller_finalize_file_end")
+            return
+
+        common, unique = self._compute_common_unique(succeeded)
+        merged_nodes = {}
+        for test_name, deps in succeeded.items():
+            merged = {}
+            for key, value in common.items():
+                merged[key] = set(value)
+            for key, value in unique.get(test_name, {}).items():
+                if key in merged:
+                    merged[key].update(value)
+                else:
+                    merged[key] = set(value)
+            merged_nodes[test_name] = merged
+
+        merged_nodes = self._merge_collection_deps(merged_nodes)
+
+        test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
+            merged_nodes, self._outcomes
+        )
+        self.testmon_data.save_test_deps_bitmap(test_executions_fingerprints)
+        self._timing_totals["finalize_test_file_body"] += time.monotonic() - t0
+        self._timing_counts["finalize_test_file_body"] += 1
+        if self._config is not None:
+            _timing_log(self._config, "controller_finalize_file_end")
+
+    def _compute_common_unique(self, nodes):
+        """Return (common_deps, unique_deps_by_test) for simplified payloads."""
+        common = None
+        for deps in nodes.values():
+            normalized = {
+                "deps": set(deps.get("deps", set())),
+                "file_deps": set(deps.get("file_deps", set())),
+                "external_deps": set(deps.get("external_deps", set())),
+            }
+            if common is None:
+                common = normalized
+                continue
+            for key in ("deps", "file_deps", "external_deps"):
+                common[key] &= normalized[key]
+        if common is None:
+            common = {"deps": set(), "file_deps": set(), "external_deps": set()}
+
+        unique = {}
+        for test_name, deps in nodes.items():
+            norm = {
+                "deps": set(deps.get("deps", set())),
+                "file_deps": set(deps.get("file_deps", set())),
+                "external_deps": set(deps.get("external_deps", set())),
+            }
+            unique_deps = {}
+            for key in ("deps", "file_deps", "external_deps"):
+                diff = norm[key] - common[key]
+                if diff:
+                    unique_deps[key] = diff
+            unique[test_name] = unique_deps
+        return common, unique
+
+    def _encode_worker_deps(self, deps):
+        if self._running_as != "worker":
+            return deps
+
+        def _encode_path(path: str) -> str:
+            # Avoid double-encoding: if path doesn't exist under root, assume encoded.
+            try:
+                root = Path(self.testmon_data.rootdir)
+                candidate = Path(path)
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                if not candidate.exists():
+                    return path
+            except Exception:
+                return path
+            return self._path_encoder.encode(path)
+
+        encoded = {"deps": set(), "file_deps": set(), "external_deps": set()}
+        for path in deps.get("deps", set()):
+            encoded["deps"].add(_encode_path(path))
+
+        for path, sha in deps.get("file_deps", set()):
+            encoded["file_deps"].add((_encode_path(path), sha))
+
+        for pkg in deps.get("external_deps", set()):
+            encoded["external_deps"].add(self._package_index.get(pkg, pkg))
+        return encoded
+
+    def _finalize_worker_test_file(self, test_file: str) -> None:
+        if self._config is not None:
+            _timing_log(self._config, "worker_finalize_file_start", test_file=test_file)
+        t0 = time.monotonic()
+        nodes = self._file_nodes.pop(test_file, {})
+        tests_in_file = self._file_tests.pop(test_file, set())
+        if not nodes:
+            nodes = {}
+
+        succeeded = {}
+        for test_name in tests_in_file or nodes.keys():
+            deps = nodes.get(test_name)
+            if deps is None:
+                deps = {"deps": {test_file}, "file_deps": set(), "external_deps": set()}
+            outcome = self._outcomes.get(test_name, {"failed": False, "duration": 0.0})
+            if not outcome.get("failed"):
+                succeeded[test_name] = deps
+
+        if not succeeded:
+            return
+
+        common, unique = self._compute_common_unique(succeeded)
+        encoded_common = self._encode_worker_deps(common)
+        encoded_test_file = self._path_encoder.encode(test_file)
+
+        def _deps_to_payload(deps):
+            payload = {}
+            files = deps.get("file_deps", set())
+            if files:
+                payload["f"] = [path for path, _sha in files]
+            py_deps = deps.get("deps", set())
+            if py_deps:
+                payload["p"] = list(py_deps)
+            ext = deps.get("external_deps", set())
+            if ext:
+                payload["e"] = list(ext)
+            return payload
+
+        def _suffix_for(name):
+            if name.startswith(test_file + "::"):
+                return name[len(test_file) + 2 :]
+            if name == test_file:
+                return ""
+            return name
+
+        suffixes = [_suffix_for(name) for name in unique.keys()]
+
+        prefixes = []
+        prefix_index = {}
+        for suffix in suffixes:
+            if "::" in suffix:
+                prefix = "::".join(suffix.split("::")[:-1])
+                if prefix not in prefix_index:
+                    prefix_index[prefix] = len(prefixes) + 1
+                    prefixes.append(prefix)
+
+        def _encode_name(suffix):
+            if "::" not in suffix:
+                return "0|" + suffix
+            parts = suffix.split("::")
+            prefix = "::".join(parts[:-1])
+            last = parts[-1]
+            return f"{prefix_index[prefix]}|{last}"
+
+        t_names = []
+        for suffix in suffixes:
+            t_names.append(_encode_name(suffix))
+        name_to_index = {name: idx for idx, name in enumerate(t_names)}
+
+        file_payload = {}
+        common_payload = _deps_to_payload(encoded_common)
+        if common_payload:
+            file_payload["com"] = common_payload
+
+        etc = []
+        dur = [0.0] * len(t_names)
+        fail = []
+        for (test_name, deps), suffix in zip(unique.items(), suffixes):
+            encoded_deps = self._encode_worker_deps(deps)
+            test_payload = _deps_to_payload(encoded_deps)
+            encoded_name = _encode_name(suffix)
+            idx = name_to_index.get(encoded_name)
+            if idx is None:
+                continue
+            outcome = self._outcomes.get(test_name, {"failed": False, "duration": 0.0})
+            dur[idx] = outcome.get("duration", 0.0) or 0.0
+            if outcome.get("failed"):
+                fail.append(idx)
+            if test_payload:
+                file_payload[str(idx)] = test_payload
+            else:
+                etc.append(idx)
+
+        file_payload["t_names"] = t_names
+        if etc:
+            file_payload["etc"] = etc
+        if fail:
+            file_payload["fail"] = fail
+        file_payload["dur"] = dur
+
+        if prefixes:
+            file_payload["pm"] = prefixes
+
+        self._worker_aggregate_files[encoded_test_file] = file_payload
+        if len(self._worker_aggregate_files) >= self._worker_batch_size:
+            self._worker_batches.append({"files": dict(self._worker_aggregate_files)})
+            self._worker_aggregate_files.clear()
+        self._timing_totals["finalize_worker_file_body"] += time.monotonic() - t0
+        self._timing_counts["finalize_worker_file_body"] += 1
+        if self._config is not None:
+            _timing_log(self._config, "worker_finalize_file_end", test_file=test_file)
 
     def pytest_keyboard_interrupt(self, excinfo):  # pylint: disable=unused-argument
         if self._running_as == "single":
             nodes_files_lines = self.testmon.get_batch_coverage_data()
 
             test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
-                nodes_files_lines, self.reports
+                nodes_files_lines, self._outcomes
             )
-            self.testmon_data.save_test_execution_file_fps(
-                test_executions_fingerprints,
-                nodes_files_lines=nodes_files_lines if self._store_coverage_lines else None,
-            )
+            self.testmon_data.save_test_deps_bitmap(test_executions_fingerprints)
             self.testmon.close()
 
     def pytest_sessionfinish(self, session):  # pylint: disable=unused-argument
+        if self._running_as == "worker":
+            workeroutput = getattr(session.config, "workeroutput", None)
+            if workeroutput is not None:
+                _timing_log(session.config, "worker_send_start")
+                files_items = list(self._worker_aggregate_files.items())
+                _timing_log(session.config, "worker_batch_build_start", file_count=len(files_items))
+                batches = list(self._worker_batches)
+                if self._worker_aggregate_files:
+                    batches.append({"files": dict(self._worker_aggregate_files)})
+                    self._worker_aggregate_files.clear()
+                for idx, batch in enumerate(batches):
+                    _timing_log(
+                        session.config,
+                        "worker_batch_start",
+                        batch_index=idx,
+                        file_count=len(batch.get("files") or {}),
+                    )
+                    _timing_log(
+                        session.config,
+                        "worker_batch_end",
+                        batch_index=idx,
+                        file_count=len(batch.get("files") or {}),
+                    )
+                _timing_log(session.config, "worker_batch_build_end", batch_count=len(batches))
+                workeroutput["testmon_nodes_files_lines"] = {
+                    "__format__": "file_common_unique_v2",
+                    "batches": batches,
+                }
+                _timing_log(
+                    session.config,
+                    "worker_send_end",
+                    batch_count=len(batches),
+                    file_count=len(files_items),
+                )
+            _timing_log(session.config, "worker_end")
+            _timing_log(
+                session.config,
+                "worker_hook_totals",
+                totals=dict(self._timing_totals),
+                counts=dict(self._timing_counts),
+            )
         if self._running_as in ("single", "controller"):
+            if self._running_as == "controller":
+                self._drain_write_queue()
+            _timing_log(session.config, "controller_save_deps_start")
             self.testmon_data.db.finish_execution(
                 self.testmon_data.exec_id,
                 time.time() - self._sessionstarttime,
                 session.config.testmon_config.select,
+                commit_id=self.testmon_data.commit_id,
             )
-            # Save dependency graph edges after finish_execution (which creates run_uid)
-            graph_edges = self.testmon.get_graph_edges()
-            if graph_edges:
-                self.testmon_data.save_dependency_graph(graph_edges)
+            _timing_log(session.config, "controller_save_deps_end")
+            _timing_log(
+                session.config,
+                "controller_hook_totals",
+                totals=dict(self._timing_totals),
+                counts=dict(self._timing_counts),
+            )
+        timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
+        if timing_dir:
+            _flush_timing_logs(timing_dir)
         self.testmon.close()
+
+    def _handle_worker_output(self, workeroutput, worker_id):
+        _timing_log_for_actor("controller", "controller_receive_start", worker_id=worker_id)
+        payload_dir = os.environ.get("EZMON_WORKER_PAYLOAD_DIR")
+        if payload_dir:
+            worker_path = os.path.join(payload_dir, str(worker_id))
+            os.makedirs(worker_path, exist_ok=True)
+            counter_path = os.path.join(worker_path, "sent_index.txt")
+            try:
+                with open(counter_path, "r", encoding="utf-8") as f:
+                    idx = int(f.read().strip() or "0")
+            except Exception:
+                idx = 0
+            def _jsonable(value):
+                if isinstance(value, dict):
+                    return {str(k): _jsonable(v) for k, v in value.items()}
+                if isinstance(value, set):
+                    return [_jsonable(v) for v in value]
+                if isinstance(value, tuple):
+                    return [_jsonable(v) for v in value]
+                if isinstance(value, list):
+                    return [_jsonable(v) for v in value]
+                return value
+            try:
+                nodes_payload = workeroutput.get("testmon_nodes_files_lines")
+                if isinstance(nodes_payload, dict) and "batches" in nodes_payload:
+                    for batch in nodes_payload.get("batches") or []:
+                        batch_payload = dict(workeroutput)
+                        batch_payload["testmon_nodes_files_lines"] = {
+                            "__format__": nodes_payload.get("__format__"),
+                            "batches": [batch],
+                        }
+                        with open(os.path.join(worker_path, f"sent_{idx}.json"), "w", encoding="utf-8") as f:
+                            json.dump(_jsonable(batch_payload), f)
+                        idx += 1
+                else:
+                    with open(os.path.join(worker_path, f"sent_{idx}.json"), "w", encoding="utf-8") as f:
+                        json.dump(_jsonable(workeroutput), f)
+                    idx += 1
+                with open(counter_path, "w", encoding="utf-8") as f:
+                    f.write(str(idx))
+            except Exception as exc:
+                logger.warning(f"Failed to write workeroutput for {worker_id}: {exc}")
+        nodes_files_lines = workeroutput.get("testmon_nodes_files_lines") or {}
+        expanded = {}
+        if not (
+            isinstance(nodes_files_lines, dict)
+            and nodes_files_lines.get("__format__") == "file_common_unique_v2"
+        ):
+            _timing_log_for_actor("controller", "controller_receive_end", worker_id=worker_id, batch_count=0)
+            return
+        batches = nodes_files_lines.get("batches") or []
+        path_encoder = self.testmon_data.path_encoder
+        for batch_index, batch in enumerate(batches):
+            _timing_log_for_actor(
+                "controller",
+                "controller_batch_start",
+                worker_id=worker_id,
+                batch_index=batch_index,
+                file_count=len(batch.get("files") or {}),
+            )
+            files_payload = batch.get("files") or {}
+            for encoded_file, payload in files_payload.items():
+                test_file = str(path_encoder.decode(encoded_file))
+                if test_file.startswith(str(self.testmon_data.rootdir)):
+                    test_file = cached_relpath(test_file, str(self.testmon_data.rootdir))
+                prefix_map = payload.get("pm", []) or []
+                t_names = payload.get("t_names") or []
+                durations = payload.get("dur") or []
+                failed_idx = set(payload.get("fail") or [])
+                common_payload = payload.get("com") or {}
+                common = {}
+                if "p" in common_payload:
+                    common["deps"] = set(common_payload["p"])
+                if "f" in common_payload:
+                    common["file_deps"] = set((path, None) for path in common_payload["f"])
+                if "e" in common_payload:
+                    common["external_deps"] = set(common_payload["e"])
+
+                def _merge_unique(unique_payload):
+                    merged = {
+                        "deps": set(common.get("deps", set())),
+                        "file_deps": set(common.get("file_deps", set())),
+                        "external_deps": set(common.get("external_deps", set())),
+                    }
+                    if "p" in unique_payload:
+                        merged.setdefault("deps", set()).update(unique_payload["p"])
+                    if "f" in unique_payload:
+                        merged.setdefault("file_deps", set()).update(
+                            (path, None) for path in unique_payload["f"]
+                        )
+                    if "e" in unique_payload:
+                        merged.setdefault("external_deps", set()).update(unique_payload["e"])
+                    return merged
+
+                def _decode_name(encoded_name):
+                    if "|" not in encoded_name:
+                        return encoded_name
+                    prefix_id, last = encoded_name.split("|", 1)
+                    try:
+                        prefix_id = int(prefix_id)
+                    except ValueError:
+                        return encoded_name
+                    if prefix_id == 0:
+                        return last
+                    if 0 < prefix_id <= len(prefix_map):
+                        return f"{prefix_map[prefix_id - 1]}::{last}"
+                    return encoded_name
+
+                for suffix, deps_payload in payload.items():
+                    if suffix in ("com", "etc", "pm", "t_names", "dur", "fail"):
+                        continue
+                    try:
+                        idx = int(suffix)
+                    except ValueError:
+                        continue
+                    if idx < 0 or idx >= len(t_names):
+                        continue
+                    decoded = _decode_name(t_names[idx])
+                    if decoded and not decoded.startswith(test_file):
+                        test_name = f"{test_file}::{decoded}"
+                    else:
+                        test_name = decoded or test_file
+                    expanded[test_name] = _merge_unique(deps_payload or {})
+                    if idx < len(durations):
+                        outcome = self._outcomes.get(test_name)
+                        if outcome is None:
+                            outcome = {"failed": False, "duration": 0.0}
+                            self._outcomes[test_name] = outcome
+                        outcome["duration"] = durations[idx]
+                        if idx in failed_idx:
+                            outcome["failed"] = True
+
+                for idx in payload.get("etc", []) or []:
+                    if idx < 0 or idx >= len(t_names):
+                        continue
+                    decoded = _decode_name(t_names[idx])
+                    if decoded and not decoded.startswith(test_file):
+                        test_name = f"{test_file}::{decoded}"
+                    else:
+                        test_name = decoded or test_file
+                    expanded[test_name] = {
+                        "deps": set(common.get("deps", set())),
+                        "file_deps": set(common.get("file_deps", set())),
+                        "external_deps": set(common.get("external_deps", set())),
+                    }
+                    if idx < len(durations):
+                        outcome = self._outcomes.get(test_name)
+                        if outcome is None:
+                            outcome = {"failed": False, "duration": 0.0}
+                            self._outcomes[test_name] = outcome
+                        outcome["duration"] = durations[idx]
+                        if idx in failed_idx:
+                            outcome["failed"] = True
+            _timing_log_for_actor(
+                "controller",
+                "controller_batch_end",
+                worker_id=worker_id,
+                batch_index=batch_index,
+                file_count=len(batch.get("files") or {}),
+            )
+        _timing_log_for_actor("controller", "controller_receive_end", worker_id=worker_id, batch_count=len(batches))
+        nodes_files_lines = expanded
+        test_executions_fingerprints = None
+        if nodes_files_lines:
+            _timing_log_for_actor("controller", "controller_merge_collection_start", worker_id=worker_id)
+            nodes_files_lines = self._merge_collection_deps(nodes_files_lines)
+            _timing_log_for_actor("controller", "controller_merge_collection_end", worker_id=worker_id)
+            _timing_log_for_actor("controller", "controller_fingerprint_start", worker_id=worker_id)
+            test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
+                nodes_files_lines, self._outcomes
+            )
+            _timing_log_for_actor("controller", "controller_fingerprint_end", worker_id=worker_id)
+
+        failed_tests = [
+            name
+            for name, outcome in self._outcomes.items()
+            if outcome.get("failed")
+        ]
+        if self._running_as == "controller":
+            self._enqueue_write(test_executions_fingerprints, failed_tests)
+            self._drain_write_queue()
+        else:
+            if test_executions_fingerprints:
+                self.testmon_data.save_test_deps_bitmap(test_executions_fingerprints)
+            for test_name in failed_tests:
+                test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                self.testmon_data.db.get_or_create_test_id(
+                    self.testmon_data.exec_id,
+                    test_name,
+                    duration=self._outcomes.get(test_name, {}).get("duration", 0.0),
+                    failed=True,
+                    test_file=test_file,
+                )
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_down(self, node, error):  # pylint: disable=unused-argument
+        if self._running_as != "controller":
+            return
+        workeroutput = getattr(node, "workeroutput", None) or {}
+        worker_id = (
+            getattr(node, "workerid", None)
+            or getattr(node, "name", None)
+            or getattr(getattr(node, "gateway", None), "id", None)
+            or "worker"
+        )
+        self._handle_worker_output(workeroutput, worker_id)
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error):  # pylint: disable=unused-argument
+        if self._running_as != "controller":
+            return
+        workeroutput = getattr(node, "workeroutput", None) or {}
+        worker_id = (
+            getattr(node, "workerid", None)
+            or getattr(node, "name", None)
+            or getattr(getattr(node, "gateway", None), "id", None)
+            or "worker"
+        )
+        self._handle_worker_output(workeroutput, worker_id)
 
 
 class TestmonXdistSync:
@@ -656,18 +1475,59 @@ class TestmonXdistSync:
             return
 
         if hasattr(node.config, "testmon_data") and hasattr(node, "workerinput"):
+            worker_id = (
+                getattr(node, "workerid", None)
+                or getattr(node, "name", None)
+                or getattr(getattr(node, "gateway", None), "id", None)
+                or "worker"
+            )
+            _timing_log_for_actor("controller", "controller_send_start", worker_id=worker_id)
             testmon_data = node.config.testmon_data
             # Pass all data workers need to avoid recomputing stability
+            # Pass unstable_test_names (tests to RUN) instead of stable_test_names
+            # This is ~750x smaller (255 tests vs 230k) for large test suites
             node.workerinput["testmon_exec_id"] = testmon_data.exec_id
-            node.workerinput["testmon_stable_test_names"] = list(
-                testmon_data.stable_test_names or set()
+            node.workerinput["testmon_unstable_test_names"] = list(
+                testmon_data.unstable_test_names or set()
             )
             node.workerinput["testmon_files_of_interest"] = list(
-                testmon_data.files_of_interest or []
+                testmon_data.path_encoder.encode(path)
+                for path in (testmon_data.files_of_interest or [])
             )
             node.workerinput["testmon_changed_packages"] = list(
                 getattr(testmon_data, "changed_packages", set()) or set()
             )
+            node.workerinput["testmon_explicitly_nocollect_files"] = list(
+                testmon_data.path_encoder.encode(path)
+                for path in (
+                    getattr(testmon_data, "explicitly_nocollect_files", set())
+                    or set()
+                )
+            )
+            node.workerinput["testmon_min_collected_files"] = list(
+                testmon_data.path_encoder.encode(path)
+                for path in (
+                    getattr(testmon_data, "min_collected_files", set())
+                    or set()
+                )
+            )
+            node.workerinput["testmon_expected_imports"] = list(
+                getattr(testmon_data, "expected_imports", set()) or set()
+            )
+            node.workerinput["testmon_expected_reads"] = list(
+                getattr(testmon_data, "expected_reads", set()) or set()
+            )
+            node.workerinput["testmon_expected_packages"] = list(
+                getattr(testmon_data, "expected_packages", set()) or set()
+            )
+            node.workerinput["testmon_expected_files_list"] = list(
+                getattr(testmon_data, "expected_files_list", []) or []
+            )
+            node.workerinput["testmon_expected_packages_list"] = list(
+                getattr(testmon_data, "expected_packages_list", []) or []
+            )
+            _timing_log_for_actor("controller", "controller_send_end", worker_id=worker_id)
+
 
     def pytest_testnodeready(self, node):  # pylint: disable=unused-argument
         self.await_nodes += 1
@@ -676,8 +1536,15 @@ class TestmonXdistSync:
         self, node, ids
     ):  # pylint: disable=invalid-name
         self.await_nodes += -1
-        if self.await_nodes == 0:
-            node.config.testmon_data.sync_db_fs_tests(retain=set(ids))
+        if self.await_nodes != 0:
+            return
+        if get_running_as(node.config) != "controller":
+            return
+        collect_plugin = node.config.pluginmanager.get_plugin("TestmonCollect")
+        if not collect_plugin:
+            return
+        collect_plugin._enqueue_sync(set(ids))
+        collect_plugin._drain_write_queue()
 
 
 def did_fail(reports):
@@ -712,25 +1579,43 @@ def format_time_saved(seconds):
 
 
 class TestmonSelect:
-    def __init__(self, config, testmon_data):
+    def __init__(self, config, testmon_data, running_as: str):
         self.testmon_data: TestmonData = testmon_data
         self.config = config
 
-        failing_files, failing_test_names = get_failing(testmon_data.all_tests)
+        self._running_as = running_as
+        failing_files, failing_test_names = set(), {}
+        if running_as != "worker":
+            failing_files, failing_test_names = get_failing(testmon_data.all_tests)
 
-        self.deselected_files = [
-            file for file in testmon_data.stable_files if file not in failing_files
-        ]
-        self.deselected_tests = [
-            test_name
-            for test_name in testmon_data.stable_test_names
-            if test_name not in failing_test_names
-        ]
+        # Capture the set of known tests BEFORE sync_db_fs_tests adds new ones
+        # This is used to detect truly new tests that should always run
+        if running_as != "worker":
+            self._known_tests_at_start = set(testmon_data.all_tests.keys()) if testmon_data.all_tests else set()
+        else:
+            self._known_tests_at_start = set()
+
+        # On fresh DB or no baseline data, run all tests (no deselection)
+        # selected_tests = None means "select all"
+        if testmon_data.unstable_test_names is None:
+            self.selected_tests = None
+        else:
+            self.selected_tests = set(testmon_data.unstable_test_names or set())
+            self.selected_tests.update(
+                failing_test_names.keys() if isinstance(failing_test_names, dict) else failing_test_names
+            )
+
+        self.explicitly_nocollect_files = set(
+            getattr(testmon_data, "explicitly_nocollect_files", set()) or set()
+        )
+        self._file_code_map = {}
+        self._path_encoder = testmon_data.path_encoder
+
         self._interrupted = False
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), config.rootdir.strpath)
-        
+
         # Check if this file is in the "always run" list
         always_run_files = getattr(config, "always_run_files", [])
 
@@ -738,17 +1623,25 @@ class TestmonSelect:
         
         if is_forced:
             return None  # Don't ignore - force collection
-        
-        if strpath in self.deselected_files and self.config.testmon_config.select:
+
+        try:
+            is_dir = collection_path.is_dir()
+        except AttributeError:
+            is_dir = collection_path.isdir()
+
+        encoded_path = self._path_encoder.encode(strpath)
+        if not is_dir and encoded_path in self.explicitly_nocollect_files:
             return True
         return None
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
+        # Workers receive items from controller - skip selection/sorting logic
+        if self._running_as == "worker":
+            return
+        _timing_log(config, "selection_start", item_count=len(items))
         always_run_files = getattr(config, "always_run_files", [])
         prioritized_files = getattr(config, "prioritized_files", [])
-        print("always run files are", always_run_files)
-        print("prioritized files are", prioritized_files)
 
         # normalized versions (for comparison)
         normalized_always = [f.replace("\\", "/").lower() for f in always_run_files]
@@ -779,7 +1672,8 @@ class TestmonSelect:
 
             if matched_forced:
                 forced_by_file[matched_forced].append(item)
-                if item.nodeid in self.deselected_tests:
+                # selected_tests=None means all tests run (fresh DB)
+                if self.selected_tests is not None and item.nodeid not in self.selected_tests:
                     forced_count += 1
                 continue
 
@@ -790,14 +1684,22 @@ class TestmonSelect:
                     matched_prioritized = original_f
                     break
 
-            if matched_prioritized and item.nodeid not in self.deselected_tests:
+            # selected_tests=None means all tests run (fresh DB)
+            if matched_prioritized and (self.selected_tests is None or item.nodeid in self.selected_tests):
                 # Only prioritize if testmon would run it anyway
                 prioritized_by_file[matched_prioritized].append(item)
                 continue
 
             # Neither forced nor prioritized
-            if item.nodeid in self.deselected_tests:
-                deselected.append(item)
+            # selected_tests=None means all tests run (fresh DB)
+            if self.selected_tests is not None and item.nodeid not in self.selected_tests:
+                # Only deselect if the test was KNOWN at start (before sync_db_fs_tests)
+                # New tests (not in _known_tests_at_start) should always run
+                if item.nodeid in self._known_tests_at_start:
+                    deselected.append(item)
+                else:
+                    # New test - run it
+                    normal_selected.append(item)
             else:
                 normal_selected.append(item)
 
@@ -807,15 +1709,11 @@ class TestmonSelect:
             forced_by_file[f].sort(key=source_order_key)
             forced.extend(forced_by_file[f])
 
-        print("Forced tests are", forced)
-
         # 2) Prioritized: user's order + source order (NOT duration-sorted)
         prioritized = []
         for f in prioritized_files:
             prioritized_by_file[f].sort(key=source_order_key)
             prioritized.extend(prioritized_by_file[f])
-
-        print("Prioritized tests are", prioritized)
 
         # 3) Normal selected: duration priority (your existing testmon behavior)
         # Skip reordering if --ezmon-no-reorder is set
@@ -842,16 +1740,26 @@ class TestmonSelect:
             if not no_reorder:
                 sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
+        _timing_log(
+            config,
+            "selection_end",
+            selected_count=len(selected),
+            deselected_count=len(deselected),
+            forced_count=forced_count,
+            prioritized_count=len(prioritized),
+        )
+
+    @pytest.hookimpl(trylast=True, hookwrapper=True)
+    def pytest_runtestloop(self, session):  # pylint: disable=unused-argument
+        _timing_log(self.config, "runtestloop_start")
+        yield
+        _timing_log(self.config, "runtestloop_end")
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
-        if len(self.deselected_tests) and exitstatus == ExitCode.NO_TESTS_COLLECTED:
+        # If RTS is active (selected_tests exists) and no tests were collected,
+        # that's success - it means no tests were affected by changes
+        if hasattr(self, 'selected_tests') and exitstatus == ExitCode.NO_TESTS_COLLECTED:
             session.exitstatus = ExitCode.OK
-
-        if self.config.getoption("ezmon_graph"):
-            # The --ezmon-graph option is now deprecated.
-            # Dependency graph data is automatically collected during test execution
-            # and stored in the database. View it in the ez-viz interface.
-            logger.info("Note: --ezmon-graph is deprecated. Dependency graph is now collected automatically during test execution.")
 
     @pytest.hookimpl(trylast=True)
     def pytest_terminal_summary(self):

@@ -1,67 +1,120 @@
-# pytest-ezmon Architecture Documentation
+# pytest-ezmon-nocov Architecture Documentation
 
-**Version:** 2.1.4-a2
+**Version:** 3.0.0-nocov
 **Fork of:** [pytest-testmon](https://github.com/tarpas/pytest-testmon)
 **Python Support:** 3.7+ (we maintain compatibility with Python 3.7, unlike upstream which requires 3.10+)
 
 ## Overview
 
-pytest-ezmon is a pytest plugin that automatically selects and re-executes only tests affected by recent code changes. It achieves this through:
+pytest-ezmon-nocov is a pytest plugin that automatically selects and re-executes only tests affected by recent code changes. Unlike the original testmon which uses coverage.py, **ezmon-nocov uses import-based tracking**:
 
-1. **Coverage-based dependency tracking**: Uses `coverage.py` to track which lines of code each test executes
-2. **Fingerprint-based change detection**: Creates checksums of code blocks to detect meaningful changes
-3. **Smart test selection**: Only runs tests whose dependencies have changed
+1. **Import-based dependency tracking**: Hooks Python's import system to track which files each test imports
+2. **AST-based fingerprinting**: Creates checksums of code blocks to detect meaningful changes
+3. **Roaring bitmap storage**: Compact storage of test dependencies using compressed bitmaps
+4. **Smart test selection**: Only runs tests whose dependencies have changed
+5. **Git-aware file cache**: Uses git blob SHAs for tracked files and avoids repeated stat calls
+
+## Core Approach: Import-Based Tracking
+
+### Fundamental Principle
+
+**No code in Python outside the current module can execute unless it is imported.**
+
+This observation enables import-based test dependency tracking. If a test depends on code in `module_x.py`, then at some point during the test's lifecycle, `module_x` must be imported. By tracking imports, we identify all file dependencies.
+
+### Comparison with Coverage-Based Tracking
+
+| Aspect | ezmon-nocov (Import-Based) | Original testmon (Coverage-Based) |
+|--------|----------------------------|-----------------------------------|
+| Dependency detection | Import hooks | coverage.py contexts |
+| Granularity | File-level | Line/function-level |
+| First-run overhead | ~3x faster (no coverage) | Higher |
+| False negatives | Never (conservative) | Possible (coverage limitations) |
+| False positives | More (file-level) | Fewer (line-level) |
+
+### Trade-offs
+
+**Pros of Import-Based:**
+- Faster test execution (no coverage.py overhead)
+- No coverage context limitation bugs
+- Simpler mental model
+- More reliable tracking
+
+**Cons of Import-Based:**
+- Less precise: changes to any function in a file trigger all tests importing that file
+- Conservative: may run tests that didn't actually use the changed code
 
 ## Core Concepts
 
-### Code Blocks
+### FileInfoCache
 
-A **code block** is a unit of code that ezmon tracks for changes. There are two types:
+`FileInfoCache` provides a git-aware cache for file metadata and content fingerprints:
+- Batch APIs for fetching git blob SHAs and checksums
+- Realpath normalization to avoid duplicate work
+- Optional parallel workers for checksum computation
 
-1. **Module-level block**: The entire Python file with function/method bodies stripped out (imports, class definitions, module-level statements)
-2. **Function/Method body block**: The body of each function or method
+This reduces repeated `stat` calls across large trees and avoids recomputing AST checksums for unchanged Python files.
 
-This distinction exists because of Python's dynamic nature. When the interpreter encounters a function definition, we can safely assume the function body will NOT be executed at definition time. So we only need to track that block if a test actually executes code within it.
+#### Git State Tracking
 
-### Fingerprints
+The cache uses git commands to track file state:
 
-Each test has a **fingerprint per Python module** it used during execution. A fingerprint is a collection of CRC32 checksums representing the code blocks within that module that the test depends on.
-
-**Fingerprint structure (per test, per module):**
-```
-Test → Module Fingerprint = [checksum1, checksum2, ...]
-  where checksums include:
-  - Module-level checksum: The entire file with function/method bodies stripped
-    (imports, class definitions, module-level statements, function signatures)
-  - Method/function body checksums: One for each function/method the test executed
-    (as reported by coverage.py)
+```python
+_head_shas    = git ls-tree -r HEAD        # blob SHAs at HEAD commit
+_index_shas   = git ls-files -s            # blob SHAs in staging area
+_modified     = git diff --name-only       # files changed in working tree vs index
 ```
 
-**Example:** `test_calculator.py::TestCalculator::test_add` might have:
-```
-Fingerprints:
-  src/calculator.py: [3477891697, 2557190835, 2213528436]
-    └─ 3477891697 = module-level (class Calculator definition, imports)
-    └─ 2557190835 = Calculator.__init__() body
-    └─ 2213528436 = Calculator.calculate() body
+The design principle: **we only consider files as they are in the current HEAD commit**. Local uncommitted edits are ignored because we want to evaluate whether the previous test run had the same base to run tests.
 
-  src/math_utils.py: [86328506, 377580465]
-    └─ 86328506 = module-level (function definitions)
-    └─ 377580465 = add() body
+#### Optimization: Avoiding Disk Reads
 
-  tests/test_calculator.py: [291892047, 3281913381]
-    └─ 291892047 = module-level (imports, class TestCalculator)
-    └─ 3281913381 = test_add() body
+For files that are NOT modified locally (working tree == HEAD):
+- **fsha**: Use `_head_shas` directly (no disk read needed)
+- **source**: Reading from disk gives HEAD content
+
+For files that ARE modified locally (working tree != HEAD):
+- **fsha**: Use `_head_shas` (we want HEAD state, not local edits)
+- **source**: Must read from git or use cached HEAD content
+
+The `get_source_and_fsha()` method implements this optimization by returning `source=None` for unmodified files when only the fsha is needed (e.g., for `batch_get_fshas`). This avoids unnecessary disk I/O for thousands of files.
+
+#### Checksum Computation
+
+The `batch_get_checksums()` method computes AST-based checksums for Python files. Since checksums require the actual source code, this method handles the case where `get_source_and_fsha()` returns `source=None`:
+
+```python
+def compute_one(norm: str) -> Tuple[str, Optional[int]]:
+    source, fsha, mtime = self.get_source_and_fsha(norm)
+
+    # For unmodified files, get_source_and_fsha returns source=None as an
+    # optimization. We need the actual source to compute the checksum, so
+    # read the file directly. This is safe because unmodified means disk == HEAD.
+    if source is None:
+        content = self._read_file(norm)
+        if content is None:
+            return norm, None
+        source = content.source
+        # ... cache and compute checksum
 ```
 
-**Fingerprint creation process:**
-```
-Source File → AST Parse → Extract Blocks → For each block:
-  1. Convert block to AST representation (strips # comments automatically)
-  2. Strip docstrings from AST representation
-  3. Calculate CRC32(normalized_ast_content)
-  4. Store (start_line, end_line, checksum, function_name)
-```
+This ensures checksums are always computed correctly while preserving the disk I/O optimization for operations that don't need source content.
+
+#### Performance Caches
+
+Two additional caches reduce repeated lookups:
+- `_norm_cache`: Caches path normalization results
+- `_is_tracked_cache`: Caches git tracking status
+
+Both use `try/except KeyError` pattern for fast cache hits (single hash lookup vs two lookups for `if key in dict`).
+
+### File Fingerprints
+
+Each Python file gets a single **AST-based checksum**:
+
+1. Parse source code into AST (comments are automatically excluded)
+2. Strip docstrings from the AST
+3. Compute CRC32 checksum of the normalized AST dump
 
 **What affects fingerprints:**
 | Change Type | Affects Fingerprint | Triggers Tests |
@@ -70,55 +123,162 @@ Source File → AST Parse → Extract Blocks → For each block:
 | `"""docstring"""` | No (explicitly stripped) | No |
 | Code logic changes | Yes | Yes |
 | Function signature | Yes | Yes |
-| Import statements | Yes (module-level) | Yes |
+| Import statements | Yes | Yes |
 
-### Test Selection Flow
+### Test Dependencies
+
+Each test has a set of file dependencies tracked as a **Roaring bitmap**:
 
 ```
-1. pytest --ezmon (first run)
-   ├─ Coverage initialized for all tests
-   ├─ Each test: coverage.switch_context(test_name)
-   ├─ Extract covered lines per file
-   ├─ Create fingerprints for each test
-   ├─ Store in .testmondata SQLite database
-   └─ Ready for incremental runs
-
-2. Code changes occur
-
-3. pytest --ezmon (subsequent run)
-   ├─ Load .testmondata database
-   ├─ Calculate SHA1 hashes of all project files
-   ├─ Query DB: which files have changed SHA?
-   ├─ For changed files: extract method checksums
-   ├─ Query DB: which tests depend on changed methods?
-   ├─ Mark affected tests as UNSTABLE
-   ├─ Mark other tests as STABLE
-   ├─ Deselect stable test files
-   ├─ Run only affected tests (+ always_run, prioritized)
-   ├─ Collect new coverage data
-   └─ Update fingerprints in database
+Test "tests/test_calculator.py::TestCalculator::test_add":
+  Dependencies (file IDs): [1, 5, 10, 23]
+    └─ 1 = tests/test_calculator.py
+    └─ 5 = src/calculator.py
+    └─ 10 = src/math_utils.py
+    └─ 23 = src/__init__.py
 ```
+
+When any of these files change, the test is marked as affected.
+
+External package dependencies are tracked by **package name + version** when available, and stored alongside the bitmap.
+
+### Dependency Phases
+
+Dependency tracking uses explicit phases instead of `sys.modules` checkpoint restore:
+
+```
+pytest starts
+    |
+    v
+conftest.py loads (imports packages)
+    |
+    v
+[GLOBAL TRACKING ACTIVE] -- dependencies common to ALL tests
+    |
+    v
+For each test file:
+    |
+    +-- [STOP GLOBAL TRACKING]
+    +-- [START FILE TRACKING]
+    +-- Collect test file (imports/reads tracked for this file)
+    +-- [STOP FILE TRACKING]
+    |
+    v
+For each test:
+    |
+    +-- [START TEST TRACKING]
+    +-- Run test (imports/reads tracked for this test)
+    +-- [STOP TEST TRACKING]
+    |
+    v
+Test dependencies = global + file + test dependencies
+```
+
+## Roaring Bitmap Storage
+
+### Why Roaring Bitmaps?
+
+Traditional approach uses junction tables:
+```sql
+test_execution_file_fp (test_id, file_id)  -- 8 bytes per dependency
+```
+
+For 1000 tests × 50 dependencies = 50,000 rows = ~400KB
+
+Roaring bitmap approach:
+```sql
+test_deps (test_id, bitmap_blob)  -- ~50-200 bytes per test
+```
+
+For 1000 tests = ~100-200KB (4x smaller, faster queries)
+
+### Data Structures
+
+```python
+@dataclass
+class TestDeps:
+    """Test dependencies stored as a Roaring bitmap."""
+    test_id: int
+    file_ids: BitMap  # Roaring bitmap of file IDs
+    external_packages: Set[str]  # e.g., {"numpy==2.2.1", "pandas==2.1.4"}
+
+    def serialize(self) -> bytes:
+        """Serialize with zstd compression for database storage."""
+        raw_bytes = self.file_ids.serialize()
+        return zstd.compress(raw_bytes)
+
+    def depends_on_any(self, changed_ids: Set[int]) -> bool:
+        """Fast bitmap intersection to check if affected."""
+        return bool(self.file_ids & BitMap(changed_ids))
+```
+
+### Fallbacks
+
+- **pyroaring not available**: Pure Python set-based BitMap fallback
+- **zstandard not available**: gzip compression fallback
+
+## Database Schema (v18)
+
+### Core Tables
+
+```sql
+-- Unified file registry with stable integer IDs
+CREATE TABLE files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    checksum INTEGER,          -- AST checksum (Python) or content CRC32
+    fsha TEXT,                 -- Git blob SHA for fast change detection
+    file_type TEXT DEFAULT 'python'  -- 'python' or 'data'
+);
+
+-- Test records
+CREATE TABLE tests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    duration REAL,
+    failed INTEGER DEFAULT 0
+);
+
+-- Test dependencies (Roaring bitmap, zstd compressed)
+CREATE TABLE test_deps (
+    test_id INTEGER PRIMARY KEY,
+    file_bitmap BLOB NOT NULL,     -- Roaring bitmap of file IDs
+    external_packages TEXT,        -- Comma-separated: "numpy,pandas"
+    FOREIGN KEY(test_id) REFERENCES tests(id)
+);
+```
+
+### Previous Schema Tables (Kept for Compatibility)
+
+The old schema tables are retained during transition:
+- `file_fp` - File fingerprints with checksums
+- `test_execution` - Test execution records
+- `test_execution_file_fp` - Junction table
 
 ## Project Structure
 
 ```
-pytest-testmon/
+pytest-ezmon-nocov/
 ├── ezmon/                      # Main plugin code
-│   ├── __init__.py            # Version: TESTMON_VERSION
+│   ├── __init__.py            # Version: 3.0.0-nocov
 │   ├── pytest_ezmon.py        # Pytest plugin hooks, test selection
-│   ├── testmon_core.py        # Core fingerprinting and coverage collection
+│   ├── testmon_core.py        # Core fingerprinting and collection
+│   ├── file_cache.py          # Git-aware file info cache
 │   ├── db.py                  # SQLite database schema and operations
+│   ├── bitmap_deps.py         # Roaring bitmap storage (NEW)
+│   ├── dependency_tracker.py  # Import and file dependency tracking
 │   ├── process_code.py        # AST parsing, fingerprint generation
 │   ├── configure.py           # Configuration and decision logic
 │   ├── common.py              # Shared utilities and type definitions
 │   ├── server_sync.py         # Server synchronization for distributed CI
-│   ├── dependency_tracker.py  # Import and file dependency tracking
-│   ├── net_db.py              # Network database client for server communication
+│   ├── net_db.py              # Network database client
 │   └── graph.py               # Dependency graph generation
 ├── ez-viz/                    # Frontend visualization server (Flask)
-│   └── app.py                 # Multi-project dashboard and API
-├── analyze.py                 # Database analysis utilities
-└── extract_db_data.py         # Low-level DB inspection tools
+├── integration_tests/         # Scenario-based integration tests
+└── tests/                     # Unit tests
+    ├── test_db.py             # Database operations and change detection
+    ├── test_process_code.py   # AST fingerprinting and checksums
+    └── test_file_cache_checksum.py  # FileInfoCache checksum computation
 ```
 
 ## Key Classes
@@ -127,380 +287,124 @@ pytest-testmon/
 
 | Class | File | Responsibility |
 |-------|------|----------------|
-| `Module` | process_code.py | AST parsing, block extraction, checksum generation |
-| `Block` | process_code.py | Represents a code section with line range and checksum |
-| `SourceTree` | testmon_core.py | File system caching, mtime/sha tracking |
-| `TestmonData` | testmon_core.py | Orchestrates fingerprint creation and stability analysis |
-| `TestmonCollector` | testmon_core.py | Coverage collection during test execution |
-| `DB` | db.py | SQLite database schema, CRUD operations |
-| `DependencyTracker` | dependency_tracker.py | Tracks file reads and imports during test execution |
-| `NetDB` | net_db.py | Network-based DB implementation for server communication |
+| `Module` | process_code.py | AST parsing, checksum generation |
+| `TestDeps` | bitmap_deps.py | Roaring bitmap test dependencies |
+| `FileRecord` | bitmap_deps.py | File entry with stable ID |
+| `FileInfoCache` | file_cache.py | Git-aware file info cache |
+| `TestmonData` | testmon_core.py | Orchestrates stability analysis |
+| `DependencyTracker` | dependency_tracker.py | Import/file tracking hooks |
+| `CheckpointManager` | dependency_tracker.py | Checkpoint state management |
+| `DB` | db.py | SQLite database operations |
+| `NetDB` | net_db.py | Network-based DB for CI |
 
 ### Pytest Plugin
 
 | Class | File | Responsibility |
 |-------|------|----------------|
-| `TestmonCollect` | pytest_ezmon.py | Hook implementation for coverage collection |
-| `TestmonSelect` | pytest_ezmon.py | Hook implementation for test selection/ordering |
-| `TestmonXdistSync` | pytest_ezmon.py | Synchronization for pytest-xdist (distributed) |
+| `TestmonCollect` | pytest_ezmon.py | Collection-time dependency tracking |
+| `TestmonSelect` | pytest_ezmon.py | Test selection/deselection |
+| `TestmonXdistSync` | pytest_ezmon.py | xdist parallel execution support |
 
-### Configuration
+## Dependency Tracking Details
 
-| Class | File | Responsibility |
-|-------|------|----------------|
-| `TmConf` | configure.py | Configuration dataclass (collect, select, message) |
+### Import Hook
 
-## Database Schema
-
-ezmon uses SQLite with WAL (Write-Ahead Logging) mode for performance. The database is stored in `.testmondata`.
-
-### Core Tables
-
-```sql
--- Environment tracking (Python version, installed packages)
-environment (
-    id INTEGER PRIMARY KEY,
-    environment_name TEXT,
-    system_packages TEXT,
-    python_version TEXT
-)
-
--- File fingerprints (checksums of code blocks)
-file_fp (
-    id INTEGER PRIMARY KEY,
-    filename TEXT,
-    method_checksums BLOB,  -- Binary array of CRC32 checksums
-    mtime FLOAT,
-    fsha TEXT               -- SHA1 hash of file content
-)
-
--- Test execution records
-test_execution (
-    id INTEGER PRIMARY KEY,
-    environment_id INTEGER,
-    test_name TEXT,
-    duration FLOAT,
-    failed BIT,
-    forced BIT
-)
-
--- Many-to-many: tests to file fingerprints
-test_execution_file_fp (
-    test_execution_id INTEGER,
-    fingerprint_id INTEGER
-)
-```
-
-### Historical Tracking Tables (ezmon extensions)
-
-These tables are ezmon-specific additions for the visualization frontend:
-
-```sql
--- Run identifiers for historical tracking
-run_uid (
-    id INTEGER PRIMARY KEY,
-    repo_run_id INTEGER,
-    create_date TEXT
-)
-
--- Run-level statistics
-run_infos (
-    run_time_saved REAL,
-    run_time_all REAL,
-    tests_saved INTEGER,
-    tests_all INTEGER,
-    run_uid INTEGER
-)
-
--- Historical test data
-test_infos (
-    id INTEGER PRIMARY KEY,
-    test_execution_id INTEGER,
-    test_name TEXT,
-    duration FLOAT,
-    failed BIT,
-    forced BIT,
-    run_uid INTEGER
-)
-
--- Historical fingerprint snapshots
-file_fp_infos (
-    id INTEGER PRIMARY KEY,
-    fingerprint_id INTEGER,
-    filename TEXT,
-    method_checksums BLOB,
-    mtime FLOAT,
-    fsha TEXT,
-    run_uid INTEGER
-)
-
--- Line-level coverage tracking
-test_execution_coverage (
-    id INTEGER PRIMARY KEY,
-    test_execution_id INTEGER,
-    filename TEXT,
-    lines TEXT,  -- JSON array of line numbers
-    run_uid INTEGER
-)
-```
-
-## Fingerprint Matching Algorithm
-
-The fingerprint matching algorithm is conservative - it marks a test as affected if ANY of its recorded checksums are no longer present:
+The `DependencyTracker` hooks `builtins.__import__` to intercept all imports:
 
 ```python
-def match_fingerprint(module: Module, fingerprint):
-    """
-    Returns True if test's recorded fingerprint matches current code.
-    Returns False if any recorded checksums are missing (code changed).
-    """
-    if set(fingerprint) - set(module.checksums):
-        return False  # Mismatch: some recorded checksums not in current code
-    return True       # Match: all recorded checksums still present
+def _tracking_import(self, name, globals=None, locals=None, fromlist=(), level=0):
+    result = self._original_import(name, globals, locals, fromlist, level)
+
+    # Track the imported module
+    self._track_import(result, name)
+
+    # For 'from X import Y', also track Y's defining module
+    if fromlist:
+        for attr_name in fromlist:
+            imported_obj = getattr(result, attr_name, None)
+            if hasattr(imported_obj, '__module__'):
+                # Class/function - track its defining module
+                defining_module = sys.modules.get(imported_obj.__module__)
+                if defining_module:
+                    self._track_import(defining_module, imported_obj.__module__)
+
+    return result
 ```
 
-This approach:
-- **Catches removals/modifications**: Any change to a block invalidates the fingerprint
-- **Allows additions**: New code blocks don't invalidate existing fingerprints
-- **Ignores comments**: `# comment` lines are stripped by Python's AST parser
-- **Ignores docstrings**: `"""docstring"""` content is explicitly stripped from fingerprints
+### Class Import Tracking
 
-## Method-Level Fingerprinting
-
-Ezmon tracks dependencies at the **method level**, not just file level. Each test has a fingerprint **per module** containing:
-1. The module-level checksum (file with function bodies stripped)
-2. Checksums for each function/method body the test executed
-
-When you modify a function, only tests that have that function's checksum in their fingerprint will be re-run.
-
-**Example:**
-```
-# test_add has fingerprint for math_utils.py: [module_checksum, add_checksum]
-# test_subtract has fingerprint for math_utils.py: [module_checksum, subtract_checksum]
-
-# Modify math_utils.add()
-# → add_checksum changes
-# → Only test_add re-runs (it has add_checksum in its fingerprint)
-# → test_subtract is NOT affected (it only has subtract_checksum)
-
-# Modify calculator.clear_history()
-# → Only test_clear_history re-runs (it's the only test with clear_history checksum)
-```
-
-## Dependency Tracking
-
-Beyond coverage-based fingerprinting, ezmon tracks additional dependencies that coverage.py might miss:
-
-### Import Tracking
-
-The `DependencyTracker` class hooks into Python's import system to capture:
-
-1. **Local module imports**: All Python files within the project that are imported during test execution
-2. **External package imports**: Third-party packages (e.g., `requests`, `numpy`) imported by each test
-
-#### Local Module Detection
-
-A module is considered "local" if:
-- Its file path is within the project's root directory
-- OR it's a pip-installed editable package that corresponds to a local package directory
-
-This second condition is important for projects like matplotlib where the package is pip-installed (`pip install -e .`) but we still want to track it as a local dependency:
+When a class is imported via package re-export (e.g., `from pandas import Series`), we track the defining module using `__module__`:
 
 ```python
-# In matplotlib project:
-import matplotlib.pyplot  # This is local, even though it's "installed"
-
-# The tracker checks for: <rootdir>/matplotlib/ or <rootdir>/lib/matplotlib/
-# If found, matplotlib is treated as a local package, not external
+# User.__module__ = 'src.models.user'
+# So we track src/models/user.py, not just src/models/__init__.py
 ```
 
-#### External Package Tracking
-
-External packages are tracked at the **package level** (e.g., `requests` not `requests.adapters`):
-
-- Each test has a set of external packages it depends on
-- When a package version changes, only tests that import that package are marked as affected
-- Standard library modules (os, sys, json, etc.) are excluded
+The tracker resolves class/function imports via `__module__` so re-exported symbols
+still map back to their defining module file.
 
 ### File Dependency Tracking
 
-Ezmon tracks non-Python files (JSON, YAML, images, etc.) that are read during test execution.
-
-#### How It Works
-
-The `DependencyTracker` hooks `builtins.open()` to intercept file reads:
+Non-Python files (JSON, YAML, etc.) are tracked when read. The tracker hooks both `builtins.open` and `io.open`:
 
 ```python
-# During test execution:
-with open('config.json') as f:    # Intercepted!
-    config = json.load(f)
-
-# The tracker records: test depends on config.json with SHA <committed_sha>
+def _tracking_open(self, file, mode='r', *args, **kwargs):
+    result = self._original_open(file, mode, *args, **kwargs)
+    if 'r' in mode:
+        relpath = self._is_in_project(file)
+        if relpath and not relpath.endswith('.py'):
+            sha = self._get_committed_file_sha(relpath)
+            if sha:  # Only track git-tracked files
+                self._track_file(relpath, sha)
+    return result
 ```
 
-#### Git-Based Tracking (Critical Design Decision)
-
-**Only files committed to git are tracked**, and the **committed state** (not the working tree state) is used:
-
-1. **Ephemeral/generated files are NOT tracked**: Files like `result_images/`, `__pycache__/`, or test outputs that aren't in git won't create dependencies
-
-2. **Workflow-modified files use committed state**: If a CI workflow modifies a config file during testing, we track the file's committed SHA, not the modified content
+## Test Selection Flow
 
 ```
-# Example: config.json in git with content A (SHA: abc123)
-# Workflow modifies it to content B during testing
+1. pytest --ezmon (first run)
+   ├─ Capture current HEAD commit ID
+   ├─ Build expected file/package sets from HEAD
+   ├─ Install import/open hooks (filtered to expected sets)
+   ├─ For each test file:
+   │   ├─ Track imports/reads during collection
+   │   ├─ Track imports/reads during execution
+   │   └─ Save dependencies as Roaring bitmap
+   └─ Store in .testmondata SQLite database (including commit_id)
 
-# Old behavior (WRONG):
-#   Track config.json with SHA of content B
-#   → Every run sees config.json as "changed"
-#   → All dependent tests always run
+2. Code changes occur (committed)
 
-# New behavior (CORRECT):
-#   Track config.json with SHA abc123 (from git HEAD)
-#   → Only runs tests when config.json actually changes in a commit
+3. pytest --ezmon (subsequent run)
+   ├─ Load .testmondata database
+   ├─ Diff last-run commit → HEAD (ignore dirty working tree)
+   ├─ Identify git_new/git_mod/git_del
+   ├─ Recompute AST checksums only for tracked .py files in git_mod/git_del
+   ├─ Build git_affected (meaningful changes)
+   ├─ expected_imports/reads = all git-tracked files at HEAD (never filter out real imports/reads)
+   ├─ Compute pack_affecting (removed/changed packages)
+   ├─ Bitmap intersection: tests depending on git_affected or pack_affecting
+   ├─ Add previously failing tests → min_selected_tests
+   ├─ Derive min_collected_files from min_selected_tests
+   ├─ Ignore all other known test files at collection time
+   ├─ Run only selected tests
+   └─ Update dependencies in database
 ```
-
-#### Implementation Details
-
-```python
-def _get_committed_file_sha(self, relpath: str) -> Optional[str]:
-    """
-    Get git blob hash for the committed version of a file.
-    Returns None for files not in git (ephemeral/generated).
-    """
-    result = subprocess.run(
-        ['git', 'ls-tree', 'HEAD', '--', relpath],
-        capture_output=True, text=True
-    )
-    # Parse: "100644 blob <sha>\t<filename>"
-    return sha_from_output(result.stdout)
-```
-
-This approach ensures:
-- `result_images/` (25,284 generated test images in matplotlib) → NOT tracked
-- `baseline_images/` (reference images in git) → Tracked correctly
-- `config.json` (modified during workflow) → Tracked with committed state
-
-### Database Schema for Dependencies
-
-```sql
--- File dependencies (non-Python files)
-file_dependency (
-    id INTEGER PRIMARY KEY,
-    filename TEXT,        -- Relative path: "config.json"
-    sha TEXT              -- Git blob hash of committed version
-)
-
--- Many-to-many: tests to file dependencies
-test_execution_file_dependency (
-    test_execution_id INTEGER,
-    file_dependency_id INTEGER
-)
-```
-
-### Dependency Flow During Test Execution
-
-```
-1. Test starts
-   ├─ DependencyTracker.start(test_name)
-   ├─ Hook builtins.open() and builtins.__import__()
-   └─ Initialize tracking sets for this test
-
-2. Test runs
-   ├─ Coverage.py tracks executed lines
-   ├─ DependencyTracker captures:
-   │   ├─ File reads: open('config.json', 'r') → record if in git
-   │   ├─ Local imports: import src.utils → record path
-   │   └─ External imports: import requests → record package name
-   └─ Test completes
-
-3. Test ends
-   ├─ DependencyTracker.stop() returns (files, local_imports, external_imports)
-   ├─ Files → stored in file_dependency table
-   ├─ Local imports → coverage.py already handles these
-   └─ External imports → stored in environment/test metadata
-```
-
-## Coverage Context Limitation
-
-**Important**: Due to a fundamental limitation in coverage.py's dynamic context tracking, only the **first test to execute a code path** gets recorded as depending on that code. Subsequent tests calling the same code (under different contexts) don't get the dependency recorded.
-
-This affects both:
-1. **Tests across different files**: First file to import gets the dependency
-2. **Tests within the same file**: First test to call a function gets the dependency
-
-**Example:**
-```
-# Test order: test_calculator.py → test_math_utils.py (alphabetical)
-
-# test_calculator.py::TestCalculator::test_add runs first, calls math_utils.add()
-# → Gets dependency on math_utils.add() ✓
-
-# test_calculator.py::TestCalculatorHistory::test_history_recording runs later
-# → Also calls add() but it's already traced, no dependency recorded ✗
-
-# test_math_utils.py runs later, imports same math_utils
-# → math_utils.py already traced, no dependencies recorded ✗
-```
-
-**Implications:**
-- Changes to `math_utils.add()` will only trigger `test_calculator.py::TestCalculator::test_add` to re-run
-- `test_history_recording` and `test_math_utils.py` tests won't re-run even though they use add()
-
-This is a known limitation of the coverage.py context tracking approach used by ezmon (and upstream testmon).
-
-## Known Limitations
-
-### 1. Coverage Context Limitation (see above)
-
-Only the first test to execute a code path gets the dependency recorded. This is a fundamental limitation of coverage.py's dynamic context tracking.
-
-### 2. Import Without Execution
-
-When a module is imported but specific functions are not called during test execution, those functions are **not** tracked in the test's fingerprint.
-
-```python
-from mymodule import helper_function  # Imported but not called
-
-def test_something():
-    assert callable(helper_function)  # Never executes helper_function body
-```
-
-If `helper_function()` body changes, this test will **not** be re-run.
-
-**Note**: This is by design - ezmon tracks executed code, not imported code. If the function body isn't executed, there's no dependency.
 
 ## Command Line Options
 
 | Option | Description |
 |--------|-------------|
-| `--ezmon` | Enable test selection and coverage collection |
+| `--ezmon` | Enable test selection and dependency collection |
 | `--ezmon-noselect` | Reorder tests by failure likelihood, but don't deselect |
-| `--ezmon-nocollect` | Selection only, no coverage collection |
+| `--ezmon-nocollect` | Selection only, no dependency collection |
 | `--ezmon-forceselect` | Force selection even with pytest selectors (-k, -m) |
 | `--no-ezmon` | Disable ezmon completely |
-| `--ezmon-env` | Separate coverage data for different environments |
+| `--ezmon-env` | Separate dependency data for different environments |
 | `--ezmon-graph` | Generate interactive dependency graph |
 
-## Server Sync (CI Integration)
+## NetDB Architecture (Server Communication)
 
-ezmon supports synchronizing test data with a central server for CI environments:
-
-1. **Download**: Fetch previous `.testmondata` before running tests
-2. **Test Preferences**: Load `always_run_tests` and `prioritized_tests` from server
-3. **Upload**: Push updated `.testmondata` after tests complete
-4. **Graph Upload**: Optionally upload dependency graph visualization
-
-Environment variables for CI:
-- `TESTMON_DATAFILE`: Custom path for .testmondata
-- `REPO_ID`, `JOB_ID`, `RUN_ID`: CI metadata
-- `GITHUB_REPOSITORY`: Auto-detected from GitHub Actions
-
-## NetDB Architecture (Direct Server Communication)
-
-NetDB is an alternative to the download/upload SQLite file approach. Instead of syncing entire database files, the pytest-ezmon plugin communicates directly with the server via RPC-style API calls during test execution.
-
-### Architecture Overview
+For CI environments, ezmon-nocov supports direct server communication:
 
 ```
 ┌─────────────────┐         HTTPS/REST          ┌──────────────────┐
@@ -511,412 +415,134 @@ NetDB is an alternative to the download/upload SQLite file approach. Instead of 
                                                          ▼
                                                 ┌──────────────────┐
                                                 │  SQLite per job  │
-                                                │  .testmondata    │
                                                 └──────────────────┘
 ```
 
-### Key Benefits
-
-- **No local `.testmondata` file needed** in CI/CD ephemeral environments
-- **Reduced data transfer**: Only changed data is sent, not entire database files
-- **Real-time updates**: Test results are stored immediately on the server
-- **Better concurrency**: Server-side locking handles multiple concurrent runs
-
-### Data Flow
-
-A typical CI/CD test run with 500 tests requires only ~5 network requests:
-
-1. **pytest_configure** → `POST /api/rpc/session/initiate`
-   - Sends: environment name, system packages, Python version
-   - Returns: `exec_id`, `filenames`, `packages_changed`
-
-2. **determine_stable** → `POST /api/rpc/tests/determine`
-   - Sends: file hashes, dependency SHAs
-   - Returns: `affected` tests, `failing` tests
-
-3. **Every 250 tests** → `POST /api/rpc/test_execution/batch_insert`
-   - Sends: gzip-compressed batch of test results + fingerprints
-   - Server bulk inserts all data
-
-4. **pytest_sessionfinish** → `POST /api/rpc/session/finish`
-   - Server aggregates stats, vacuums orphans, commits
-
-### Key Components
-
-| Component | File | Description |
-|-----------|------|-------------|
-| `NetDB` | `ezmon/net_db.py` | Client-side class implementing DB interface via HTTP |
-| `create_database()` | `ezmon/testmon_core.py` | Factory function selecting NetDB or local DB |
-| RPC Endpoints | `ez-viz/app.py` | Server-side `/api/rpc/*` routes |
-
-### NetDB Class Features
-
-- **Same interface as `db.DB`**: Drop-in replacement for local SQLite
-- **Client-side LRU cache**: Reduces network calls for fingerprint lookups
-- **Gzip compression**: Payloads > 1KB are automatically compressed
-- **Connection pooling**: Uses `requests.Session` for efficient HTTP
-- **Retry logic**: Exponential backoff for transient failures
-
-### Environment Variables
-
+Enable with:
 ```bash
-# Required for NetDB mode
 TESTMON_NET_ENABLED=true
 TESTMON_SERVER=https://your-server.com
-REPO_ID=owner/repo              # or GITHUB_REPOSITORY
-JOB_ID=test-py311               # identifier for this variant
-
-# Optional
-TESTMON_AUTH_TOKEN=your-token   # for authentication
-RUN_ID=$GITHUB_RUN_ID           # links to CI run
+REPO_ID=owner/repo
+JOB_ID=test-py311
 ```
 
-### RPC Endpoints
+If `TESTMON_SERVER` points at the ezmon public backend, the plugin stays local and does not make network calls.
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/rpc/session/initiate` | POST | Start execution, return exec_id |
-| `/api/rpc/session/finish` | POST | Finalize, aggregate stats |
-| `/api/rpc/tests/all` | GET | Get all test executions |
-| `/api/rpc/tests/determine` | POST | Compute affected tests |
-| `/api/rpc/tests/delete` | POST | Delete test executions |
-| `/api/rpc/files/fetch_unknown` | POST | Find changed files |
-| `/api/rpc/files/list` | GET | List files for environment |
-| `/api/rpc/files/fingerprints` | GET | Get fingerprint details |
-| `/api/rpc/test_execution/batch_insert` | POST | Bulk insert tests |
-| `/api/rpc/coverage/batch_insert` | POST | Bulk insert coverage |
-| `/api/rpc/fingerprint/fetch_or_create` | POST | Fetch/create fingerprint |
-| `/api/rpc/file_dependency/fetch_or_create` | POST | Fetch/create file dep |
-| `/api/rpc/metadata/read` | GET | Read metadata attribute |
-| `/api/rpc/metadata/write` | POST | Write metadata attribute |
+## Parallel Execution (pytest-xdist)
 
-### Authentication
+ezmon-nocov fully supports parallel test execution:
 
-RPC endpoints support two authentication methods:
+1. **Controller** computes selection once before workers spawn
+2. **Controller** passes selection + expected file/package sets via `workerinput`
+3. **Workers** avoid loading the database and skip recomputation
+4. **Workers** prune collection using an explicit no-collect file list
+5. **Workers** track deps only (no SHA/checksum computation)
+6. **Controller** computes checksums and writes dependency updates
 
-1. **Session cookie**: For browser-based OAuth (existing frontend flow)
-2. **Authorization header**: For CI/CD tokens (`Bearer <token>`)
+Detailed flow:
+- Startup: controller loads the database, diffs last run commit to HEAD, and builds the selected test set.
+- Worker bootstrap: selection data + expected tracking sets are injected into `workerinput`; workers do not compute SHAs or checksums.
+- Collection: workers use `pytest_ignore_collect` to skip explicitly non-collected files.
+- Execution: dependency tracking runs only for collected tests; collection-time dependencies are merged into per-test data.
+- Finish: worker reports are sent to the controller; the controller resolves SHAs/checksums and writes final dependency updates.
+
+### Worker Payload Encoding
+
+To reduce xdist overhead, workers encode dependency payloads in two ways:
+
+1) **Deterministic encoding for files + packages**
+- The controller builds deterministic code maps:
+  - git-tracked files are encoded using directory-ordered, stable indices
+  - packages are encoded by sorted package name
+- These maps are shared with workers via `workerinput`.
+- Workers send only integer IDs for dependency paths and package names.
+- The controller decodes IDs back to paths/packages when writing fingerprints.
+
+2) **Per-file test-name prefix encoding**
+- Each test file payload includes a `pm` prefix map (list of class/param prefixes).
+- Test suffixes are encoded as `prefix_id|last_part`, where `last_part` is the final `::` segment.
+- Prefix IDs are 1-based indexes into `pm` (id 1 maps to `pm[0]`); id 0 means no prefix.
+- The controller expands this into full test suffixes and reattaches the test file.
+
+Payload grouping:
+- Dependencies are grouped by test file.
+- Each file payload has:
+  - `com`: deps shared by all tests in the file
+  - `t_names`: list of encoded test suffixes
+  - `etc`: list of indices into `t_names` for tests with no unique deps
+  - `dur`: list of durations aligned to `t_names`
+  - `fail`: list of indices into `t_names` for failed tests
+  - per-test entries only when unique deps exist, keyed by index
+- Workers send batches of **up to 5 test files** per payload.
+
+This preserves full per-test dependency information while shrinking payloads significantly.
+
+### Payload Capture (optional)
+
+To capture xdist worker communications, set `EZMON_WORKER_PAYLOAD_DIR`:
 
 ```bash
-# CI/CD usage
-export TESTMON_AUTH_TOKEN=your-service-token
+EZMON_WORKER_PAYLOAD_DIR=/tmp/ezmon_payloads pytest --ezmon -n auto ...
 ```
 
-### Performance Comparison
+Behavior:
+- Each worker writes `received.json` (workerinput) to its own subdir.
+- The controller writes `sent_N.json` per batch to each worker directory.
+- To disable capture, unset `EZMON_WORKER_PAYLOAD_DIR`.
 
-| Metric | Download/Upload Approach | NetDB Approach |
-|--------|-------------------------|----------------|
-| Network calls | 2 (download + upload) | ~5 per run |
-| Data transfer | ~5-10 MB each way | ~100-400 KB total |
-| Startup latency | High (download entire DB) | Low (single init call) |
-| Concurrent safety | Manual locking needed | Server-side locking |
+### Xdist Timing Trace (optional)
 
-### Backward Compatibility
-
-- Local `.testmondata` mode remains **default**
-- NetDB activates only when `TESTMON_NET_ENABLED=true`
-- Existing `server_sync.py` upload/download still works
-- All visualization endpoints unchanged (read same SQLite files)
-
-## Parallel Execution (pytest-xdist) Support
-
-Ezmon fully supports parallel test execution with pytest-xdist (`pytest -n auto` or `pytest -n <workers>`).
-
-### Architecture Overview
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                       CONTROLLER PROCESS                          │
-│                                                                   │
-│  pytest_configure()                                               │
-│    └─► init_testmon_data() → TestmonData()                       │
-│          └─► determine_stable() → computes stable_test_names     │
-│                                                                   │
-│  pytest_configure_node() [for each worker]                        │
-│    └─► Passes via workerinput:                                   │
-│          • exec_id                                                │
-│          • stable_test_names                                      │
-│          • files_of_interest                                      │
-│          • changed_packages                                       │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│   WORKER gw0    │ │   WORKER gw1    │ │   WORKER gw2    │
-│                 │ │                 │ │                 │
-│ init_testmon_   │ │ init_testmon_   │ │ init_testmon_   │
-│ data() detects  │ │ data() detects  │ │ data() detects  │
-│ workerinput →   │ │ workerinput →   │ │ workerinput →   │
-│ TestmonData.    │ │ TestmonData.    │ │ TestmonData.    │
-│ for_worker()    │ │ for_worker()    │ │ for_worker()    │
-│                 │ │                 │ │                 │
-│ Uses pre-       │ │ Uses pre-       │ │ Uses pre-       │
-│ computed        │ │ computed        │ │ computed        │
-│ stability data  │ │ stability data  │ │ stability data  │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         │                   │                   │
-         └───────────────────┴───────────────────┘
-                             │
-                             ▼
-                   Coverage data flows back
-                   to controller via xdist
-```
-
-### The Problem: Collection Mismatch Race Condition
-
-When running with xdist, each worker process independently calls `pytest_collection_modifyitems` to determine which tests to run. If workers compute different `stable_test_names` sets, xdist raises:
-
-```
-Different tests were collected between gw0 and gw1. The difference is: ...
-```
-
-**Root cause**: Workers were independently calling `determine_stable()` which reads from the database. If:
-1. The controller is still writing to the database while workers start
-2. Workers read the database at different times
-3. SQLite WAL mode gives each reader a snapshot from when they started
-
-Then workers could see different database states and compute different `stable_test_names`.
-
-### The Solution: Controller-to-Worker Data Synchronization
-
-Following the original pytest-testmon's approach, ezmon now:
-
-1. **Controller computes stability once** in `init_testmon_data()` before workers spawn
-2. **Controller passes pre-computed data** to workers via `pytest_configure_node()`:
-   ```python
-   # In TestmonXdistSync.pytest_configure_node()
-   node.workerinput["testmon_exec_id"] = testmon_data.exec_id
-   node.workerinput["testmon_stable_test_names"] = list(testmon_data.stable_test_names)
-   node.workerinput["testmon_files_of_interest"] = list(testmon_data.files_of_interest)
-   node.workerinput["testmon_changed_packages"] = list(testmon_data.changed_packages)
-   ```
-3. **Workers use pre-computed data** instead of recomputing:
-   ```python
-   # In init_testmon_data()
-   if running_as == "worker" and "testmon_exec_id" in config.workerinput:
-       testmon_data = TestmonData.for_worker(
-           rootdir=config.rootdir.strpath,
-           exec_id=workerinput["testmon_exec_id"],
-           stable_test_names=workerinput["testmon_stable_test_names"],
-           ...
-       )
-   ```
-
-### Key Components
-
-| Component | File | Responsibility |
-|-----------|------|----------------|
-| `TestmonXdistSync` | `pytest_ezmon.py` | Passes stability data from controller to workers |
-| `TestmonData.for_worker()` | `testmon_core.py` | Creates worker TestmonData using pre-computed data |
-| `get_running_as()` | `pytest_ezmon.py` | Detects "controller", "worker", or "single" mode |
-
-### TrackedFile Serialization Fix
-
-Xdist uses execnet to serialize data between processes. The `TrackedFile` namedtuple couldn't be serialized:
-
-```
-execnet.gateway_base.DumpError: can't serialize <class 'ezmon.dependency_tracker.TrackedFile'>
-```
-
-**Fix**: Convert `TrackedFile` namedtuples to plain `(path, sha)` tuples before storing in `nodes_files_lines`:
-```python
-# In testmon_core.py
-if files:
-    file_deps_key = f"__file_deps__{test_name}"
-    nodes_files_lines[test_name][file_deps_key] = {(tf.path, tf.sha) for tf in files}
-```
-
-### Testing
-
-Parallel execution is tested in `integration_tests/test_parallel_execution.py`:
-
-| Test | Mode | Description |
-|------|------|-------------|
-| `test_sequential_baseline` | Local SQLite | Verifies sequential works as baseline |
-| `test_parallel_small_subset` | Local SQLite | Tests parallel with small test set |
-| `test_parallel_coverage_saved` | Local SQLite | Verifies coverage saved from parallel workers |
-| `test_parallel_netdb_basic` | NetDB | Tests parallel with network database |
-| `test_parallel_netdb_coverage_collection` | NetDB | Verifies NetDB coverage collection in parallel |
-
-Run parallel tests:
-```bash
-pytest integration_tests/test_parallel_execution.py -v
-```
-
-### Usage
+To capture timing events for worker/controller communication and batching, set
+`EZMON_XDIST_TIMING_LOG_DIR`:
 
 ```bash
-# Run tests in parallel with ezmon
-pytest --ezmon -n auto
-
-# Or with specific worker count
-pytest --ezmon -n 4
+EZMON_XDIST_TIMING_LOG_DIR=/tmp/ezmon_timing pytest --ezmon -n auto ...
 ```
 
-Both local SQLite and NetDB modes support parallel execution.
+Behavior:
+- JSONL files are written per actor:
+  - `controller.jsonl`
+  - `gw0.jsonl`, `gw1.jsonl`, ...
+- Events include:
+  - worker first control (`worker_start`)
+  - receive start/end (`worker_received_start`, `worker_received_end`)
+  - batch start/end (`worker_batch_start`, `worker_batch_end`)
+  - send start/end (`worker_send_start`, `worker_send_end`)
+  - worker end (`worker_end`)
+  - controller send start/end (`controller_send_start`, `controller_send_end`)
+  - controller receive/batch start/end (`controller_receive_start`, `controller_batch_start`, `controller_batch_end`, `controller_receive_end`)
+- To disable trace logging, unset `EZMON_XDIST_TIMING_LOG_DIR`.
 
-## Visualization Frontend (ez-viz)
 
-The Flask-based frontend (`ez-viz/app.py`) provides:
+```bash
+pytest --ezmon -n auto  # Parallel execution
+```
 
-- Multi-project/multi-job test data visualization
-- Historical run statistics and trends
-- Test dependency exploration
-- Interactive dependency graph (via Pyvis)
+## Integration Tests
 
-API endpoints:
-- `GET/POST /api/client/download` - Download testmon data
-- `POST /api/client/upload` - Upload test results
-- `GET /api/client/testPreferences` - Fetch test preferences
-- `POST /api/client/upload_graph` - Upload dependency graph
+24 scenario-based integration tests verify correct behavior:
+
+| Category | Scenarios |
+|----------|-----------|
+| Basic changes | modify_math_utils, modify_calculator_only, etc. |
+| No changes | no_changes, comment_only_change, docstring_only_change |
+| Complex patterns | nested classes, generators, decorators, context managers |
+| Class imports | from_package_import_class, from_package_import_class_product |
+| File deps | modify_config_file |
+| Module-level | modify_import_only_module_level, modify_globals |
+
+Run with:
+```bash
+python integration_tests/run_integration_tests.py
+```
 
 ## Differences from Upstream testmon
 
-1. **Package name**: `ezmon` instead of `testmon`
-2. **Python support**: We maintain Python 3.7+ compatibility (upstream requires 3.10+)
-3. **Historical tracking**: Additional tables for run history and visualization
-4. **Line-level coverage**: Stores exact line numbers for detailed analysis
-5. **Server sync**: Built-in CI integration for shared test data
-6. **Dependency graph**: Interactive visualization generation
-7. **Test prioritization**: Server-driven always_run and prioritized test lists
-
-## Upstream Fixes Merged
-
-The following bug fixes from upstream testmon have been merged (as of v2.1.4-a2):
-
-- **Fix #235**: Internal error in some match statements when function defined inside
-  - Modified `process_code.py` to use `end_lineno` from last child when `end` is None
-- **Fix #255**: Unreliable system packages change detection
-  - Added `ORDER BY id DESC` to environment query for consistent results
-  - Added `ON DELETE CASCADE` to foreign keys for proper cleanup
-  - Improved environment handling when packages change (create new, delete old)
-- **Pytest 9 support**: Updated dependency to allow `pytest>=5,<10`
-
-## Test Suite
-
-The project includes a comprehensive test suite with unit tests and scenario-based integration tests:
-
-### Structure
-
-```
-tests/
-├── conftest.py             # Shared fixtures
-├── test_process_code.py    # Unit tests for fingerprint generation (24 tests)
-└── README.md
-
-integration_tests/          # Scenario-based integration tests
-├── run_integration_tests.py    # Main test runner with version verification
-├── test_all_versions.py        # Multi-version testing (Python 3.7-3.13)
-├── scenarios/__init__.py       # Declarative scenario definitions (15 scenarios)
-├── sample_project/             # Example project with clear dependencies
-└── README.md
-```
-
-### Running Tests
-
-```bash
-# Unit tests
-pytest tests/ -v
-pytest tests/ -v --cov=ezmon --cov-report=term-missing
-
-# Integration tests - all scenarios
-python integration_tests/run_integration_tests.py
-
-# Integration tests - specific scenario
-python integration_tests/run_integration_tests.py --scenario modify_math_utils
-
-# Integration tests - with specific Python version
-python integration_tests/run_integration_tests.py --python python3.7 --expect-version 3.7
-
-# Multi-version testing (all available Python versions)
-python integration_tests/test_all_versions.py
-
-# List available versions
-python integration_tests/test_all_versions.py --list-versions
-```
-
-### Integration Test Scenarios
-
-The integration tests use declarative scenarios that modify code and verify individual test selection. This verifies method-level fingerprinting is working correctly.
-
-**Note**: Due to the coverage context limitation (see above), only the first test to execute each function gets the dependency recorded.
-
-**Basic Scenarios:**
-
-| Scenario | Description | Expected Selected Test |
-|----------|-------------|----------------------|
-| `modify_math_utils` | Change math_utils.add() | `TestCalculator::test_add` |
-| `modify_string_utils` | Change string_utils.uppercase() | `TestFormatter::test_upper_style` |
-| `modify_calculator_only` | Change Calculator.clear_history() | `TestCalculatorHistory::test_clear_history` |
-| `modify_formatter_only` | Change Formatter.set_style() | `TestFormatterStyleChange::test_change_style` |
-| `modify_test_only` | Change test_math_utils::TestAdd::test_positive_numbers | `TestAdd::test_positive_numbers` |
-| `no_changes` | No modifications | (none) |
-| `add_new_test` | Add a new test file | `test_new_feature`, `test_another_new` |
-| `multiple_modifications` | Change subtract() and lowercase() | `test_subtract`, `test_lower_style` |
-
-**Complex Code Pattern Scenarios:**
-
-| Scenario | Description | Pattern Tested |
-|----------|-------------|----------------|
-| `modify_nested_class_method` | Change Statistics.mean() | Nested class methods |
-| `modify_static_method` | Change BaseProcessor.validate_data() | Static methods |
-| `modify_generator` | Change fibonacci() | Generator functions (yield) |
-| `modify_decorator` | Change memoize() | Decorators and closures |
-| `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
-
-**File Dependency Scenarios:**
-
-| Scenario | Description | Status |
-|----------|-------------|--------|
-| `modify_config_file` | Change config.json | **PASSES** - tests reading config.json are selected |
-
-**Limitation Demonstration Scenarios:**
-
-| Scenario | Description | Status |
-|----------|-------------|--------|
-| `modify_uncalled_method` | Change imported but uncalled function | **FAILS** - by design, uncalled code has no dependency |
-
-### Sample Project Structure
-
-```
-sample_project/
-├── config.json            # Config file (for limitation tests)
-├── src/
-│   ├── math_utils.py      # Basic functions (add, subtract, etc.)
-│   ├── string_utils.py    # String manipulation (uppercase, lowercase)
-│   ├── calculator.py      # Class using math_utils
-│   ├── formatter.py       # Class using string_utils
-│   ├── data_processor.py  # Complex patterns: inheritance, nested classes,
-│   │                      # static/class methods, properties
-│   ├── cache_manager.py   # Decorators, context managers, closures
-│   ├── generators.py      # Generators, iterators, pipelines
-│   ├── config_reader.py   # File dependency demonstration
-│   ├── external_deps.py   # External package dependency demo
-│   └── import_only.py     # Import without execution demo
-└── tests/
-    ├── test_math_utils.py
-    ├── test_string_utils.py
-    ├── test_calculator.py
-    ├── test_formatter.py
-    ├── test_data_processor.py   # 21 tests for complex class patterns
-    ├── test_cache_manager.py    # 22 tests for decorators/context managers
-    ├── test_generators.py       # 31 tests for generators/iterators
-    ├── test_config_reader.py    # 11 tests (file dependency limitation)
-    ├── test_external_deps.py    # 9 tests (external deps limitation)
-    └── test_import_only.py      # 9 tests (import tracking)
-```
-
-This verifies:
-- **Function isolation**: Modify `add()` → only tests using `add()` run
-- **Module isolation**: Modify `string_utils` → only string tests run
-- **Indirect deps**: `Calculator` uses `math_utils` → changes propagate
-- **Comment immunity**: Comment-only changes don't trigger re-runs (AST-based)
-- **Nested classes**: Modifications to nested class methods correctly trigger dependent tests
-- **Static/class methods**: Static and class methods are tracked independently
-- **Generators**: Generator functions with `yield` are tracked correctly
-- **Decorators**: Decorator functions and closures are tracked correctly
-- **Context managers**: `__enter__`/`__exit__` methods are tracked correctly
-- **File dependencies**: Non-Python files in git trigger re-runs when changed
-- **Git-only tracking**: Ephemeral/generated files don't create spurious dependencies
-- **Import without execution**: Imported but uncalled functions don't create dependencies (by design)
+| Feature | ezmon-nocov | Original testmon |
+|---------|-------------|------------------|
+| Dependency tracking | Import hooks | coverage.py |
+| Granularity | File-level | Line-level |
+| Storage | Roaring bitmaps | Junction tables |
+| First-run speed | ~3x faster | Slower (coverage overhead) |
+| Package name | `pytest-ezmon-nocov` | `pytest-testmon` |
+| Python support | 3.7+ | 3.10+ |

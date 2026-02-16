@@ -10,14 +10,15 @@ import json
 import os
 import time
 from functools import lru_cache
-from typing import Dict, List, Optional, Any
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from ezmon.process_code import blob_to_checksums, checksums_to_blob
+from typing import Dict, List, Optional, Any, Set
+
 from ezmon.common import TestExecutions, get_logger
+from ezmon.bitmap_deps import TestDeps
 
 logger = get_logger(__name__)
 
@@ -195,7 +196,7 @@ class NetDB:
 
     def version_compatibility(self):
         """Return the data version for compatibility checks."""
-        return 16  # Match DB.DATA_VERSION
+        return 18  # Match DB.DATA_VERSION
 
     def initiate_execution(
         self,
@@ -238,9 +239,19 @@ class NetDB:
             "filenames": response.get("filenames", []),
             "packages_changed": packages_changed or bool(changed_packages),
             "changed_packages": changed_packages,
+            "previous_packages": response.get("previous_packages", ""),
+            "previous_python": response.get("previous_python", ""),
+            "current_packages": system_packages,
+            "current_python": python_version,
         }
 
-    def finish_execution(self, exec_id: int, duration: float = None, select: bool = True):
+    def finish_execution(
+        self,
+        exec_id: int,
+        duration: float = None,
+        select: bool = True,
+        commit_id: Optional[str] = None,
+    ):
         """
         Finalize execution session and aggregate stats.
         """
@@ -251,12 +262,17 @@ class NetDB:
                 "exec_id": exec_id,
                 "duration": duration,
                 "select": select,
+                "commit_id": commit_id,
             },
         )
 
         # Clear caches
         self._fingerprint_cache.clear()
         self._file_dependency_cache.clear()
+
+    def get_latest_run_commit_id(self) -> Optional[str]:
+        """NetDB does not currently expose run commit IDs."""
+        return None
 
     def fetch_unknown_files(self, files_fshas: Dict[str, str], exec_id: int) -> List[str]:
         """
@@ -291,27 +307,19 @@ class NetDB:
 
         Args:
             exec_id: Execution/environment ID
-            files_mhashes: Dict of {filename: method_checksums}
+            files_mhashes: Dict of {filename: file_checksum} (single int per file)
             file_deps_shas: Dict of {filename: sha} for non-Python dependencies
             changed_packages: Set of package names that changed (granular tracking)
 
         Returns:
             Dict with 'affected' and 'failing' test lists
         """
-        # Convert method_checksums to base64 for transport
-        serialized_mhashes = {}
-        for filename, mhashes in files_mhashes.items():
-            if mhashes is not None:
-                serialized_mhashes[filename] = checksums_to_blob(mhashes).hex()
-            else:
-                serialized_mhashes[filename] = None
-
         response = self._make_request(
             "POST",
             "/api/rpc/tests/determine",
             data={
                 "exec_id": exec_id,
-                "files_mhashes": serialized_mhashes,
+                "files_checksums": files_mhashes,
                 "file_deps_shas": file_deps_shas or {},
                 "changed_packages": list(changed_packages) if changed_packages else [],
             },
@@ -326,14 +334,15 @@ class NetDB:
         self,
         filename: str,
         fsha: str,
-        method_checksums: bytes,
+        file_checksum: int,
     ) -> int:
         """
         Fetch or create a fingerprint record.
 
         Uses client-side LRU cache to minimize network calls.
+        With single-file checksums, file_checksum is just an integer.
         """
-        cache_key = (filename, fsha, method_checksums)
+        cache_key = (filename, fsha, file_checksum)
         if cache_key in self._fingerprint_cache:
             return self._fingerprint_cache[cache_key]
 
@@ -344,7 +353,7 @@ class NetDB:
                 "exec_id": self.exec_id,
                 "filename": filename,
                 "fsha": fsha,
-                "method_checksums": method_checksums.hex() if method_checksums else None,
+                "file_checksum": file_checksum,
             },
         )
 
@@ -398,8 +407,7 @@ class NetDB:
                     "filename": dep["filename"],
                     "fsha": dep["fsha"],
                     "mtime": dep.get("mtime"),
-                    "method_checksums": checksums_to_blob(dep["method_checksums"]).hex()
-                        if dep.get("method_checksums") else None,
+                    "file_checksum": dep.get("file_checksum"),
                 })
 
             serialized_data[test_name] = serialized_test
@@ -489,14 +497,12 @@ class NetDB:
             },
         )
 
-        # Deserialize method_checksums from hex
         result = []
         for row in response.get("data", []):
             result.append([
                 row["filename"],
                 row["test_name"],
-                blob_to_checksums(bytes.fromhex(row["method_checksums"]))
-                    if row.get("method_checksums") else [],
+                row.get("file_checksum"),
                 row["id"],
                 row["failed"],
                 row.get("duration"),
@@ -587,58 +593,258 @@ class NetDB:
         )
         return response.get("data", default)
 
-    def insert_dependency_graph_edges(self, edges: List[tuple], exec_id: int):
-        """Insert dependency graph edges via RPC.
-
-        Args:
-            edges: List of tuples (source_file, target_file, target_package, edge_type)
-            exec_id: Execution ID to associate edges with
-        """
-        if not edges:
-            return
-
-        # Serialize edges for transport
-        serialized_edges = [
-            {
-                "source_file": src,
-                "target_file": tgt,
-                "target_package": pkg,
-                "edge_type": etype,
-            }
-            for src, tgt, pkg, etype in edges
-        ]
-
-        self._make_request(
-            "POST",
-            "/api/rpc/dependency_graph/batch_insert",
-            data={
-                "exec_id": exec_id,
-                "edges": serialized_edges,
-            },
-            compress=True,
-            timeout=120,
-        )
-
-    def get_dependency_graph(self, run_uid: int = None) -> List[Dict]:
-        """Retrieve dependency graph edges via RPC.
-
-        Args:
-            run_uid: Optional run UID to filter by.
-
-        Returns:
-            List of dicts with keys: source_file, target_file, target_package, edge_type
-        """
-        response = self._make_request(
-            "GET",
-            "/api/rpc/dependency_graph/get",
-            data={"run_uid": run_uid} if run_uid else {},
-        )
-        return response.get("edges", [])
-
     def close(self):
         """Close the HTTP session."""
         if self._http_session:
             self._http_session.close()
+
+    # ==========================================================================
+    # New Roaring Bitmap-based methods for simplified dependency storage
+    # ==========================================================================
+
+    def get_or_create_file_id(
+        self,
+        path: str,
+        checksum: int = None,
+        fsha: str = None,
+        file_type: str = 'python'
+    ) -> int:
+        """Get or create a stable file ID for a given path.
+
+        Args:
+            path: Relative file path
+            checksum: AST checksum (Python) or content hash (data files)
+            fsha: Git blob SHA for fast change detection
+            file_type: 'python' or 'data'
+
+        Returns:
+            Integer file ID
+        """
+        response = self._make_request(
+            "POST",
+            "/api/rpc/files/get_or_create_id",
+            data={
+                "exec_id": self.exec_id,
+                "path": path,
+                "checksum": checksum,
+                "fsha": fsha,
+                "file_type": file_type,
+            },
+        )
+        return response["file_id"]
+
+    def get_file_id_map(self, exec_id: int = None) -> Dict[str, int]:
+        """Get a mapping of file paths to their IDs.
+
+        Args:
+            exec_id: Optional environment ID
+
+        Returns:
+            Dict mapping file path to integer ID
+        """
+        response = self._make_request(
+            "GET",
+            "/api/rpc/files/id_map",
+            data={"exec_id": exec_id or self.exec_id},
+        )
+        return response.get("file_id_map", {})
+
+    def get_file_checksums(self) -> Dict[str, int]:
+        """Get current checksums for all files."""
+        response = self._make_request(
+            "GET",
+            "/api/rpc/files/checksums",
+        )
+        return response.get("checksums", {})
+
+    def update_file_checksum(self, path: str, checksum: int, fsha: str = None) -> None:
+        """Update the checksum for a file."""
+        self._make_request(
+            "POST",
+            "/api/rpc/files/update_checksum",
+            data={
+                "path": path,
+                "checksum": checksum,
+                "fsha": fsha,
+            },
+        )
+
+    def get_file_ids_for_paths(self, paths: Set[str]) -> Set[int]:
+        """Return file IDs for known file paths."""
+        if not paths:
+            return set()
+        response = self._make_request(
+            "POST",
+            "/api/rpc/files/ids_for_paths",
+            data={"paths": list(paths)},
+        )
+        return set(response.get("file_ids", []))
+
+    def get_or_create_test_id(
+        self,
+        exec_id: int,
+        test_name: str,
+        duration: float = None,
+        failed: bool = False,
+        test_file: Optional[str] = None,
+    ) -> int:
+        """Get or create a test ID for a given test name."""
+        response = self._make_request(
+            "POST",
+            "/api/rpc/tests/get_or_create_id",
+            data={
+                "exec_id": exec_id,
+                "test_name": test_name,
+                "duration": duration,
+                "failed": failed,
+                "test_file": test_file,
+            },
+        )
+        return response["test_id"]
+
+    def get_test_files_for_tests(self, exec_id: int, test_names: Set[str]) -> Set[str]:
+        """Get test files for a set of test names."""
+        if not test_names:
+            return set()
+        response = self._make_request(
+            "POST",
+            "/api/rpc/tests/test_files",
+            data={
+                "exec_id": exec_id,
+                "test_names": list(test_names),
+            },
+        )
+        return set(response.get("test_files", []))
+
+    def get_all_test_files(self, exec_id: int) -> Set[str]:
+        """Get all known test files for an environment."""
+        response = self._make_request(
+            "GET",
+            "/api/rpc/tests/all_files",
+            data={"exec_id": exec_id},
+        )
+        return set(response.get("test_files", []))
+
+    def get_failing_tests_bitmap(self, exec_id: int) -> List[str]:
+        """Get names of tests that failed in their last run."""
+        response = self._make_request(
+            "GET",
+            "/api/rpc/tests/failing",
+            data={"exec_id": exec_id},
+        )
+        return response.get("failing", [])
+
+    def save_test_deps(self, test_id: int, deps: TestDeps) -> None:
+        """Save test dependencies as a compressed Roaring bitmap via RPC.
+
+        Args:
+            test_id: Test ID
+            deps: TestDeps object with file IDs and external packages
+        """
+        import base64
+        blob = deps.serialize()
+        self._make_request(
+            "POST",
+            "/api/rpc/test_deps/save",
+            data={
+                "exec_id": self.exec_id,
+                "test_id": test_id,
+                "file_bitmap": base64.b64encode(blob).decode('ascii'),
+                "external_packages": deps.serialize_external_packages(),
+            },
+        )
+
+    def get_all_test_deps(self, exec_id: int) -> List[TestDeps]:
+        """Get all test dependencies for an environment via RPC.
+
+        Args:
+            exec_id: Environment ID
+
+        Returns:
+            List of TestDeps objects
+        """
+        import base64
+        response = self._make_request(
+            "GET",
+            "/api/rpc/test_deps/all",
+            data={"exec_id": exec_id},
+        )
+
+        deps_list = []
+        for item in response.get("deps", []):
+            blob = base64.b64decode(item["file_bitmap"])
+            deps = TestDeps.deserialize(
+                item["test_id"],
+                blob,
+                item.get("external_packages")
+            )
+            deps_list.append(deps)
+
+        return deps_list
+
+    def find_affected_tests_bitmap(
+        self,
+        exec_id: int,
+        changed_file_ids: Set[int],
+        changed_packages: Optional[Set[str]] = None
+    ) -> List[str]:
+        """Find tests affected by file or package changes via RPC.
+
+        Args:
+            exec_id: Environment ID
+            changed_file_ids: Set of file IDs that changed
+            changed_packages: Set of package names that changed
+
+        Returns:
+            List of affected test names
+        """
+        response = self._make_request(
+            "POST",
+            "/api/rpc/tests/find_affected_bitmap",
+            data={
+                "exec_id": exec_id,
+                "changed_file_ids": list(changed_file_ids),
+                "changed_packages": list(changed_packages) if changed_packages else [],
+            },
+        )
+        return response.get("affected", [])
+
+    def get_changed_file_ids(self, files_checksums: Dict[str, int]) -> Set[int]:
+        """Find file IDs for files whose checksums have changed via RPC.
+
+        Args:
+            files_checksums: Dict of {path: current_checksum}
+
+        Returns:
+            Set of file IDs whose checksums differ
+        """
+        response = self._make_request(
+            "POST",
+            "/api/rpc/files/get_changed_ids",
+            data={
+                "exec_id": self.exec_id,
+                "files_checksums": files_checksums,
+            },
+        )
+        return set(response.get("changed_ids", []))
+
+    def fetch_unknown_files(
+        self,
+        files_fshas: Dict[str, str],
+        exec_id: int,
+        restrict_to_known: bool = False,
+    ) -> List[str]:
+        """Return unknown files list from server or empty on error."""
+        response = self._make_request(
+            "POST",
+            "/api/rpc/files/fetch_unknown",
+            data={
+                "exec_id": exec_id,
+                "files_fshas": files_fshas,
+                "restrict_to_known": restrict_to_known,
+            },
+        )
+        return response.get("unknown_files", [])
 
 
 def create_net_db_from_env() -> Optional[NetDB]:
@@ -664,6 +870,9 @@ def create_net_db_from_env() -> Optional[NetDB]:
     server_url = os.environ.get("TESTMON_SERVER")
     if not server_url:
         logger.warning("TESTMON_NET_ENABLED is true but TESTMON_SERVER is not set")
+        return None
+    if "ezmon.aloiz.ch" in server_url:
+        logger.info("NetDB server is disabled for this endpoint; using local database.")
         return None
 
     repo_id = os.environ.get("REPO_ID") or os.environ.get("GITHUB_REPOSITORY")

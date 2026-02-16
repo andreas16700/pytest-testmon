@@ -2,22 +2,18 @@ import hashlib
 import os
 import random
 import sys
-import sysconfig
 import textwrap
+import subprocess
+import time
+import json
+from pathlib import Path
 from functools import lru_cache
 from collections import defaultdict
 from xmlrpc.client import Fault, ProtocolError
 from socket import gaierror
-
-from typing import TypeVar
-
-try:
-    from pytest_cov.plugin import CovPlugin
-except ImportError:
-    pass
+from typing import Dict, List, Optional, Set
 
 import pytest
-from coverage import Coverage, CoverageData
 
 from ezmon import db
 from ezmon.net_db import create_net_db_from_env, NetDB
@@ -27,27 +23,55 @@ from ezmon.common import (
     get_system_packages,
     drop_patch_version,
     git_current_head,
+    compute_package_diff,
 )
 
 from ezmon.process_code import (
-    match_fingerprint,
     create_fingerprint,
-    methods_to_checksums,
     get_source_sha,
     Module,
+    bytes_to_string_and_fsha,
+    compute_file_checksum,
 )
+from ezmon.file_cache import FileInfoCache
+from ezmon.deterministic_coding import (
+    git_tracked_files,
+    build_package_code_map,
+    invert_map,
+    encode_packages,
+)
+from ezmon.trie import TrieEncoder, get_encoder
 
 from ezmon.common import DepsNOutcomes, TestExecutions
 from ezmon.dependency_tracker import DependencyTracker, file_sha_to_checksum
-
-T = TypeVar("T")
+from ezmon.bitmap_deps import TestDeps
 
 TEST_BATCH_SIZE = 1
 
-CHECKUMS_ARRAY_TYPE = "I"
 DB_FILENAME = ".testmondata"
 
 logger = get_logger(__name__)
+
+
+def _core_timing_log(event, **fields):
+    timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
+    if not timing_dir or not os.environ.get("EZMON_CORE_TIMING"):
+        return
+    payload = {
+        "event": event,
+        "actor": "controller",
+        "ts": time.time(),
+        "mono": time.monotonic(),
+    }
+    if fields:
+        payload.update(fields)
+    try:
+        os.makedirs(timing_dir, exist_ok=True)
+        path = os.path.join(timing_dir, "controller.jsonl")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except Exception:
+        return
 
 
 def create_database(rootdir, readonly=False):
@@ -104,17 +128,26 @@ class SourceTree:
       based on mtime, fsha)
     """
 
-    def __init__(self, rootdir, packages=None):
+    def __init__(self, rootdir, packages=None, file_cache: Optional[FileInfoCache] = None):
         self.rootdir = rootdir
         self.packages = packages
         self.cache: dict = {}
+        self.file_cache = file_cache
 
     def get_file(self, filename):
+        if os.environ.get("EZMON_CORE_TIMING_VERBOSE"):
+            _core_timing_log("source_tree_get_file_start", filename=filename, cache_hit=filename in self.cache)
         if filename not in self.cache:
-            code, fsha = get_source_sha(directory=self.rootdir, filename=filename)
+            if self.file_cache is not None:
+                code, fsha, mtime = self.file_cache.get_source_and_fsha(filename)
+            else:
+                code, fsha = get_source_sha(directory=self.rootdir, filename=filename)
+                mtime = None
             if fsha:
                 try:
-                    fs_mtime = os.path.getmtime(os.path.join(self.rootdir, filename))
+                    fs_mtime = mtime
+                    if fs_mtime is None:
+                        fs_mtime = os.path.getmtime(os.path.join(self.rootdir, filename))
                     self.cache[filename] = Module(
                         source_code=code,
                         mtime=fs_mtime,
@@ -127,59 +160,25 @@ class SourceTree:
                     self.cache[filename] = None
             else:
                 self.cache[filename] = None
+        if os.environ.get("EZMON_CORE_TIMING_VERBOSE"):
+            _core_timing_log("source_tree_get_file_end", filename=filename, cache_hit=filename in self.cache)
         return self.cache[filename]
 
 
-def check_mtime(file_system: SourceTree, record):
-    absfilename = os.path.join(file_system.rootdir, record["filename"])
+def collect_checksums(source_tree, new_changed_file_data):
+    """Collect single file checksums for changed files."""
+    if source_tree.file_cache is not None and new_changed_file_data:
+        checksums = source_tree.file_cache.batch_get_checksums(
+            new_changed_file_data,
+            parallel=True,
+        )
+        return {path: checksum for path, checksum in checksums.items()}
 
-    cache_module = file_system.cache.get(record["filename"], None)
-    try:
-        fs_mtime = cache_module.mtime if cache_module else os.path.getmtime(absfilename)
-    except OSError:
-        return False
-    return record["mtime"] == fs_mtime
-
-
-def check_fsha(file_system, record):
-    cache_module = file_system.get_file(record["filename"])
-    fs_fsha = cache_module.fs_fsha if cache_module else None
-
-    return record["fsha"] == fs_fsha
-
-
-def check_fingerprint(
-    disk, record: db.ChangedFileData
-):  # filename name method_fshas id failed
-    file = record[0]
-    fingerprint = record[2]
-
-    module = disk.get_file(file)
-    return module and match_fingerprint(module, fingerprint)
-
-
-def split_filter(disk, function, records: [T]) -> ([T], [T]):
-    first = []
-    second = []
-    for record in records:
-        if function(disk, record):
-            first.append(record)
-        else:
-            second.append(record)
-    return first, second
-
-
-@lru_cache(maxsize=1000)
-def should_include(cov, filename):
-    return cov._should_trace(str(filename), None).trace
-
-
-def collect_mhashes(source_tree, new_changed_file_data):
-    files_mhashes = {}
+    files_checksums = {}
     for filename in new_changed_file_data:
         module = source_tree.get_file(filename)
-        files_mhashes[filename] = module.method_checksums if module else None
-    return files_mhashes
+        files_checksums[filename] = module.checksum if module else None
+    return files_checksums
 
 
 class TestmonData:  # pylint: disable=too-many-instance-attributes
@@ -196,7 +195,8 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     ):
         self.rootdir = rootdir
         self.environment = environment if environment else "default"
-        self.source_tree = SourceTree(rootdir=self.rootdir)
+        self.file_cache = FileInfoCache(self.rootdir)
+        self.source_tree = SourceTree(rootdir=self.rootdir, file_cache=self.file_cache)
         if system_packages is None:
             # Pass rootdir to auto-detect and exclude local packages
             system_packages = get_system_packages(rootdir=self.rootdir)
@@ -235,10 +235,19 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 self.environment, system_packages, python_version, {}
             )
         self.exec_id = result["exec_id"]
+        self.commit_id = git_current_head(rootdir)
 
         self.system_packages_change = result["packages_changed"]
         self.changed_packages = result.get("changed_packages", set())  # Granular package tracking
+        self.previous_packages = result.get("previous_packages", "")
+        self.current_packages = result.get("current_packages", "")
         self.files_of_interest = result["filenames"]
+        self.expected_files_list = []
+        self.expected_packages_list = []
+        self.file_code_map = {}
+        self.file_code_map_rev = {}
+        self.package_code_map = {}
+        self.package_code_map_rev = {}
 
         self.all_files = {}
         self.unstable_test_names = None
@@ -248,7 +257,21 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.failing_tests = None
 
     @classmethod
-    def for_worker(cls, rootdir, exec_id, stable_test_names, files_of_interest, changed_packages):
+    def for_worker(
+        cls,
+        rootdir,
+        exec_id,
+        unstable_test_names,
+        files_of_interest,
+        changed_packages,
+        explicitly_nocollect_files=None,
+        min_collected_files=None,
+        expected_imports=None,
+        expected_reads=None,
+        expected_packages=None,
+        expected_files_list=None,
+        expected_packages_list=None,
+    ):
         """Create a TestmonData instance for xdist workers using pre-computed controller data.
 
         Workers receive stability data from the controller via workerinput to avoid
@@ -258,7 +281,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         Args:
             rootdir: Project root directory
             exec_id: Execution ID from the controller
-            stable_test_names: Set/list of test names the controller computed as stable
+            unstable_test_names: Set/list of test names that need to run (affected by changes)
             files_of_interest: List of files being tracked
             changed_packages: Set/list of packages that changed
 
@@ -268,26 +291,69 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         instance = object.__new__(cls)
         instance.rootdir = rootdir
         instance.environment = "default"
-        instance.source_tree = SourceTree(rootdir=rootdir)
+        instance.file_cache = FileInfoCache(rootdir)
+        instance.source_tree = SourceTree(rootdir=rootdir, file_cache=instance.file_cache)
 
-        # Open database in readonly mode - workers only read coverage data
-        instance.db = create_database(rootdir, readonly=True)
+        # Workers do not access the database; controller provides all data.
+        instance.db = None
 
         # Use pre-computed data from controller
         instance.exec_id = exec_id
+        instance.commit_id = git_current_head(rootdir)
         instance.files_of_interest = list(files_of_interest) if files_of_interest else []
         instance.changed_packages = set(changed_packages) if changed_packages else set()
         instance.system_packages_change = bool(changed_packages)
 
-        # Convert stable_test_names from list to set (xdist serializes sets as lists)
-        instance.stable_test_names = set(stable_test_names) if stable_test_names else set()
+        # Convert unstable_test_names from list to set (xdist serializes sets as lists)
+        # Workers receive the small set of tests to RUN (unstable), not the large set to skip
+        instance.unstable_test_names = set(unstable_test_names) if unstable_test_names else set()
+        instance.stable_test_names = set()  # Workers don't need the full stable set
         instance.stable_files = set()
-        instance.unstable_test_names = set()
         instance.unstable_files = set()
+        instance.explicitly_nocollect_files = set(explicitly_nocollect_files or [])
+        instance.min_collected_files = set(min_collected_files or [])
+        instance.expected_imports = set(expected_imports or [])
+        instance.expected_reads = set(expected_reads or [])
+        instance.expected_packages = set(expected_packages or [])
+        instance.expected_files_list = list(expected_files_list or [])
+        instance.expected_packages_list = list(expected_packages_list or [])
+        instance.file_code_map = {}
+        instance.file_code_map_rev = {}
+        instance.package_code_map = {}
+        instance.package_code_map_rev = {}
         instance.all_files = {}
         instance.failing_tests = []
 
+        instance._init_deterministic_coding(
+            tracked_files=git_tracked_files(rootdir),
+            packages_str=drop_patch_version(get_system_packages(rootdir=rootdir)),
+        )
+
         return instance
+
+    def _init_deterministic_coding(
+        self,
+        tracked_files: Optional[List[str]] = None,
+        packages_str: Optional[str] = None,
+    ) -> None:
+        if tracked_files is None:
+            tracked_files = git_tracked_files(self.rootdir)
+        if packages_str is None:
+            packages_str = self.current_packages or drop_patch_version(
+                get_system_packages(rootdir=self.rootdir)
+            )
+        package_names = self._package_names_from_string(packages_str)
+        # Use singleton encoder for cache efficiency
+        self.path_encoder = get_encoder(self.rootdir)
+        # Set db on encoder for file ID caching
+        if hasattr(self, 'db') and self.db:
+            self.path_encoder.set_db(self.db)
+        self.file_code_map = {}
+        self.file_code_map_rev = {}
+        self.package_code_map = build_package_code_map(package_names)
+        self.package_code_map_rev = invert_map(self.package_code_map)
+        self._fingerprint_cache = {}
+        self._fp_stats = defaultdict(int)
 
     @property
     def new_db(self):
@@ -307,120 +373,413 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     def all_tests(self):
         return self.db.all_test_executions(self.exec_id)
 
-    def get_tests_fingerprints(self, nodes_files_lines, reports) -> TestExecutions:
+    def get_tests_fingerprints(self, nodes_files_lines, outcomes) -> TestExecutions:
+        """Create fingerprints for tests based on file dependencies.
+
+        With the simplified model, dependency sets are explicit:
+        - deps: local Python files (encoded paths)
+        - file_deps: non-Python files with (encoded_path, sha)
+        - external_deps: external package names
+
+        Paths are kept encoded throughout for efficiency.
+        """
         test_executions_fingerprints = {}
-        for context in nodes_files_lines:
+        for context, deps_payload in nodes_files_lines.items():
             deps_n_outcomes: DepsNOutcomes = {"deps": [], "file_deps": [], "external_deps": []}
 
-            for filename, covered in nodes_files_lines[context].items():
-                # Handle special keys for file and external dependencies
-                if filename.startswith("__file_deps__"):
-                    # covered is a set of (path, sha) tuples
-                    for path, sha in covered:
-                        deps_n_outcomes["file_deps"].append({
-                            "filename": path,
-                            "sha": sha,
-                        })
-                    continue
-                elif filename.startswith("__external_deps__"):
-                    # covered is a set of package names
-                    deps_n_outcomes["external_deps"] = list(covered)
-                    continue
+            deps_set = deps_payload.get("deps", set())
+            file_deps_set = deps_payload.get("file_deps", set())
+            external_deps_set = deps_payload.get("external_deps", set())
+            extra_deps = set()  # Encoded init paths
 
-                # Regular Python file dependency
-                if os.path.exists(os.path.join(self.rootdir, filename)):
-                    module = self.source_tree.get_file(filename)
-                    if module:
-                        fingerprint = create_fingerprint(module, covered)
-                        deps_n_outcomes["deps"].append(
-                            {
-                                "filename": filename,
-                                "mtime": module.mtime,
-                                "fsha": module.fs_fsha,
-                                "method_checksums": fingerprint,
-                            }
-                        )
+            for encoded in deps_set:
+                if isinstance(encoded, int):
+                    if 0 <= encoded < len(self.expected_files_list):
+                        encoded = self.expected_files_list[encoded]
+                    else:
+                        continue
+                # Decode only to check .py extension and compute init deps
+                decoded = self._decode_path(encoded)
+                if decoded and decoded.endswith(".py"):
+                    # Get init deps as decoded paths, then encode them
+                    for init_path in self._package_init_deps_for_path(decoded):
+                        extra_deps.add(self.path_encoder.encode(init_path))
+                record = self._get_cached_fingerprint(encoded)
+                if record:
+                    deps_n_outcomes["deps"].append(record)
 
-            deps_n_outcomes.update(process_result(reports[context]))
+            for encoded, sha in file_deps_set:
+                if isinstance(encoded, int):
+                    if 0 <= encoded < len(self.expected_files_list):
+                        encoded = self.expected_files_list[encoded]
+                    else:
+                        continue
+                # Decode path for the record (database stores decoded paths)
+                decoded = self._decode_path(encoded)
+                if not decoded:
+                    continue
+                if sha is None:
+                    sha = self.file_cache.get_tracked_sha(decoded)
+                    if not sha:
+                        continue
+                deps_n_outcomes["file_deps"].append({"filename": decoded, "sha": sha})
+
+            for encoded in sorted(extra_deps):
+                record = self._get_cached_fingerprint(encoded)
+                if record:
+                    deps_n_outcomes["deps"].append(record)
+
+            resolved_packages = []
+            for pkg in external_deps_set:
+                if isinstance(pkg, int):
+                    if 0 <= pkg < len(self.expected_packages_list):
+                        pkg = self.expected_packages_list[pkg]
+                    else:
+                        continue
+                elif isinstance(pkg, str) and self.package_code_map_rev:
+                    pkg = self.package_code_map_rev.get(pkg, pkg)
+                resolved_packages.append(pkg)
+            deps_n_outcomes["external_deps"] = resolved_packages
+
+            outcome = outcomes.get(context, {"failed": False, "duration": 0.0})
+            deps_n_outcomes.update(outcome)
             deps_n_outcomes["forced"] = context in self.stable_test_names and (
                 context not in self.failing_tests
             )
             test_executions_fingerprints[context] = deps_n_outcomes
         return test_executions_fingerprints
 
+    def _decode_path(self, encoded: str) -> Optional[str]:
+        """Decode an encoded path to relative path string."""
+        try:
+            decoded = self.path_encoder.decode(encoded)
+            if str(decoded).startswith(str(self.rootdir)):
+                return str(decoded.relative_to(self.rootdir))
+            return str(decoded)
+        except Exception:
+            return None
+
+    def _compute_file_info(self, path: str):
+        abs_path = os.path.join(self.rootdir, path)
+        try:
+            data = Path(abs_path).read_bytes()
+        except OSError:
+            return (None, None, None)
+        source, fsha = bytes_to_string_and_fsha(data)
+        try:
+            mtime = os.path.getmtime(abs_path)
+        except OSError:
+            mtime = None
+        ext = path.rsplit(".", 1)[-1] if "." in path else ""
+        checksum = compute_file_checksum(source, ext if ext else "txt")
+        return (checksum, fsha, mtime)
+
+    def _get_cached_fingerprint(self, encoded: str):
+        """Get fingerprint for an encoded path. Returns record with decoded filename."""
+        if not encoded:
+            return None
+        cached = self._fingerprint_cache.get(encoded)
+        if cached:
+            self._fp_stats["fingerprint_cache_hit"] += 1
+            return cached
+        self._fp_stats["fingerprint_cache_miss"] += 1
+
+        # Get file info from encoder (uses its cache)
+        try:
+            fingerprint, fsha, mtime = self.path_encoder.get_file_info(encoded)
+        except Exception:
+            fingerprint = None
+
+        if fingerprint is None:
+            self._fp_stats["source_tree_miss"] += 1
+            return None
+        self._fp_stats["source_tree_hit"] += 1
+
+        # Decode path for the record (database stores decoded paths)
+        decoded = self._decode_path(encoded)
+        if not decoded:
+            return None
+
+        record = {
+            "filename": decoded,  # Store decoded path for database
+            "mtime": mtime,
+            "fsha": fsha,
+            "file_checksum": fingerprint,
+        }
+        self._fingerprint_cache[encoded] = record
+        if os.environ.get("EZMON_CORE_TIMING"):
+            _core_timing_log(
+                "fingerprint_cache_stats",
+                hits=self._fp_stats.get("fingerprint_cache_hit", 0),
+                misses=self._fp_stats.get("fingerprint_cache_miss", 0),
+                source_hits=self._fp_stats.get("source_tree_hit", 0),
+                source_misses=self._fp_stats.get("source_tree_miss", 0),
+            )
+        return record
+
     def sync_db_fs_tests(self, retain):
+        """Synchronize database tests with filesystem tests.
+
+        Adds new tests found in collection and removes tests no longer collected.
+        """
         collected = retain.union(set(self.stable_test_names))
         add = list(collected - set(self.all_tests))
         with self.db:
-            test_execution_file_fps = {
+            test_executions_fingerprints = {
                 test_name: {
-                    "deps": (
+                    "deps": [
                         {
                             "filename": home_file(test_name),
-                            "method_checksums": methods_to_checksums(["0match"]),
-                            "mtime": None,
+                            "file_checksum": 0,  # Placeholder checksum for new tests
                             "fsha": None,
                         },
-                    )
+                    ]
                 }
                 for test_name in add
                 if is_python_file(home_file(test_name))
             }
-            if test_execution_file_fps:
-                self.save_test_execution_file_fps(test_execution_file_fps)
+            if test_executions_fingerprints:
+                self.save_test_deps_bitmap(test_executions_fingerprints)
 
         to_delete = list(set(self.all_tests) - collected)
         with self.db as database:
             database.delete_test_executions(to_delete, self.exec_id)
 
-    def determine_stable(self, assert_old=True):
-        files_fshas = {}
-        for filename in self.files_of_interest:
-            module = self.source_tree.get_file(filename)
-            if module:
-                files_fshas[filename] = module.fs_fsha
+    def _package_init_deps_for_path(self, relpath: Optional[str]) -> Set[str]:
+        if not relpath:
+            return set()
+        parts = Path(relpath).parts
+        if len(parts) <= 1:
+            return set()
+        deps = set()
+        for i in range(1, len(parts)):
+            init_rel = Path(*parts[:i]) / "__init__.py"
+            init_abs = Path(self.rootdir) / init_rel
+            if init_abs.exists():
+                deps.add(str(init_rel).replace(os.sep, "/"))
+        return deps
 
-        # Compare the fshas from disk to the fshas in the database and get files
-        # where the fsha is not in database.
-        new_changed_file_data = self.db.fetch_unknown_files(files_fshas, self.exec_id)
+    def determine_stable(self):
+        """Determine which tests are stable (unchanged) vs unstable (need to run).
 
-        # Debug: Log changed files
-        if new_changed_file_data:
-            from ezmon.common import logger
-            logger.info(f"DEBUG: {len(new_changed_file_data)} files marked as changed")
-            for f in sorted(new_changed_file_data)[:10]:  # Show first 10
-                logger.info(f"DEBUG:   changed file: {f}")
-            if len(new_changed_file_data) > 10:
-                logger.info(f"DEBUG:   ... and {len(new_changed_file_data) - 10} more")
+        New flow:
+        - Use git diff since last commit to find meaningful file changes
+        - Use package diff to find affecting external package changes
+        - Select tests that depend on changed files/packages + failing tests
+        - Compute which test files to collect and which to ignore
+        """
+        self.expected_imports = set()
+        self.expected_reads = set()
+        self.expected_packages = set()
+        self.expected_files_list = []
+        self.expected_packages_list = []
+        self.explicitly_nocollect_files = set()
+        self.git_affected_files = set()
+        self.min_collected_files = set()
 
-        # Get the mhashes for the files from above
-        files_mhashes = collect_mhashes(self.source_tree, new_changed_file_data)
+        last_commit = self.db.get_latest_run_commit_id()
+        has_existing_data = bool(last_commit) and not self.new_db and bool(self.all_tests)
 
-        # Get file dependency SHAs from disk
-        file_deps_shas = self._compute_file_dependency_shas()
-
-        # Pass changed_packages for granular external dependency tracking
-        tests = self.db.determine_tests(
-            self.exec_id,
-            files_mhashes,
-            file_deps_shas,
-            changed_packages=self.changed_packages
+        # Compute package deltas
+        prev_packages = getattr(self, "previous_packages", "") or ""
+        curr_packages = getattr(self, "current_packages", "") or ""
+        pack_added, pack_removed, pack_changed = compute_package_diff(
+            prev_packages, curr_packages
         )
-        affected_tests, self.failing_tests = tests["affected"], tests["failing"]
+        pack_affecting = pack_removed | pack_changed
+        pack_expected = pack_added | pack_changed
 
-        if assert_old:
-            self.assert_old_determin_stable(affected_tests)
+        # If python version changed, force all tests
+        if "__python_version_changed__" in (self.changed_packages or set()):
+            pack_affecting = {"__python_version_changed__"}
 
-        self.all_files = set(self.db.filenames(self.exec_id))
-        self.unstable_test_names = set()
-        self.unstable_files = set()
+        if not has_existing_data:
+            # No prior data: track all files from HEAD, select all tests
+            head_files = self._git_head_files()
+            # Track all external packages for initial run
+            self._init_deterministic_coding(
+                tracked_files=list(head_files),
+                packages_str=curr_packages,
+            )
+            self.expected_reads = set(self.path_encoder.encode(p) for p in head_files)
+            self.expected_imports = set(
+                self.path_encoder.encode(p) for p in head_files if p.endswith(".py")
+            )
+            self.expected_packages = set(
+                encode_packages(
+                    self._package_names_from_string(curr_packages),
+                    self.package_code_map,
+                )
+            )
+            self.expected_files_list = []
+            self.expected_packages_list = []
 
-        for fingerprint_miss in affected_tests:
-            self.unstable_test_names.add(fingerprint_miss)
-            self.unstable_files.add(fingerprint_miss.split("::", 1)[0])
+            self.unstable_test_names = None
+            self.stable_test_names = set()
+            self.unstable_files = set()
+            self.stable_files = set()
+            self.failing_tests = []
+            self.min_collected_files = None
+            return
 
+        git_new, git_mod, git_del = self._git_diff_files(last_commit)
+        # For dependency tracking, we must include ALL git-tracked files at HEAD,
+        # not just changed files, so we never miss actual imports/reads.
+        head_files = set(self._git_head_files())
+        # Initialize path encoder before using it
+        self._init_deterministic_coding(
+            tracked_files=list(head_files),
+            packages_str=curr_packages,
+        )
+        self.expected_reads = set(self.path_encoder.encode(p) for p in head_files)
+        self.expected_imports = set(
+            self.path_encoder.encode(p) for p in head_files if p.endswith(".py")
+        )
+        # Track all current packages (selection still uses pack_affecting).
+        self.expected_packages = set(self._package_names_from_string(curr_packages))
+        self.expected_files_list = []
+        self.expected_packages_list = []
+
+        tracked_files = set(self.db.get_file_id_map().keys())
+        candidate_files = (git_mod | git_del) & tracked_files
+        files_for_cache = (git_new | git_mod) - git_del
+
+        if files_for_cache:
+            self.path_encoder.prefill_file_info(files_for_cache)
+
+        db_checksums = self.db.get_file_checksums()
+        head_shas = self.file_cache.batch_get_head_shas(candidate_files)
+
+        git_affected = set()
+        for path in sorted(candidate_files):
+            is_deleted = path in git_del
+            is_python = path.endswith(".py")
+
+            if is_deleted:
+                git_affected.add(path)
+                continue
+
+            if is_python:
+                source = self._git_head_file_source(path)
+                if source is None:
+                    continue
+                checksum = compute_file_checksum(source, "py")
+                old_checksum = db_checksums.get(path)
+                fsha = head_shas.get(path)
+                # Always update checksum/fsha in DB when computed
+                self.db.update_file_checksum(path, checksum, fsha=fsha)
+                if old_checksum != checksum:
+                    git_affected.add(path)
+            else:
+                # Non-Python tracked file: git_mod implies content changed
+                fsha = head_shas.get(path)
+                self.db.update_file_checksum(path, db_checksums.get(path), fsha=fsha)
+                git_affected.add(path)
+
+        self.git_affected_files = git_affected
+        changed_file_ids = self.db.get_file_ids_for_paths(git_affected)
+
+        # Find affected tests via bitmap
+        affected_tests = set(
+            self.db.find_affected_tests_bitmap(
+                self.exec_id, changed_file_ids, pack_affecting
+            )
+        )
+        self.failing_tests = set(self.db.get_failing_tests_bitmap(self.exec_id))
+        min_selected_tests = affected_tests | self.failing_tests
+
+        self.unstable_test_names = set(min_selected_tests)
         self.stable_test_names = set(self.all_tests) - self.unstable_test_names
-        self.stable_files = set(self.all_files) - self.unstable_files
+
+        # Collect only test files that contain min_selected_tests
+        min_collected_files = self.db.get_test_files_for_tests(
+            self.exec_id, min_selected_tests
+        )
+        known_test_files = self.db.get_all_test_files(self.exec_id)
+        self.explicitly_nocollect_files = set(known_test_files) - set(min_collected_files)
+        self.min_collected_files = set(min_collected_files)
+
+        self.unstable_files = set(self.git_affected_files)
+        self.stable_files = set(self.db.filenames(self.exec_id)) - self.unstable_files
+
+        # expected_reads/imports already encoded via TrieEncoder (called at line 640)
+        self.expected_packages = set(
+            encode_packages(self.expected_packages, self.package_code_map)
+        )
+
+    def _git_diff_files(self, base_commit: str):
+        """Return (added, modified, deleted) files between base_commit and HEAD."""
+        cmd = ["git", "diff", "--name-status", "-z", f"{base_commit}..HEAD"]
+        result = subprocess.run(
+            cmd,
+            cwd=self.rootdir,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return set(), set(), set()
+        data = result.stdout
+        parts = data.split(b"\0")
+        added, modified, deleted = set(), set(), set()
+        idx = 0
+        while idx < len(parts):
+            status = parts[idx]
+            if not status:
+                idx += 1
+                continue
+            status_str = status.decode("utf-8", "replace")
+            if status_str.startswith("R") or status_str.startswith("C"):
+                if idx + 2 < len(parts):
+                    old_path = parts[idx + 1].decode("utf-8", "replace")
+                    new_path = parts[idx + 2].decode("utf-8", "replace")
+                    deleted.add(old_path)
+                    added.add(new_path)
+                    idx += 3
+                    continue
+                idx += 1
+                continue
+            if idx + 1 >= len(parts):
+                break
+            path = parts[idx + 1].decode("utf-8", "replace")
+            if status_str == "A":
+                added.add(path)
+            elif status_str == "M":
+                modified.add(path)
+            elif status_str == "D":
+                deleted.add(path)
+            idx += 2
+        return added, modified, deleted
+
+    def _git_head_files(self) -> Set[str]:
+        """Return all files at HEAD (committed)."""
+        cmd = ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD"]
+        result = subprocess.run(cmd, cwd=self.rootdir, capture_output=True)
+        if result.returncode != 0:
+            return set()
+        return {p for p in result.stdout.decode("utf-8", "replace").split("\0") if p}
+
+    def _git_head_file_source(self, path: str) -> Optional[str]:
+        """Return file content from HEAD as text (ignores working tree)."""
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{path}"],
+            cwd=self.rootdir,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return None
+        source, _ = bytes_to_string_and_fsha(result.stdout)
+        return source
+
+    def _package_names_from_string(self, packages_str: str) -> Set[str]:
+        if not packages_str:
+            return set()
+        names = set()
+        for item in packages_str.split(", "):
+            item = item.strip()
+            if not item:
+                continue
+            parts = item.rsplit(" ", 1)
+            names.add(parts[0])
+        return names
 
     def _compute_file_dependency_shas(self):
         """Compute SHA hashes for all tracked file dependencies.
@@ -430,74 +789,20 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         1. Files not in git won't have a SHA (treated as changed)
         2. Files modified during workflow use committed state
         """
-        import subprocess
         file_deps_shas = {}
 
         # Get list of file dependencies from database
         file_dep_filenames = self.db.get_file_dependency_filenames(self.exec_id)
 
-        for filename in file_dep_filenames:
-            try:
-                # Use git ls-tree to get the committed blob hash
-                # This matches how we record file dependencies
-                result = subprocess.run(
-                    ['git', 'ls-tree', 'HEAD', '--', filename],
-                    cwd=self.rootdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    # Output format: "100644 blob <sha>\t<filename>"
-                    parts = result.stdout.strip().split()
-                    if len(parts) >= 3 and parts[1] == 'blob':
-                        file_deps_shas[filename] = parts[2]
-            except Exception:
-                # File not in git or error - mark as changed (no SHA)
-                pass
+        if not file_dep_filenames:
+            return file_deps_shas
+
+        tracked_shas = self.file_cache.batch_get_tracked_shas(file_dep_filenames)
+        for filename, sha in tracked_shas.items():
+            if sha:
+                file_deps_shas[filename] = sha
 
         return file_deps_shas
-
-    def assert_old_determin_stable(self, new_fingerprint_misses):
-        filenames_fingerprints = self.db.filenames_fingerprints(self.exec_id)
-
-        _, fsha_misses = split_filter(
-            self.source_tree, check_fsha, filenames_fingerprints
-        )  # check 2. fsha vs filesystem
-
-        # with the list of fingerprint_ids go to the database
-        # and fetch all the data needed for next step
-
-        changed_file_data = self.db.fetch_changed_file_data(
-            [fsha_miss["fingerprint_id"] for fsha_miss in (fsha_misses)],
-            self.exec_id,
-        )
-
-        # changed_file_data:
-        # [(filename, test_name, method_fshas, fingerprint_id, failed )]
-        # All the test_names in this list have a dependency on one
-        # or more changed files. And we also have the fingerprints
-        # of data content which they depend on. So it’s possible to
-        # filter out the node_ids where the content of the changed file
-        # still matches the fingerprint
-
-        _, fingerprint_misses = split_filter(
-            self.source_tree, check_fingerprint, changed_file_data
-        )
-
-        if {fingerprint_miss[1] for fingerprint_miss in fingerprint_misses} != set(
-            new_fingerprint_misses
-        ):
-            print("ERROR: old and new fingerprint misses differ.. printing old algo")
-            print(
-                "\n".join(
-                    sorted(
-                        {fingerprint_miss[1] for fingerprint_miss in fingerprint_misses}
-                    )
-                )
-            )
-            print("printing new algo")
-            print("\n".join(sorted(new_fingerprint_misses)))
 
     @property
     def avg_durations(self) -> dict:
@@ -529,35 +834,68 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
         return durations
 
-    def save_test_execution_file_fps(self, test_executions_fingerprints , nodes_files_lines=None,):
-        self.db.insert_test_file_fps(test_executions_fingerprints, self.exec_id)
-        if nodes_files_lines:
-            self.db.insert_coverage_lines(self.exec_id, nodes_files_lines)
+    def save_test_deps_bitmap(self, test_executions_fingerprints: TestExecutions) -> None:
+        """Save test dependencies using the new Roaring bitmap format.
 
-    def save_dependency_graph(self, graph_edges):
-        """Save dependency graph edges discovered during test execution.
+        This stores dependencies compactly in the new schema while the old schema
+        is also populated for backwards compatibility.
 
         Args:
-            graph_edges: List of tuples (source_file, target_file, target_package, edge_type)
+            test_executions_fingerprints: Dict mapping test name to DepsNOutcomes
         """
-        if not graph_edges:
-            return
+        # Ensure encoder has db reference for file ID caching
+        if not hasattr(self, 'path_encoder') or self.path_encoder is None:
+            self.path_encoder = get_encoder(self.rootdir)
+        self.path_encoder.set_db(self.db)
 
-        # Get the current run_uid
-        # For local DB, query directly. For NetDB, use the RPC method
-        if isinstance(self.db, NetDB):
-            # NetDB: use the RPC endpoint
-            self.db.insert_dependency_graph_edges(graph_edges, self.exec_id)
-            logger.info(f"Saved {len(graph_edges)} dependency graph edges via NetDB")
-        else:
-            # Local DB: get the latest run_uid
-            with self.db.con as con:
-                row = con.execute("SELECT MAX(id) FROM run_uid").fetchone()
-                run_uid = row[0] if row and row[0] else None
+        for test_name, deps_n_outcomes in test_executions_fingerprints.items():
+            file_ids = set()
+            external_packages = set()
 
-            if run_uid is not None:
-                self.db.insert_dependency_graph_edges(graph_edges, run_uid)
-                logger.info(f"Saved {len(graph_edges)} dependency graph edges for run_uid={run_uid}")
+            # Process Python file dependencies
+            for dep in deps_n_outcomes.get("deps", []):
+                filename = dep["filename"]
+                checksum = dep.get("file_checksum")
+                fsha = dep.get("fsha")
+
+                encoded = self.path_encoder.encode(filename)
+                file_id = self.path_encoder.get_file_id(
+                    encoded, checksum=checksum, fsha=fsha, file_type='python'
+                )
+                if file_id is not None:
+                    file_ids.add(file_id)
+
+            # Process non-Python file dependencies
+            for file_dep in deps_n_outcomes.get("file_deps", []):
+                filename = file_dep["filename"]
+                sha = file_dep.get("sha")
+
+                checksum = file_sha_to_checksum(sha) if sha else None
+                encoded = self.path_encoder.encode(filename)
+                file_id = self.path_encoder.get_file_id(
+                    encoded, checksum=checksum, fsha=sha, file_type='data'
+                )
+                if file_id is not None:
+                    file_ids.add(file_id)
+
+            # Process external package dependencies
+            for pkg_name in deps_n_outcomes.get("external_deps", []):
+                external_packages.add(pkg_name)
+
+            # Get or create test ID
+            test_file = test_name.split("::")[0] if "::" in test_name else test_name
+            test_id = self.db.get_or_create_test_id(
+                self.exec_id,
+                test_name,
+                duration=deps_n_outcomes.get("duration"),
+                failed=deps_n_outcomes.get("failed", False),
+                test_file=test_file,
+            )
+
+            # Create and save bitmap-based dependencies
+            deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
+            if hasattr(self.db, "save_test_deps"):
+                self.db.save_test_deps(test_id, deps)
 
     def fetch_saving_stats(self, select):
         return self.db.fetch_saving_stats(self.exec_id, select)
@@ -593,324 +931,239 @@ def cached_relpath(path, basepath):
 
 
 class TestmonCollector:
-    coverage_stack: [Coverage] = []
+    """Collector for test dependencies.
+
+    With the simplified model (no coverage.py), we rely solely on the
+    DependencyTracker to identify file dependencies. Any change to a
+    file that a test imports will trigger a re-run of that test.
+    """
 
     def __init__(
-        self, rootdir, testmon_labels=None, cov_plugin=None
-    ):  # TODO remove cov_plugin
-        try:
-            from ezmon.testmon_core import (  # pylint: disable=import-outside-toplevel
-                Testmon as UberTestmon,
-            )
-
-            TestmonCollector.coverage_stack: [Coverage] = UberTestmon.coverage_stack
-        except ImportError:
-            pass
+        self,
+        rootdir,
+        testmon_labels=None,
+        cov_plugin=None,
+        expected_imports: Optional[Set[str]] = None,
+        expected_reads: Optional[Set[str]] = None,
+        expected_packages: Optional[Set[str]] = None,
+        expected_files_list: Optional[List[str]] = None,
+        expected_packages_list: Optional[List[str]] = None,
+        package_index: Optional[Dict[str, str]] = None,
+        dependency_tracker: Optional[DependencyTracker] = None,
+    ):
         if testmon_labels is None:
             testmon_labels = {"singleprocess"}
         self.rootdir = rootdir
         self.testmon_labels = testmon_labels
-        self.cov: Coverage = None
-        self.sub_cov_file = None
-        self.cov_plugin: CovPlugin = cov_plugin
         self._test_name = None
         self._next_test_name = None
         self.batched_test_names = set()
-        self.check_stack = []
         self.is_started = False
         self._interrupted_at = None
 
         # Dependency tracker for file and import tracking
-        self.dependency_tracker = DependencyTracker(rootdir)
+        self.dependency_tracker = dependency_tracker or DependencyTracker(rootdir)
+        # Use singleton encoder for cache efficiency
+        self.path_encoder = get_encoder(rootdir)
+        self.dependency_tracker.set_expected(
+            expected_imports=expected_imports,
+            expected_reads=expected_reads,
+            expected_packages=expected_packages,
+        )
+        # Note: file_index removed - DependencyTracker uses singleton encoder directly
+        self._expected_files_list = list(expected_files_list or [])
+        if package_index is not None:
+            expected_packages_list = list(expected_packages_list or [])
+        elif expected_packages_list is not None:
+            expected_packages_list = list(expected_packages_list)
+            package_index = {pkg: idx for idx, pkg in enumerate(expected_packages_list)}
+        elif expected_packages is not None:
+            expected_packages_list = sorted(expected_packages or set())
+            package_index = {pkg: idx for idx, pkg in enumerate(expected_packages_list)}
+        else:
+            expected_packages_list = []
+            package_index = None
+        self._expected_packages_list = expected_packages_list
+        self.dependency_tracker.set_expected_indices(
+            package_index=package_index,
+        )
         # Store tracked dependencies per test for batch processing
         self._tracked_deps = {}  # {test_name: (files, local_imports, external_imports)}
-        # Store dependency graph edges: (source_file, target_file, target_package, edge_type)
-        self._graph_edges = set()
 
-        # Collection-time coverage tracking
-        self._collection_cov: Coverage = None
-        self._collection_context: str = None  # Current test file being collected
+    def _package_init_deps_for_path(self, relpath: Optional[str]) -> Set[str]:
+        """Return package __init__.py files for a given relative module path."""
+        if not relpath:
+            return set()
+        parts = Path(relpath).parts
+        if len(parts) <= 1:
+            return set()
+        deps = set()
+        for i in range(1, len(parts)):
+            init_rel = Path(*parts[:i]) / "__init__.py"
+            init_abs = Path(self.rootdir) / init_rel
+            if init_abs.exists():
+                deps.add(str(init_rel).replace(os.sep, "/"))
+        return deps
 
-    def start_cov(self):
-        if not self.cov._started:
-            TestmonCollector.coverage_stack.append(self.cov)
-            self.cov.start()
+    def _decode_import_path(self, path):
+        if isinstance(path, int):
+            if 0 <= path < len(self._expected_files_list):
+                return self._expected_files_list[path]
+            return None
+        try:
+            decoded = self.path_encoder.decode(path)
+            if str(decoded).startswith(str(self.rootdir)):
+                return str(decoded.relative_to(self.rootdir))
+            return str(decoded)
+        except Exception:
+            return path
+        return path
 
-    def stop_cov(self):
-        if self.cov is None:
-            return
-        assert self.cov in TestmonCollector.coverage_stack
-        if TestmonCollector.coverage_stack:
-            while TestmonCollector.coverage_stack[-1] != self.cov:
-                cov = TestmonCollector.coverage_stack.pop()
-                cov.stop()
-        if self.cov._started:
-            self.cov.stop()
-            TestmonCollector.coverage_stack.pop()
-        if TestmonCollector.coverage_stack:
-            TestmonCollector.coverage_stack[-1].start()
-
-    def setup_coverage(self, subprocess=False):
-        params = {
-            "include": [os.path.join(self.rootdir, "*")],
-            "omit": {
-                os.path.join(value, "*")
-                for key, value in sysconfig.get_paths().items()
-                if key.endswith("lib")
-            },
-        }
-        if self.cov_plugin and self.cov_plugin._started:
-            cov = self.cov_plugin.cov_controller.cov
-            TestmonCollector.coverage_stack.append(cov)
-            if cov.config.source:
-                params["include"] = list(
-                    set(
-                        [os.path.join(self.rootdir, "*")]
-                        + [
-                            os.path.join(os.path.abspath(source), "*")
-                            for source in cov.config.source
-                        ]
-                    )
-                )
-            elif cov.config.run_include:
-                params["include"] = list(
-                    set(cov.config.run_include + params["include"])
-                )
-            # params["omit"] = cov.config.run_omit
-            if cov.config.branch:
-                raise TestmonException(
-                    "ezmon doesn't support simultaneous run with pytest-cov when "
-                    "branch coverage is on. Please disable branch coverage."
-                )
-
-        self.cov = Coverage(data_file=self.sub_cov_file, config_file=False, **params)
-        self.cov._warn_no_data = False
-        if TestmonCollector.coverage_stack:
-            TestmonCollector.coverage_stack[-1].stop()
-
-        self.start_cov()
-
-    def setup_collection_coverage(self):
-        """Setup coverage for tracking collection-time code execution.
-
-        This captures which lines are executed when test files are imported,
-        giving us precise line coverage for collection-time dependencies.
-        """
-        params = {
-            "include": [os.path.join(self.rootdir, "*")],
-            "omit": {
-                os.path.join(value, "*")
-                for key, value in sysconfig.get_paths().items()
-                if key.endswith("lib")
-            },
-        }
-        self._collection_cov = Coverage(data_file=None, config_file=False, **params)
-        self._collection_cov._warn_no_data = False
-        self._collection_cov.start()
-
-    def set_collection_coverage_context(self, test_file: str):
-        """Switch collection coverage context to a test file.
-
-        Called when pytest starts collecting a test module.
-        """
-        if self._collection_cov is None:
-            return
-        self._collection_context = test_file
-        self._collection_cov.switch_context(test_file)
-
-    def get_collection_coverage(self) -> dict:
-        """Stop collection coverage and return coverage data per test file.
-
-        Returns:
-            Dict mapping test_file -> {module_path -> set of line numbers}
-        """
-        if self._collection_cov is None:
-            return {}
-
-        self._collection_cov.stop()
-        cov_data = self._collection_cov.get_data()
-
-        # Build per-test-file coverage data
-        collection_coverage = {}  # {test_file: {module_path: set(lines)}}
-
-        for file in cov_data.measured_files():
-            relfilename = cached_relpath(file, self.rootdir)
-            contexts_by_lineno = cov_data.contexts_by_lineno(file)
-
-            for lineno, contexts in contexts_by_lineno.items():
-                for context in contexts:
-                    if context:  # Skip empty context
-                        collection_coverage.setdefault(context, {}).setdefault(
-                            relfilename, set()
-                        ).add(lineno)
-
-        self._collection_cov = None
-        return collection_coverage
+    def _encode_import_path(self, path: str):
+        return self.path_encoder.encode(path)
 
     def start_testmon(self, test_name, next_test_name=None):
+        """Start tracking dependencies for a test.
+
+        With the no-coverage model, we rely solely on the DependencyTracker
+        to identify which files the test imports/depends on.
+        """
         self._next_test_name = next_test_name
-
         self.batched_test_names.add(test_name)
-        if self.cov is None:
-            self.setup_coverage()
-
-        self.start_cov()
         self._test_name = test_name
-        self.cov.switch_context(test_name)
-        self.check_stack = TestmonCollector.coverage_stack.copy()
 
         # Start dependency tracking for this test
         # Extract test file from nodeid (format: "tests/test_foo.py::TestClass::test_method")
         test_file = test_name.split("::")[0] if "::" in test_name else None
-        self.dependency_tracker.start(test_name, test_file=test_file)
+        self.dependency_tracker.start_test(test_name, test_file=test_file)
 
     def discard_current(self):
         self._interrupted_at = self._test_name
 
-    def get_batch_coverage_data(self):
-        if self.check_stack != TestmonCollector.coverage_stack:
-            pytest.exit(
-                (
-                    "Exiting pytest!!!! This test corrupts Testmon.coverage_stack:"
-                    f" {self._test_name} {self.check_stack},"
-                    f" {TestmonCollector.coverage_stack}"
-                ),
-                returncode=3,
-            )
+    def stop_testmon(self):
+        """Stop tracking for the current test and return its deps payload."""
+        files, local_imports, external_imports, test_file = self.dependency_tracker.end_test()
+        deps_payload = {
+            "deps": set(),
+            "file_deps": set(),
+            "external_deps": set(),
+        }
+        if local_imports:
+            deps_payload["deps"].update(local_imports)
+        for rel in local_imports or []:
+            decoded = self._decode_import_path(rel)
+            if not decoded:
+                continue
+            for init_path in self._package_init_deps_for_path(decoded):
+                deps_payload["deps"].add(self._encode_import_path(init_path))
+        for init_path in self._package_init_deps_for_path(test_file):
+            deps_payload["deps"].add(self._encode_import_path(init_path))
+        if test_file:
+            deps_payload["deps"].add(test_file)
+        test_home = home_file(self._test_name)
+        deps_payload["deps"].add(test_home)
+        global_deps = getattr(self.dependency_tracker, "_checkpoint_local_imports", set())
+        if global_deps:
+            deps_payload["deps"].update(global_deps)
+        if files:
+            deps_payload["file_deps"].update({(tf.path, tf.sha) for tf in files})
+        if external_imports:
+            deps_payload["external_deps"].update(set(external_imports))
+        return deps_payload
 
+    def get_batch_coverage_data(self):
+        """Get dependency data for the current batch of tests.
+
+        With the no-coverage model, we rely solely on the DependencyTracker
+        to identify file dependencies. Each file that a test imports
+        becomes a dependency.
+        """
         # Stop dependency tracking and collect tracked dependencies
         files, local_imports, external_imports, test_file = self.dependency_tracker.stop()
         self._tracked_deps[self._test_name] = (files, local_imports, external_imports, test_file)
 
         nodes_files_lines = {}
 
-        if self.cov and (
+        if (
             len(self.batched_test_names) >= TEST_BATCH_SIZE
             or self._next_test_name is None
             or self._interrupted_at
         ):
-            self.cov.stop()
-            nodes_files_lines, lines_data = self.get_nodes_files_lines(
-                dont_include=self._interrupted_at
-            )
+            # Build nodes_files_lines from dependency tracker data
+            nodes_files_lines = self._build_nodes_files_lines()
 
-            # Merge tracked dependencies into nodes_files_lines
+            # Merge tracked dependencies
             nodes_files_lines = self._merge_tracked_deps(nodes_files_lines)
 
-            if (
-                len(TestmonCollector.coverage_stack) > 1
-                and TestmonCollector.coverage_stack[-1] == self.cov
-            ):
-                filtered_lines_data = {
-                    file: data
-                    for file, data in lines_data.items()
-                    if should_include(TestmonCollector.coverage_stack[-2], file)
-                }
-                TestmonCollector.coverage_stack[-2].get_data().add_lines(
-                    filtered_lines_data
-                )
-
-            self.cov.erase()
-            self.cov.start()
             self.batched_test_names = set()
             self._tracked_deps = {}  # Clear after processing batch
         return nodes_files_lines
 
+    def _build_nodes_files_lines(self):
+        """Build nodes_files_lines from dependency tracker data."""
+        nodes_files_lines = {}
+        global_deps = getattr(self.dependency_tracker, "_checkpoint_local_imports", set())
+        for test_name in self.batched_test_names:
+            if test_name == self._interrupted_at:
+                continue
+            deps_payload = {
+                "deps": set(),
+                "file_deps": set(),
+                "external_deps": set(),
+            }
+
+            if test_name in self._tracked_deps:
+                _files, local_imports, _external_imports, test_file = self._tracked_deps[test_name]
+                deps_payload["deps"].update(local_imports)
+                if test_file:
+                    for init_path in self._package_init_deps_for_path(test_file):
+                        deps_payload["deps"].add(self._encode_import_path(init_path))
+                    deps_payload["deps"].add(test_file)
+                for rel in local_imports or []:
+                    decoded = self._decode_import_path(rel)
+                    if not decoded:
+                        continue
+                    for init_path in self._package_init_deps_for_path(decoded):
+                        deps_payload["deps"].add(self._encode_import_path(init_path))
+
+            test_home = home_file(test_name)
+            deps_payload["deps"].add(test_home)
+            if global_deps:
+                deps_payload["deps"].update(global_deps)
+
+            nodes_files_lines[test_name] = deps_payload
+
+        return nodes_files_lines
+
     def _merge_tracked_deps(self, nodes_files_lines):
         """Merge tracked file and import dependencies into coverage data.
-
-        Also collects dependency graph edges for visualization.
 
         Note: Collection-time imports (module-level imports that happen during test
         file collection) are tracked separately by the dependency tracker and merged
         in pytest_ezmon.py via _merge_collection_deps(). This method handles:
         - Runtime imports (dynamic imports during test execution)
         - File reads during test execution
-        - Building dependency graph edges from runtime data
         """
         for test_name, (files, local_imports, external_imports, test_file) in self._tracked_deps.items():
             if test_name not in nodes_files_lines:
-                nodes_files_lines[test_name] = {}
+                nodes_files_lines[test_name] = {
+                    "deps": set(),
+                    "file_deps": set(),
+                    "external_deps": set(),
+                }
 
-            # Build graph edges for local imports captured during runtime
-            # Note: We no longer add {0} as a fallback - coverage.py tracks the actual
-            # lines executed when functions are called. Collection-time imports are
-            # handled by _merge_collection_deps with precise line coverage.
-            for local_import in local_imports:
-                if test_file:
-                    self._graph_edges.add((test_file, local_import, None, 'local'))
-
-            # Build graph edges for external imports
-            if test_file and external_imports:
-                for pkg in external_imports:
-                    self._graph_edges.add((test_file, None, pkg, 'external'))
-
-            # Store file dependencies in a special key
-            # These will be handled specially in get_tests_fingerprints
-            # Convert TrackedFile namedtuples to plain tuples for xdist serialization
             if files:
-                file_deps_key = f"__file_deps__{test_name}"
-                nodes_files_lines[test_name][file_deps_key] = {(tf.path, tf.sha) for tf in files}
+                nodes_files_lines[test_name]["file_deps"].update({(tf.path, tf.sha) for tf in files})
 
             # Store external imports for granular package tracking
             if external_imports:
-                ext_deps_key = f"__external_deps__{test_name}"
-                nodes_files_lines[test_name][ext_deps_key] = set(external_imports)
+                nodes_files_lines[test_name]["external_deps"].update(set(external_imports))
 
         return nodes_files_lines
 
-    def get_graph_edges(self):
-        """Return collected dependency graph edges.
-
-        Returns:
-            List of tuples: (source_file, target_file, target_package, edge_type)
-        """
-        return list(self._graph_edges)
-
-    def get_nodes_files_lines(self, dont_include):
-        cov_data: CoverageData = self.cov.get_data()
-        files = cov_data.measured_files()
-        nodes_files_lines = {}
-        files_lines = {}
-        for file in files:
-            relfilename = cached_relpath(file, self.rootdir)
-
-            contexts_by_lineno = cov_data.contexts_by_lineno(file)
-
-            for lineno, contexts in contexts_by_lineno.items():
-                for context in contexts:
-                    nodes_files_lines.setdefault(context, {}).setdefault(
-                        relfilename, set()
-                    ).add(lineno)
-                    files_lines.setdefault(file, set()).add(lineno)
-        nodes_files_lines.pop(dont_include, None)
-        self.batched_test_names.discard(dont_include)
-        nodes_files_lines.pop("", None)
-        for test_name in self.batched_test_names:
-            if home_file(test_name) not in nodes_files_lines.setdefault(test_name, {}):
-                nodes_files_lines[test_name].setdefault(home_file(test_name), {1})
-        return nodes_files_lines, files_lines
-
     def close(self):
-        # Close dependency tracker
+        """Close the collector and clean up resources."""
         self.dependency_tracker.close()
-
-        if self.cov is None:
-            return
-        assert self.cov in TestmonCollector.coverage_stack
-        if TestmonCollector.coverage_stack:
-            while TestmonCollector.coverage_stack[-1] != self.cov:
-                cov = TestmonCollector.coverage_stack.pop()
-                cov.stop()
-        if self.cov._started:
-            self.cov.stop()
-            TestmonCollector.coverage_stack.pop()
-        if self.sub_cov_file:
-            os.remove(self.sub_cov_file + "_rc")
-        os.environ.pop("COVERAGE_PROCESS_START", None)
-        self.cov = None
-        if TestmonCollector.coverage_stack:
-            TestmonCollector.coverage_stack[-1].start()
 
 
 def eval_environment(environment, **kwargs):
@@ -927,9 +1180,3 @@ def eval_environment(environment, **kwargs):
         return str(eval(environment, eval_globals))
     except Exception as error:  # pylint: disable=broad-except
         return repr(error)
-
-
-def process_result(result):
-    failed = any(r.outcome == "failed" for r in result.values())
-    duration = sum(value.duration for value in result.values())
-    return {"failed": failed, "duration": duration}

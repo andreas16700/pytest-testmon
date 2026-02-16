@@ -52,7 +52,7 @@ from dotenv import load_dotenv
 
 from ezmon.process_code import (
     bytes_to_string_and_fsha,
-    checksums_to_blob,
+    compute_file_checksum,
 )
 from ezmon.testmon_core import SourceTree
 from ezmon.common import get_logger
@@ -290,15 +290,18 @@ class ImpactEstimator:
 
     def compute_fingerprints(
         self, files: List[str]
-    ) -> Tuple[Dict[str, str], Dict[str, List[int]]]:
+    ) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
-        Compute file SHAs and method checksums for the given files.
+        Compute file SHAs and file checksums for the given files.
+
+        With the simplified single-file checksum model, each file has one checksum
+        representing the entire file's code (excluding comments and docstrings).
 
         Returns:
-            Tuple of (files_fshas, files_mhashes)
+            Tuple of (files_fshas, files_checksums)
         """
         files_fshas = {}
-        files_mhashes = {}
+        files_checksums = {}
 
         source_tree = SourceTree(rootdir=str(self.repo_path))
 
@@ -307,7 +310,7 @@ class ImpactEstimator:
             if not full_path.exists():
                 # File was deleted
                 files_fshas[filepath] = None
-                files_mhashes[filepath] = None
+                files_checksums[filepath] = None
                 continue
 
             try:
@@ -316,21 +319,19 @@ class ImpactEstimator:
                 source_code, fsha = bytes_to_string_and_fsha(content)
                 files_fshas[filepath] = fsha
 
-                # Get method checksums using SourceTree
-                # The module.method_checksums property returns integer CRC32 hashes
+                # Get single file checksum using SourceTree
                 module = source_tree.get_file(filepath)
-                if module and hasattr(module, 'method_checksums'):
-                    checksums = module.method_checksums
-                    files_mhashes[filepath] = checksums
+                if module:
+                    files_checksums[filepath] = module.checksum
                 else:
-                    files_mhashes[filepath] = []
+                    files_checksums[filepath] = None
 
             except Exception as e:
                 logger.warning(f"Failed to process {filepath}: {e}")
                 files_fshas[filepath] = None
-                files_mhashes[filepath] = None
+                files_checksums[filepath] = None
 
-        return files_fshas, files_mhashes
+        return files_fshas, files_checksums
 
     def list_variants(self, repo_id: str, include_incomplete: bool = False) -> Tuple[List[str], List[dict]]:
         """
@@ -370,10 +371,13 @@ class ImpactEstimator:
         repo_id: str,
         job_id: str,
         files_fshas: Dict[str, str],
-        files_mhashes: Dict[str, List[int]],
+        files_checksums: Dict[str, int],
     ) -> ImpactResult:
         """
         Estimate impact for a single job variant.
+
+        With the simplified single-file checksum model, we send integer checksums
+        directly instead of serialized method checksum arrays.
         """
         result = ImpactResult(
             job_id=job_id,
@@ -381,14 +385,6 @@ class ImpactEstimator:
         )
 
         try:
-            # Serialize method checksums for transport
-            serialized_mhashes = {}
-            for filename, mhashes in files_mhashes.items():
-                if mhashes is not None:
-                    serialized_mhashes[filename] = checksums_to_blob(mhashes).hex()
-                else:
-                    serialized_mhashes[filename] = None
-
             # Call impact estimation endpoint
             response = self._make_request(
                 "POST",
@@ -397,7 +393,7 @@ class ImpactEstimator:
                     "repo_id": repo_id,
                     "job_id": job_id,
                     "files_fshas": files_fshas,
-                    "files_mhashes": serialized_mhashes,
+                    "files_checksums": files_checksums,
                 },
             )
 
@@ -445,7 +441,7 @@ class ImpactEstimator:
             )
 
         # Compute fingerprints
-        files_fshas, files_mhashes = self.compute_fingerprints(changed_files)
+        files_fshas, files_checksums = self.compute_fingerprints(changed_files)
 
         # Get variants to check
         if not job_ids:
@@ -471,7 +467,7 @@ class ImpactEstimator:
 
         for job_id in job_ids:
             result = self.estimate_impact_for_variant(
-                repo_id, job_id, files_fshas, files_mhashes
+                repo_id, job_id, files_fshas, files_checksums
             )
             report.results.append(result)
 

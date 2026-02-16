@@ -1,0 +1,311 @@
+{
+  "matplotlib": {
+    "repo_path": "/Users/andrew_yos/pytest-super/matplotlib",
+    "dependencies": [
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/classic.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/bmh.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/dark_background.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/fivethirtyeight.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/ggplot.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/grayscale.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/mpl-data/stylelib/seaborn-v0_8.mplstyle",
+        "affected_test_file": "lib/matplotlib/tests/test_style.py",
+        "bypass_method": "importlib.resources",
+        "description": "Style file loaded via package resources"
+      },
+      {
+        "dependency_file": "lib/matplotlib/tests/data/test_inline_01.ipynb",
+        "affected_test_file": "lib/matplotlib/tests/test_backend_inline.py",
+        "bypass_method": "subprocess (jupyter nbconvert)",
+        "description": "Jupyter notebook executed in subprocess"
+      },
+      {
+        "dependency_file": "lib/matplotlib/tests/data/test_nbagg_01.ipynb",
+        "affected_test_file": "lib/matplotlib/tests/test_backend_nbagg.py",
+        "bypass_method": "subprocess (jupyter nbconvert)",
+        "description": "Jupyter notebook executed in subprocess"
+      },
+      {
+        "dependency_file": "lib/matplotlib/tests/baseline_images/test_image/interp_alpha.png",
+        "affected_test_file": "lib/matplotlib/tests/test_image.py",
+        "bypass_method": "image comparison (runtime file read)",
+        "description": "Baseline image for visual comparison"
+      },
+      {
+        "dependency_file": "lib/matplotlib/tests/baseline_images/test_axes/bxp_horizontal.png",
+        "affected_test_file": "lib/matplotlib/tests/test_axes.py",
+        "bypass_method": "image comparison (runtime file read)",
+        "description": "Baseline image for visual comparison"
+      },
+      {
+        "dependency_file": "lib/matplotlib/tests/data/mpltest.ttf",
+        "affected_test_file": "lib/matplotlib/tests/test_mathtext.py",
+        "bypass_method": "font loading (C library)",
+        "description": "Test font file loaded by FreeType"
+      },
+      {
+        "dependency_file": "lib/matplotlib/tests/data/cmr10.pfb",
+        "affected_test_file": "lib/matplotlib/tests/test_type1font.py",
+        "bypass_method": "font loading (C library)",
+        "description": "Type1 font file loaded by FreeType"
+      },
+      {
+        "dependency_file": "lib/matplotlib/figure.py",
+        "affected_test_file": "lib/matplotlib/tests/test_pickle.py",
+        "bypass_method": "subprocess (subprocess_run_helper)",
+        "description": "Figure pickle format used in subprocess test"
+      },
+      {
+        "dependency_file": "lib/matplotlib/backends/backend_macosx.py",
+        "affected_test_file": "lib/matplotlib/tests/test_backend_macosx.py",
+        "bypass_method": "subprocess (subprocess_run_helper)",
+        "description": "Backend code executed in subprocess"
+      },
+      {
+        "dependency_file": "lib/matplotlib/backends/backend_tkagg.py",
+        "affected_test_file": "lib/matplotlib/tests/test_backend_tk.py",
+        "bypass_method": "subprocess (subprocess_run_helper)",
+        "description": "Backend code executed in subprocess"
+      },
+      {
+        "dependency_file": "lib/matplotlib/ticker.py",
+        "affected_test_file": "lib/matplotlib/tests/test_ticker.py",
+        "bypass_method": "subprocess (subprocess_run_helper)",
+        "description": "Ticker locale test in subprocess"
+      }
+    ]
+  },
+  "pandas": {
+    "repo_path": "/Users/andrew_yos/pandasRepo",
+    "dependencies": [
+      {
+        "dependency_file": "pandas/__init__.py",
+        "affected_test_file": "pandas/tests/test_downstream.py",
+        "bypass_method": "subprocess (-OO flag)",
+        "description": "Import behavior tested in optimized subprocess"
+      },
+      {
+        "dependency_file": "pandas/core/frame.py",
+        "affected_test_file": "pandas/tests/test_downstream.py",
+        "bypass_method": "subprocess (pickle test)",
+        "description": "DataFrame pickle tested in subprocess"
+      },
+      {
+        "dependency_file": "pandas/io/clipboard/__init__.py",
+        "affected_test_file": "pandas/tests/io/test_clipboard.py",
+        "bypass_method": "subprocess (external clipboard tools)",
+        "description": "Clipboard uses external tools like pbcopy, xclip"
+      },
+      {
+        "dependency_file": "pandas/tests/io/data/csv/test_mmap.csv",
+        "affected_test_file": "pandas/tests/io/parser/common/test_file_buffer_url.py",
+        "bypass_method": "mmap.mmap (after initial open)",
+        "description": "CSV file accessed via memory mapping"
+      },
+      {
+        "dependency_file": "pandas/tests/io/data/csv/test1.csv",
+        "affected_test_file": "pandas/tests/io/parser/test_c_parser_only.py",
+        "bypass_method": "mmap.mmap",
+        "description": "CSV file accessed via memory mapping in test"
+      },
+      {
+        "dependency_file": "pandas/tests/io/data/legacy_pickle/1.5.3/1.5.3_x86_64_linux_3.11.9.pickle",
+        "affected_test_file": "pandas/tests/io/test_pickle.py",
+        "bypass_method": "pickle (C deserialization)",
+        "description": "Legacy pickle file for compatibility testing"
+      },
+      {
+        "dependency_file": "pandas/plotting/_core.py",
+        "affected_test_file": "pandas/tests/plotting/test_backend.py",
+        "bypass_method": "entry_points (plugin loading)",
+        "description": "Plotting backend loaded via entry points"
+      }
+    ]
+  },
+  "scipy": {
+    "repo_path": "/Users/andrew_yos/scipy",
+    "dependencies": [
+      {
+        "dependency_file": "scipy/special/tests/data/boost.npz",
+        "affected_test_file": "scipy/special/tests/test_data.py",
+        "bypass_method": "np.load() + importlib.resources",
+        "description": "Boost library reference data for special functions"
+      },
+      {
+        "dependency_file": "scipy/special/tests/data/gsl.npz",
+        "affected_test_file": "scipy/special/tests/test_data.py",
+        "bypass_method": "np.load() + importlib.resources",
+        "description": "GSL library reference data for special functions"
+      },
+      {
+        "dependency_file": "scipy/special/tests/data/local.npz",
+        "affected_test_file": "scipy/special/tests/test_data.py",
+        "bypass_method": "np.load() + importlib.resources",
+        "description": "Local reference data for special functions"
+      },
+      {
+        "dependency_file": "scipy/stats/tests/data/jf_skew_t_gamlss_pdf_data.npy",
+        "affected_test_file": "scipy/stats/tests/test_distributions.py",
+        "bypass_method": "np.load()",
+        "description": "JF Skew-T distribution reference data"
+      },
+      {
+        "dependency_file": "scipy/stats/tests/data/levy_stable/stable-Z1-pdf-sample-data.npy",
+        "affected_test_file": "scipy/stats/tests/test_distributions.py",
+        "bypass_method": "np.load()",
+        "description": "Levy stable distribution PDF reference data"
+      },
+      {
+        "dependency_file": "scipy/stats/tests/data/levy_stable/stable-Z1-cdf-sample-data.npy",
+        "affected_test_file": "scipy/stats/tests/test_distributions.py",
+        "bypass_method": "np.load()",
+        "description": "Levy stable distribution CDF reference data"
+      },
+      {
+        "dependency_file": "scipy/stats/tests/data/levy_stable/stable-loc-scale-sample-data.npy",
+        "affected_test_file": "scipy/stats/tests/test_distributions.py",
+        "bypass_method": "np.load()",
+        "description": "Levy stable distribution loc-scale reference data"
+      },
+      {
+        "dependency_file": "scipy/stats/tests/data/rel_breitwigner_pdf_sample_data_ROOT.npy",
+        "affected_test_file": "scipy/stats/tests/test_distributions.py",
+        "bypass_method": "np.load()",
+        "description": "Relativistic Breit-Wigner reference data from ROOT"
+      },
+      {
+        "dependency_file": "scipy/stats/_sobol_direction_numbers.npz",
+        "affected_test_file": "scipy/stats/tests/test_qmc.py",
+        "bypass_method": "np.load() + importlib.resources",
+        "description": "Sobol sequence direction numbers"
+      },
+      {
+        "dependency_file": "scipy/fftpack/tests/test.npz",
+        "affected_test_file": "scipy/fft/_pocketfft/tests/test_real_transforms.py",
+        "bypass_method": "np.load()",
+        "description": "FFT test reference data"
+      },
+      {
+        "dependency_file": "scipy/fftpack/tests/fftw_double_ref.npz",
+        "affected_test_file": "scipy/fft/_pocketfft/tests/test_real_transforms.py",
+        "bypass_method": "np.load()",
+        "description": "FFTW double precision reference data"
+      },
+      {
+        "dependency_file": "scipy/fftpack/tests/fftw_single_ref.npz",
+        "affected_test_file": "scipy/fft/_pocketfft/tests/test_real_transforms.py",
+        "bypass_method": "np.load()",
+        "description": "FFTW single precision reference data"
+      },
+      {
+        "dependency_file": "scipy/io/tests/data/fortran-mixed-endian-record-marker.dat",
+        "affected_test_file": "scipy/io/tests/test_fortran.py",
+        "bypass_method": "FortranFile (np.fromfile)",
+        "description": "Fortran binary test data"
+      },
+      {
+        "dependency_file": "scipy/io/matlab/tests/data/test_struct_example.mat",
+        "affected_test_file": "scipy/io/matlab/tests/test_mio.py",
+        "bypass_method": "loadmat() (binary MATLAB I/O)",
+        "description": "MATLAB struct test data"
+      },
+      {
+        "dependency_file": "scipy/io/matlab/tests/data/testdouble_7.4_GLNX86.mat",
+        "affected_test_file": "scipy/io/matlab/tests/test_mio.py",
+        "bypass_method": "loadmat() (binary MATLAB I/O)",
+        "description": "MATLAB v7.4 test data"
+      },
+      {
+        "dependency_file": "scipy/io/tests/data/scalar_string.sav",
+        "affected_test_file": "scipy/io/tests/test_idl.py",
+        "bypass_method": "readsav() (binary IDL I/O)",
+        "description": "IDL save file test data"
+      },
+      {
+        "dependency_file": "scipy/io/tests/data/example_1.nc",
+        "affected_test_file": "scipy/io/tests/test_netcdf.py",
+        "bypass_method": "netcdf_file() (mmap/binary I/O)",
+        "description": "NetCDF test data"
+      },
+      {
+        "dependency_file": "scipy/io/tests/data/test-8000Hz-le-2ch-1byteu.wav",
+        "affected_test_file": "scipy/io/tests/test_wavfile.py",
+        "bypass_method": "wavfile.read() (np.fromfile/memmap)",
+        "description": "WAV audio test data"
+      },
+      {
+        "dependency_file": "scipy/interpolate/tests/data/bug-1310.npz",
+        "affected_test_file": "scipy/interpolate/tests/test_fitpack.py",
+        "bypass_method": "np.load()",
+        "description": "Interpolation regression test data"
+      },
+      {
+        "dependency_file": "scipy/interpolate/tests/data/gcvspl.npz",
+        "affected_test_file": "scipy/interpolate/tests/test_bsplines.py",
+        "bypass_method": "np.load()",
+        "description": "GCVSPL reference data for B-splines"
+      },
+      {
+        "dependency_file": "scipy/interpolate/tests/data/estimate_gradients_hang.npy",
+        "affected_test_file": "scipy/interpolate/tests/test_interpnd.py",
+        "bypass_method": "np.load()",
+        "description": "Gradient estimation test data"
+      },
+      {
+        "dependency_file": "scipy/spatial/tests/data/cdist-X1.txt",
+        "affected_test_file": "scipy/spatial/tests/test_distance.py",
+        "bypass_method": "np.loadtxt() (text parsing)",
+        "description": "Distance computation test data"
+      },
+      {
+        "dependency_file": "scipy/spatial/tests/data/iris.txt",
+        "affected_test_file": "scipy/spatial/tests/test_qhull.py",
+        "bypass_method": "np.load()/np.loadtxt()",
+        "description": "Qhull iris dataset"
+      },
+      {
+        "dependency_file": "scipy/linalg/tests/data/carex_15_data.npz",
+        "affected_test_file": "scipy/linalg/tests/test_solvers.py",
+        "bypass_method": "np.load()",
+        "description": "CAREX test data for linear algebra"
+      },
+      {
+        "dependency_file": "scipy/stats/_distn_infrastructure.py",
+        "affected_test_file": "scipy/stats/tests/test_distributions.py",
+        "bypass_method": "exec() (dynamic code generation)",
+        "description": "Distribution arg parser template - but this IS tracked via import"
+      }
+    ]
+  }
+}

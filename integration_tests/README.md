@@ -1,23 +1,33 @@
-# Integration Tests for pytest-ezmon
+# Integration Tests for pytest-ezmon-nocov
 
-This directory contains integration tests that verify ezmon's test selection behavior using realistic scenarios.
+This directory contains integration tests that verify ezmon-nocov's test selection behavior using realistic scenarios.
 
-## Key Improvements Over Original testmon
+## Key Differences from Original testmon
 
-Ezmon provides significant improvements over the original `pytest-testmon` plugin:
+Ezmon-nocov uses **import-based tracking** instead of coverage.py:
 
-| Feature | Original testmon | Ezmon |
-|---------|------------------|-------|
-| Transitive imports (globals pattern) | ❌ Not tracked | ✅ Tracked via AST parsing |
-| File dependencies (JSON, YAML, etc.) | ❌ Not tracked | ✅ Tracked via file hashing |
-| Method-level precision | ✅ Yes | ✅ Yes (via coverage.py) |
+| Feature | Original testmon | Ezmon-nocov |
+|---------|------------------|-------------|
+| Dependency tracking | coverage.py contexts | Import hooks |
+| Granularity | Line/method-level | File-level |
+| Transitive imports | ❌ Not fully tracked | ✅ Tracked via import hooks |
+| File dependencies (JSON, YAML) | ❌ Not tracked | ✅ Tracked via file hashing |
+| First-run speed | Slower (coverage overhead) | ~3x faster |
+| False negatives | Possible (coverage limitations) | Never (conservative) |
+| Storage | Junction tables | Roaring bitmaps + zstd |
+
+### Trade-offs
+
+**Import-based tracking is conservative**: When any code in a file changes, all tests that import that file (directly or transitively) are re-run. This means:
+- **Pros**: No false negatives - if code changes, dependent tests run
+- **Cons**: May run more tests than strictly necessary (tests that import but don't use changed code)
 
 ### Verified Improvements
 
 We tested both plugins on limitation scenarios:
 
-| Scenario | Original testmon | Ezmon |
-|----------|------------------|-------|
+| Scenario | Original testmon | Ezmon-nocov |
+|----------|------------------|-------------|
 | `modify_globals` (change app_globals.py) | 0 selected / 23 deselected | **23 selected** |
 | `modify_config_file` (change config.json) | 0 selected / 11 deselected | **11 selected** |
 
@@ -28,7 +38,7 @@ integration_tests/
 ├── run_integration_tests.py  # Test runner script
 ├── test_all_versions.py      # Multi-version test script
 ├── scenarios/
-│   └── __init__.py           # Scenario definitions (16 scenarios)
+│   └── __init__.py           # Scenario definitions (24 scenarios)
 └── sample_project/           # Example project with various code patterns
     ├── config.json            # Config file (for file dependency tests)
     ├── src/
@@ -44,7 +54,11 @@ integration_tests/
     │   ├── external_deps.py   # External package dependency demo
     │   ├── import_only.py     # Import without execution demo
     │   ├── app_globals.py     # Global constants (for transitive import tests)
-    │   └── globals_consumer.py # Module that uses globals
+    │   ├── globals_consumer.py # Module that uses globals
+    │   └── models/            # Package re-export pattern demo
+    │       ├── __init__.py    # Re-exports User, Product from submodules
+    │       ├── user.py        # User class definition
+    │       └── product.py     # Product class definition
     └── tests/
         ├── test_math_utils.py       # 10 tests
         ├── test_string_utils.py     # 6 tests
@@ -56,24 +70,66 @@ integration_tests/
         ├── test_config_reader.py    # 11 tests (file dependency)
         ├── test_external_deps.py    # 9 tests (external deps)
         ├── test_import_only.py      # 9 tests (import tracking)
-        └── test_globals_consumer.py # 23 tests (transitive import tracking)
+        ├── test_globals_consumer.py # 23 tests (transitive import tracking)
+        ├── test_models.py           # Tests importing via package __init__
+        ├── test_user_only.py        # Tests User class only
+        └── test_product_only.py     # Tests Product class only
 ```
 
-## How Dependency Tracking Works
+## How Import-Based Dependency Tracking Works
 
-### 1. Method-Level Fingerprinting (via coverage.py)
+### Core Principle
 
-Ezmon tracks dependencies at the **method level**, not just file level. Each test has a fingerprint **per Python module** it used, containing:
-1. The module-level checksum (file with function/method bodies stripped)
-2. Checksums for each function/method body the test actually executed (as reported by coverage.py)
+**No code in Python outside the current module can execute unless it is imported.**
 
-When you modify a specific function, only tests that have that function's checksum in their fingerprint will be re-run.
+This observation enables import-based test dependency tracking. If a test depends on code in `module_x.py`, then at some point during the test's lifecycle, `module_x` must be imported.
 
-### 2. Transitive Import Tracking (NEW)
+### 1. Import Hook
 
-**Problem**: When Python imports module M1, which imports M2, the interpreter executes M2's top-level code. This creates a transitive dependency that coverage.py doesn't track (because no code is "executed" during test runtime - it was executed during import).
+Ezmon-nocov hooks `builtins.__import__` to intercept all imports:
 
-**Example - The Globals Pattern**:
+```python
+def _tracking_import(self, name, globals=None, locals=None, fromlist=(), level=0):
+    result = self._original_import(name, globals, locals, fromlist, level)
+
+    # Track the imported module
+    self._track_import(result, name)
+
+    # For 'from X import Y', also track Y's defining module
+    if fromlist:
+        for attr_name in fromlist:
+            imported_obj = getattr(result, attr_name, None)
+            if hasattr(imported_obj, '__module__'):
+                # Class/function - track its defining module
+                defining_module = sys.modules.get(imported_obj.__module__)
+                if defining_module:
+                    self._track_import(defining_module, imported_obj.__module__)
+
+    return result
+```
+
+### 2. Class Import Tracking (Package Re-exports)
+
+When a class is imported via package re-export, we track the defining module:
+
+```python
+# src/models/__init__.py
+from src.models.user import User  # Re-export User
+
+# test_user.py
+from src.models import User  # User.__module__ = 'src.models.user'
+
+# Ezmon tracks src/models/user.py, not just src/models/__init__.py
+```
+
+This handles common patterns like:
+- `from pandas import Series` (Series is defined in pandas.core.series)
+- `from django.db import models` (models is defined in django.db.models.base)
+
+### 3. Transitive Import Tracking
+
+When Python imports module M1, which imports M2, both modules are tracked:
+
 ```python
 # src/app_globals.py
 MAX_ITEMS = 100  # Global constant
@@ -92,20 +148,26 @@ def test_valid_count():
 ```
 
 If `MAX_ITEMS` changes in `app_globals.py`:
-- **Original testmon**: ❌ 0 tests selected (doesn't see the transitive dependency)
-- **Ezmon**: ✅ All tests selected (tracks transitive imports via AST parsing)
+- **Original testmon**: ❌ 0 tests selected (coverage doesn't see transitive dependency)
+- **Ezmon-nocov**: ✅ All tests selected (import hooks track the dependency)
 
-**How ezmon solves this**:
-1. Uses AST parsing to find import statements in each module
-2. For modules tracked by coverage, gets their transitive imports
-3. Adds module-level fingerprints for transitively imported modules
-4. When any transitive dependency changes, affected tests are selected
+### 4. File Dependency Tracking
 
-### 3. File Dependency Tracking (NEW)
+Non-Python files (JSON, YAML, etc.) are tracked when read:
 
-**Problem**: Tests that read non-Python files (JSON, YAML, CSV, etc.) aren't tracked by coverage.py.
+```python
+def _tracking_open(self, file, mode='r', *args, **kwargs):
+    result = self._original_open(file, mode, *args, **kwargs)
+    if 'r' in mode:
+        relpath = self._is_in_project(file)
+        if relpath and not relpath.endswith('.py'):
+            sha = self._get_committed_file_sha(relpath)
+            if sha:  # Only track git-committed files
+                self._track_file(relpath, sha)
+    return result
+```
 
-**Example**:
+Example:
 ```python
 # tests/test_config.py
 def test_threshold():
@@ -116,33 +178,40 @@ def test_threshold():
 
 If `config.json` changes:
 - **Original testmon**: ❌ 0 tests selected
-- **Ezmon**: ✅ Tests that read the file are selected
+- **Ezmon-nocov**: ✅ Tests that read the file are selected
 
-**How ezmon solves this**:
-1. Hooks into Python's `builtins.open()` during test execution
-2. Tracks which files each test reads
-3. Computes SHA hashes for tracked files
-4. When a tracked file changes, affected tests are selected
+### 5. Checkpoint System
 
-## Coverage Limitation
+The checkpoint system tracks which modules are in `sys.modules` at key points:
 
-**Important**: Due to a fundamental limitation in coverage.py's dynamic context tracking, only the **first test to execute a code path** gets recorded as depending on that code. Subsequent tests calling the same code (under different contexts) don't get the dependency recorded.
-
-This affects both:
-1. **Tests across different files**: First file to import gets the dependency
-2. **Tests within the same file**: First test to call a function gets the dependency
-
-### How This Interacts with Transitive Import Tracking
-
-For tests that don't call specific functions (only import modules transitively):
-- They get **module-level** fingerprints (any change to the module triggers them)
-
-For tests that do call specific functions:
-- They get **method-level** fingerprints (only changes to called methods trigger them)
-
-This means:
-- `test_add` calls `add()` → Only changes to `add()` trigger it
-- `test_unknown_operator` doesn't call math functions → Any math_utils.py change triggers it (module-level)
+```
+pytest starts
+    |
+    v
+conftest.py loads (imports packages)
+    |
+    v
+[SAVE GLOBAL CHECKPOINT] -- base dependencies for ALL tests
+    |
+    v
+For each test file:
+    |
+    +-- [RESTORE TO GLOBAL CHECKPOINT] -- clean state
+    |
+    +-- Collect test file (imports tracked)
+    |
+    +-- [SAVE PER-FILE CHECKPOINT]
+    |
+    v
+For each test:
+    |
+    +-- [RESTORE TO PER-FILE CHECKPOINT]
+    |
+    +-- Run test (more imports may happen)
+    |
+    v
+Test dependencies = base + collection + execution imports
+```
 
 ## Running Integration Tests
 
@@ -207,14 +276,16 @@ python integration_tests/test_all_versions.py --scenario modify_math_utils
 
 | Scenario | Description | Expected Behavior |
 |----------|-------------|-------------------|
-| `modify_math_utils` | Change math_utils.add() | Tests calling add() + tests with module-level deps |
-| `modify_string_utils` | Change string_utils.uppercase() | Tests calling uppercase() + tests with module-level deps |
-| `modify_calculator_only` | Change Calculator.clear_history() | Tests with matching fingerprints |
-| `modify_formatter_only` | Change Formatter.set_style() | Tests with matching fingerprints |
-| `modify_test_only` | Change test file | Only the modified test |
+| `modify_math_utils` | Change math_utils.add() | All tests importing math_utils |
+| `modify_string_utils` | Change string_utils.uppercase() | All tests importing string_utils |
+| `modify_calculator_only` | Change Calculator.clear_history() | Tests importing calculator |
+| `modify_formatter_only` | Change Formatter.set_style() | Tests importing formatter |
+| `modify_test_only` | Change test file | Only the modified test file |
 | `no_changes` | No modifications | No tests selected |
 | `add_new_test` | Add a new test file | Only new tests |
-| `multiple_modifications` | Change subtract() and lowercase() | Tests for both functions |
+| `multiple_modifications` | Change subtract() and lowercase() | Tests importing either module |
+| `comment_only_change` | Add comments only | No tests selected (AST unchanged) |
+| `docstring_only_change` | Add docstrings only | No tests selected (docstrings stripped) |
 
 ### Complex Code Pattern Scenarios
 
@@ -228,40 +299,45 @@ These scenarios test fingerprinting with advanced Python constructs:
 | `modify_decorator` | Change memoize() | Decorators and closures |
 | `modify_context_manager` | Change CacheManager.__enter__() | Context managers |
 
-### Improvement Demonstration Scenarios
+### Class Import Tracking Scenarios
 
-These scenarios demonstrate ezmon's improvements over the original testmon:
+These scenarios test class imports via package re-exports:
 
-| Scenario | Description | Status |
-|----------|-------------|--------|
-| `modify_config_file` | Change config.json | ✅ PASSES - file dependency tracking |
-| `modify_globals` | Change app_globals.py | ✅ PASSES - transitive import tracking |
+| Scenario | Description | Expected Behavior |
+|----------|-------------|-------------------|
+| `from_package_import_class` | Change user.py | Tests importing User via `from src.models import User` |
+| `from_package_import_class_product` | Change product.py | Tests importing Product via `from src.models import Product` |
 
-### Remaining Limitation Scenarios
+### Module-Level Import Scenarios
 
-| Scenario | Description | Current Status |
-|----------|-------------|----------------|
-| `modify_uncalled_method` | Change imported but uncalled function | Partial - only tests with module-level deps are selected |
+| Scenario | Description | Expected Behavior |
+|----------|-------------|-------------------|
+| `modify_import_only_module_level` | Change module-level constant | All tests importing the module |
+| `modify_globals` | Change app_globals.py | All tests importing transitively |
+
+### File Dependency Scenarios
+
+| Scenario | Description | Expected Behavior |
+|----------|-------------|-------------------|
+| `modify_config_file` | Change config.json | Tests that read config.json |
 
 ## Implementation Notes
 
 ### Challenges Encountered
 
-1. **Namespace inspection doesn't work for primitives**: Initially tried to track imports by inspecting module namespaces. This fails for imported constants (integers, strings, etc.) because they don't have `__module__` attributes. Solution: Use AST parsing instead.
+1. **Checkpoint interaction with class imports**: When a class is imported via package re-export (e.g., `from src.models import User`), the defining module (`src.models.user`) may be removed from `sys.modules` by checkpoint restore while the class still exists as an attribute on the cached parent module. Solution: Restore the defining module from cache before tracking.
 
-2. **Transitive imports need careful scoping**: Adding all transitive imports as dependencies caused false positives (unrelated tests being selected). Solution: Only add transitive imports for modules that coverage.py already tracks.
+2. **File dependency tracking requires careful hook management**: The `builtins.open()` hook must be installed/uninstalled per-test to avoid tracking file reads from other tests or the test framework itself.
 
-3. **Module-level vs method-level trade-offs**: Tests that call functions get precise method-level tracking. Tests that only import modules (but don't call functions) get broader module-level tracking. This is the correct behavior - if a test doesn't exercise specific code, it should be conservatively re-run when anything in its dependencies changes.
+3. **Git SHA optimization**: Ezmon uses git blob SHAs for fast change detection before computing AST checksums. This significantly speeds up stability analysis.
 
 ### Key Insights
 
-1. **Python executes module-level code during import**: When you `import M1`, and M1 has `from M2 import X`, Python executes M2's module-level code. This means:
-   - Test → M1 → M2 = Test depends on M2's module-level code
-   - Changes to M2's structure (not just functions) can affect the test
+1. **Import tracking is conservative**: Any change to a file triggers all tests that import it. This guarantees no false negatives but may run more tests than strictly necessary.
 
-2. **AST parsing is reliable for import detection**: Unlike runtime inspection, AST parsing always finds import statements regardless of what objects they import (modules, classes, functions, or primitives).
+2. **AST-based fingerprinting ignores comments and docstrings**: Only actual code changes trigger tests. Comments and docstrings are stripped before computing checksums.
 
-3. **File dependency tracking requires careful hook management**: The `builtins.open()` hook must be installed/uninstalled per-test to avoid tracking file reads from other tests or the test framework itself.
+3. **Class `__module__` tracks defining location**: When tracking class imports, we use `cls.__module__` to find the actual module where the class is defined, not just where it's re-exported from.
 
 ## How It Works
 
@@ -309,9 +385,9 @@ The `test_parallel_execution.py` file contains integration tests for parallel te
 |------|------|-------------|
 | `test_sequential_baseline` | Local SQLite | Verifies sequential execution works as baseline |
 | `test_parallel_small_subset` | Local SQLite | Tests parallel execution with a small test subset |
-| `test_parallel_coverage_saved` | Local SQLite | Verifies coverage data is saved from parallel workers |
+| `test_parallel_coverage_saved` | Local SQLite | Verifies dependency data is saved from parallel workers |
 | `test_parallel_netdb_basic` | NetDB | Tests parallel execution with network database |
-| `test_parallel_netdb_coverage_collection` | NetDB | Verifies coverage collection works in parallel NetDB mode |
+| `test_parallel_netdb_coverage_collection` | NetDB | Verifies dependency collection works in parallel NetDB mode |
 
 ### Running Parallel Tests
 

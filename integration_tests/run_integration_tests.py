@@ -161,6 +161,16 @@ class IntegrationTestRunner:
             capture_output=True,
         )
         subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=workspace,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=workspace,
+            capture_output=True,
+        )
+        subprocess.run(
             ["git", "add", "."],
             cwd=workspace,
             capture_output=True,
@@ -214,6 +224,20 @@ class IntegrationTestRunner:
             capture_output=not self.verbose,
         )
 
+        # Ensure we always install exactly one ezmon plugin distribution.
+        subprocess.run(
+            [
+                str(pip),
+                "uninstall",
+                "-y",
+                "pytest-ezmon",
+                "pytest-ezmon-nocov",
+                "ezmon",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
         # Determine ezmon installation source
         if self.ezmon_source == "auto":
             if is_valid_ezmon_repo(REPO_ROOT):
@@ -231,8 +255,18 @@ class IntegrationTestRunner:
             self.log(f"Installing pytest-ezmon from: {install_spec}", "debug")
 
         # Install ezmon and its dependencies
+        # Use --no-cache-dir to ensure we always get the latest source changes
         result = subprocess.run(
-            [str(pip), "install", install_spec, "requests", "networkx", "pyvis"],
+            [
+                str(pip),
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                install_spec,
+                "requests",
+                "networkx",
+                "pyvis",
+            ],
             capture_output=True,
             text=True,
         )
@@ -274,7 +308,14 @@ class IntegrationTestRunner:
             "TESTMON_NET_ENABLED": "false",  # Force local mode for integration tests
         }
         # Remove any NetDB-related env vars that might interfere
-        for key in ["TESTMON_SERVER", "TESTMON_AUTH_TOKEN", "REPO_ID", "JOB_ID", "RUN_ID"]:
+        for key in [
+            "TESTMON_SERVER",
+            "TESTMON_AUTH_TOKEN",
+            "REPO_ID",
+            "JOB_ID",
+            "RUN_ID",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        ]:
             test_env.pop(key, None)
 
         result = subprocess.run(
@@ -406,11 +447,18 @@ class IntegrationTestRunner:
                     cwd=workspace,
                     capture_output=True,
                 )
-                subprocess.run(
-                    ["git", "commit", "-m", f"Apply modifications for {scenario.name}"],
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
                     cwd=workspace,
                     capture_output=True,
+                    text=True,
                 )
+                if status.stdout.strip():
+                    subprocess.run(
+                        ["git", "commit", "-m", f"Apply modifications for {scenario.name}"],
+                        cwd=workspace,
+                        capture_output=True,
+                    )
 
             # Run again after modifications
             self.log("Running pytest --ezmon after modifications...", "debug")

@@ -29,7 +29,10 @@ from pathlib import Path
 # Add parent directory to path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(REPO_ROOT))
 SAMPLE_PROJECT = SCRIPT_DIR / "sample_project"
+
+from ezmon.bitmap_deps import TestDeps
 
 
 class Colors:
@@ -60,6 +63,8 @@ def setup_workspace():
 
     # Initialize git
     subprocess.run(["git", "init", "-b", "main"], cwd=workspace, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=workspace, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, capture_output=True)
     subprocess.run(["git", "add", "."], cwd=workspace, capture_output=True)
     subprocess.run(["git", "commit", "-m", "Initial"], cwd=workspace, capture_output=True)
 
@@ -81,28 +86,44 @@ def create_venv(workspace: Path, requests_version: str = "2.31.0", numpy_version
     # Install ezmon first
     log(f"Installing ezmon and base dependencies...", "debug")
     subprocess.run([str(pip), "install", "--upgrade", "pip"], capture_output=True)
-    subprocess.run([str(pip), "install", str(REPO_ROOT)], capture_output=True, check=True)
+    subprocess.run(
+        [
+            str(pip),
+            "uninstall",
+            "-y",
+            "pytest-ezmon",
+            "pytest-ezmon-nocov",
+            "ezmon",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [str(pip), "install", "--no-cache-dir", "--force-reinstall", str(REPO_ROOT)],
+        capture_output=True,
+        check=True,
+    )
 
     # Install specific versions of test dependencies
     if requests_version:
         log(f"Installing requests=={requests_version}", "debug")
         result = subprocess.run(
-            [str(pip), "install", f"requests=={requests_version}"],
+            [str(pip), "install", "--no-cache-dir", f"requests=={requests_version}"],
             capture_output=True, text=True
         )
         if result.returncode != 0:
             log(f"Warning: Could not install requests=={requests_version}, trying latest", "debug")
-            subprocess.run([str(pip), "install", "requests"], capture_output=True)
+            subprocess.run([str(pip), "install", "--no-cache-dir", "requests"], capture_output=True)
 
     if numpy_version:
         log(f"Installing numpy=={numpy_version}", "debug")
         result = subprocess.run(
-            [str(pip), "install", f"numpy=={numpy_version}"],
+            [str(pip), "install", "--no-cache-dir", f"numpy=={numpy_version}"],
             capture_output=True, text=True
         )
         if result.returncode != 0:
             log(f"Warning: Could not install numpy=={numpy_version}, trying latest", "debug")
-            subprocess.run([str(pip), "install", "numpy"], capture_output=True)
+            subprocess.run([str(pip), "install", "--no-cache-dir", "numpy"], capture_output=True)
 
     return python_venv, pip
 
@@ -112,7 +133,7 @@ def pip_install(pip: Path, package: str, version: str = None):
     pkg_spec = f"{package}=={version}" if version else package
     log(f"pip install {pkg_spec}", "debug")
     result = subprocess.run(
-        [str(pip), "install", pkg_spec],
+        [str(pip), "install", "--no-cache-dir", pkg_spec],
         capture_output=True, text=True
     )
     if result.returncode != 0:
@@ -158,6 +179,7 @@ def run_pytest_ezmon(workspace: Path, python_venv: Path, test_files: str = None)
         "PYTHONPATH": str(workspace),
         "TESTMON_NET_ENABLED": "false",
     }
+    env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
 
     result = subprocess.run(cmd, cwd=workspace, capture_output=True, text=True, env=env)
 
@@ -186,21 +208,25 @@ def check_external_deps_recorded(db_path: Path):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # Get test -> external deps mapping
     rows = cursor.execute("""
-        SELECT te.test_name, ted.package_name
-        FROM test_execution te
-        JOIN test_external_dependency ted ON te.id = ted.test_execution_id
-        ORDER BY te.test_name, ted.package_name
+        SELECT t.id as test_id, t.name as test_name, td.file_bitmap, td.external_packages
+        FROM tests t
+        LEFT JOIN test_deps td ON t.id = td.test_id
+        ORDER BY t.name
     """).fetchall()
 
     deps = {}
     for row in rows:
         test = row["test_name"]
-        pkg = row["package_name"]
-        if test not in deps:
-            deps[test] = set()
-        deps[test].add(pkg)
+        packages = set()
+        if row["file_bitmap"] is not None:
+            td = TestDeps.deserialize(
+                test_id=row["test_id"],
+                blob=row["file_bitmap"],
+                external_packages_str=row["external_packages"],
+            )
+            packages = td.external_packages
+        deps[test] = set(packages)
 
     conn.close()
     return deps

@@ -1,5 +1,7 @@
 import ast
+import io
 import textwrap
+import tokenize
 import zlib
 from functools import lru_cache
 import sqlite3
@@ -9,9 +11,18 @@ from typing import Optional, Union
 from array import array
 from subprocess import run, CalledProcessError
 
-from coverage.phystokens import source_encoding
 
-CHECKUMS_ARRAY_TYPE = "i"
+def source_encoding(source_bytes: bytes) -> str:
+    """Detect the encoding of Python source code.
+
+    Uses Python's tokenize module to detect encoding from coding declarations
+    or BOM. Falls back to 'utf-8' if detection fails.
+    """
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(source_bytes).readline)
+        return encoding
+    except (SyntaxError, UnicodeDecodeError):
+        return "utf-8"
 
 
 def to_signed(unsigned33):
@@ -19,37 +30,29 @@ def to_signed(unsigned33):
     return (unsigned33 ^ 0x80000000) - 0x80000000
 
 
-def debug_encode_lines(lines):
-    return lines
-
-
-def debug_code_to_blob(checksums):
-    return ";\n".join(checksums)
-
-
-def debug_blob_to_code(blob):
-    return blob.split(";\n")
-
-
-def _is_docstring_node(node) -> bool:
-    """Check if an AST node is a docstring (Expr containing a Constant string).
+def _strip_docstrings(tree):
+    """Remove docstrings from AST nodes in-place.
 
     Docstrings appear as the first statement in module/class/function bodies
-    and are represented as Expr(value=Constant(value='...')).
+    and are Expr nodes containing a Constant string.
     """
     import sys
 
-    if not isinstance(node, ast.Expr):
-        return False
-    # Python 3.8+: Constant node
-    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-        return True
-    # Python 3.7: ast.Str node (deprecated in 3.8, removed in 3.14)
-    # Only check on Python < 3.12 to avoid DeprecationWarning
-    if sys.version_info < (3, 12):
-        if hasattr(ast, 'Str') and isinstance(node.value, ast.Str):
+    def is_docstring(node):
+        if not isinstance(node, ast.Expr):
+            return False
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             return True
-    return False
+        # Python 3.7 compatibility
+        if sys.version_info < (3, 12):
+            if hasattr(ast, 'Str') and isinstance(node.value, ast.Str):
+                return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if hasattr(node, 'body') and node.body and is_docstring(node.body[0]):
+                node.body = node.body[1:]
 
 
 def _strip_comment_lines(text: str) -> str:
@@ -59,61 +62,32 @@ def _strip_comment_lines(text: str) -> str:
         if line.lstrip().startswith("#"):
             continue
         kept.append(line)
-    # Normalize to '\n' joins (stable across OS line endings)
     return "\n".join(kept)
 
-def methods_to_checksums(blocks) -> [int]:
-    checksums = []
-    for block in blocks:
-        filtered = _strip_comment_lines(block)
-        checksums.append(to_signed(zlib.crc32(filtered.encode("utf-8"))))
 
-    return checksums
+def compute_file_checksum(source_code: str, ext: str = "py") -> int:
+    """Compute a single checksum for an entire file.
 
+    For Python files, this parses the AST, strips docstrings, and computes
+    a checksum over the AST representation. This means:
+    - Comment changes don't affect the checksum
+    - Docstring changes don't affect the checksum
+    - Only actual code changes trigger re-runs
 
-def checksums_to_blob(checksums: [int]) -> sqlite3.Binary:
-    blob = array(CHECKUMS_ARRAY_TYPE, checksums)
-    data = blob.tobytes()
-    return sqlite3.Binary(data)
-
-
-def blob_to_checksums(blob):
-    arr = array(CHECKUMS_ARRAY_TYPE)
-    arr.frombytes(blob)
-    return arr.tolist()
-
-
-GAP_MARKS = {i: f"{i}GAP" for i in range(-1, 64)}
-INVERTED_GAP_MARKS_CHECKSUMS = {
-    methods_to_checksums([f"{i}GAP"])[0]: i for i in range(-1, 64)
-}
-
-
-class Block:
-    def __init__(self, start, end, code=0, name=""):
-        # assert start <= end
-        self.start = start
-        self.end = end
-        self.name = name
-        self.code = code
-
-    @property
-    def checksum(self):
-        return self.code
-
-    def __repr__(self):
-        return f"{self.start}-{self.end} h: {self.checksum}, n:{self.name}, repr:{self.code}"
-
-    def __eq__(self, other):
-        return (self.start, self.end, self.checksum, self.name) == (
-            other.start,
-            other.end,
-            other.checksum,
-            other.name,
-        )
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
+    For non-Python files, we compute CRC32 of the entire content.
+    """
+    if ext == "py":
+        try:
+            tree = ast.parse(source_code)
+            _strip_docstrings(tree)
+            # Use ast.dump to get a canonical representation
+            ast_repr = ast.dump(tree, annotate_fields=False)
+            return to_signed(zlib.crc32(ast_repr.encode("utf-8")))
+        except SyntaxError:
+            # For files with syntax errors, fall back to content hash
+            return to_signed(zlib.crc32(source_code.encode("utf-8")))
+    else:
+        return to_signed(zlib.crc32(source_code.encode("utf-8")))
 
 
 @lru_cache(300)
@@ -139,17 +113,15 @@ def bytes_to_string_and_fsha(byte_stream: bytes) -> Union[str, bytes]:
     return byte_string, hsh.hexdigest()
 
 
-def _next_lineno(nodes, i, end):
-    try:
-        return nodes[i + 1].lineno - 1
-    except IndexError:
-        return end
-    except AttributeError:
-        return None
-
-
 class Module:
-    def __init__(  # pylint: disable=too-many-arguments
+    """Represents a source file for fingerprinting.
+
+    With the simplified single-checksum model, each file has exactly one
+    checksum that represents the entire file's code (excluding comments
+    and docstrings for Python files).
+    """
+
+    def __init__(
         self,
         source_code=None,
         mtime=None,
@@ -160,8 +132,6 @@ class Module:
     ):
         self.filename = filename
         self.rootdir = rootdir
-        self._blocks = None
-        self.counter = 0
         self.mtime = mtime
         self._source_code = (
             None if source_code is None else textwrap.dedent(source_code)
@@ -170,105 +140,20 @@ class Module:
             fs_fsha or bytes_to_string_and_fsha(bytes(source_code, "utf-8"))[1]
         )
         self.ext = ext
-
-    def dump_and_block(self, node, end, name="unknown", into_block=False):
-        """Frame of this method is taken from ast.dump
-        Objective is to return a representation of python source code where
-        all of the bodies of functions are replaced with 'transformed_into_block'
-        string. The rest of the syntax tree is represented in the same way as
-        in ast.dump(tree, annotate_fields=False). Of course the bodies of functions
-        are not completely thrown away, they are transformed into Block() objects
-        and appended to self.blocks. More can be probably understood from
-        (at the time rather messy) test_process_code.py examples.
-        """
-
-        if isinstance(node, ast.AST):
-            class_name = node.__class__.__name__
-            fields = []
-            for field_name, field_value in ast.iter_fields(node):
-                transform_into_block = (
-                    class_name in ("AsyncFunctionDef", "FunctionDef", "Module")
-                ) and field_name == "body"
-                # Strip docstrings from class bodies (they're in 'body' field)
-                # Class bodies aren't transformed into blocks, but we still want
-                # to ignore docstrings for fingerprint stability
-                if class_name == "ClassDef" and field_name == "body":
-                    if isinstance(field_value, list) and field_value and _is_docstring_node(field_value[0]):
-                        field_value = field_value[1:]  # Skip the docstring
-                fields.append(
-                    (
-                        field_name,
-                        self.dump_and_block(
-                            field_value,
-                            end,
-                            name=getattr(node, "name", "unknown"),
-                            into_block=transform_into_block,
-                        ),
-                    )
-                )
-            return f"{class_name}({', '.join((field_value for field_name, field_value in fields))})"
-        if isinstance(node, list):
-            representations = []
-            # Skip docstrings at the start of bodies (into_block=True means we're in a body)
-            # Docstrings are the first Expr(Constant(str)) in module/class/function bodies
-            items_to_process = node
-            if into_block and node and _is_docstring_node(node[0]):
-                items_to_process = node[1:]  # Skip the docstring
-            for i, item in enumerate(items_to_process):
-                representations.append(
-                    self.dump_and_block(item, _next_lineno(items_to_process, i, end))
-                )
-            if into_block and node:
-                # Use last child's end_lineno only if end is not available (None)
-                # This fixes #235: internal error in some match statements
-                if end is None:
-                    last_child = node[-1]
-                    block_end = getattr(last_child, "end_lineno", None)
-                else:
-                    block_end = end
-                self._blocks.append(
-                    Block(
-                        node[0].lineno,
-                        block_end,
-                        code=str(self.counter) + ":" + ", ".join(representations),
-                        name=name,
-                    )
-                )
-                self.counter += 1
-                return "transformed_into_block"
-            return ", ".join(representations)
-        return repr(node)
+        self._checksum = None
 
     @property
-    def checksums(self):
-        return methods_to_checksums([block.checksum for block in self.blocks])
-
-    @property
-    def blocks(self):
-        if self._blocks is None:
-            self._blocks = []
-            lines = self.source_code.splitlines()
-            if self.ext == "py":
-                try:
-                    tree = ast.parse(self.source_code, filename="<unknown>")
-                    self.dump_and_block(tree, len(lines), name="<module>")
-                except SyntaxError:
-                    # We can continue without blocks because no tests depending on this file will ever get executed,
-                    # so no node depending on this checksum and mtime will ever be written to db.
-                    pass
-            else:
-                self._blocks = [Block(1, len(lines), self.source_code)]
-        return self._blocks
+    def checksum(self) -> int:
+        """Get the single file-level checksum."""
+        if self._checksum is None:
+            self._checksum = compute_file_checksum(self.source_code, self.ext)
+        return self._checksum
 
     @property
     def source_code(self):
         if self._source_code is None:
             self._source_code = read_source_sha(Path(self.rootdir) / self.filename)[0]
         return self._source_code
-
-    @property
-    def method_checksums(self):
-        return methods_to_checksums([block.checksum for block in self.blocks])
 
 
 def read_source_sha(filename: str):
@@ -323,49 +208,19 @@ def get_source_sha(directory: "str", filename: "str"):
     return read_source_sha(Path(directory) / filename)
 
 
-def match_fingerprint_source(source_code, fingerprint, ext="py"):
-    module = Module(source_code=source_code, ext=ext)
-    return match_fingerprint(module, fingerprint)
+def match_fingerprint(module: Module, stored_checksum: int) -> bool:
+    """Check if the module's current checksum matches the stored fingerprint.
 
-
-def match_fingerprint(module: Module, fingerprint):
-    if set(fingerprint) - set(module.checksums):
-        return False
-    return True
-
-
-def create_fingerprint_source(source_code, lines, ext="py"):
-    module = Module(source_code=source_code, ext=ext)
-    return create_fingerprint(module, lines)
-
-
-def create_fingerprint(module, covered_lines) -> [int]:
-    """Create a fingerprint from the blocks that contain covered lines.
-
-    With collection-time coverage tracking, we always have actual line numbers
-    for code executed during module import. This gives us precise fingerprinting -
-    only the blocks that were actually executed are included.
+    With single-file checksums, matching is simply equality comparison.
     """
-    blocks: [Block] = module.blocks
-    method_reprs = []
+    return module.checksum == stored_checksum
 
-    # Filter out line 0 if present (legacy, should not happen with collection coverage)
-    covered_lines = {line for line in covered_lines if line > 0}
 
-    if not covered_lines:
-        return methods_to_checksums(method_reprs)
+def create_fingerprint(module: Module) -> int:
+    """Create a fingerprint for a module.
 
-    # Find blocks that contain covered lines
-    line_index = 0
-    sorted_lines = sorted(covered_lines)
-
-    for current_block in sorted(blocks, key=lambda x: x.start):
-        try:
-            while sorted_lines[line_index] < current_block.start:
-                line_index += 1
-            if sorted_lines[line_index] <= current_block.end:
-                method_reprs.append(current_block.code)
-        except IndexError:
-            break
-
-    return methods_to_checksums(method_reprs)
+    With the simplified model, a fingerprint is just the file's checksum.
+    We no longer track which specific lines/functions were covered -
+    any change to the file triggers re-runs of all tests that depend on it.
+    """
+    return module.checksum

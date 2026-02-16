@@ -3,16 +3,16 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pytest-ezmon"
+name = "pytest-ezmon-nocov"
 authors = [
     { name = "Tibor Arpas", email = "tibor@testmon.org" },
 ]
 dynamic =  ["version"]
 
-description = "selects tests affected by changed files and methods"
+description = "Selects tests affected by changed files using import-based tracking and Roaring bitmaps (no coverage.py)"
 readme = "README.md"
-requires-python = ">=3.7"  # ezmon maintains Python 3.7+ support (upstream testmon requires 3.10+)
-keywords = ["testing", "pytest", "plugin"]
+requires-python = ">=3.7"
+keywords = ["testing", "pytest", "plugin", "test-selection", "import-tracking"]
 license = { text = "MIT" }
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -28,9 +28,10 @@ classifiers = [
 ]
 dependencies = [
     "pytest>=5,<10",
-    "coverage>=6,<8",
     "requests>=2.20",
     "typing_extensions>=3.7; python_version < '3.8'",
+    "pyroaring>=0.4.0",      # Roaring bitmaps for compact dependency storage (with fallback)
+    "zstandard>=0.18.0",     # zstd compression for bitmap serialization (with fallback)
 ]
 
 [project.optional-dependencies]
@@ -76,4 +77,4 @@ exclude = '''
 
 
 [project.entry-points.pytest11]
-pytest-ezmon = "ezmon.pytest_ezmon"
+pytest-ezmon-nocov = "ezmon.pytest_ezmon"

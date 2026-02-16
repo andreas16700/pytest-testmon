@@ -36,11 +36,16 @@ else:
 
 
 class FileFp(TypedDict):
+    """File fingerprint data for test dependencies.
+
+    With the simplified single-checksum model, each file has one checksum
+    representing the entire file's code (excluding comments and docstrings).
+    """
     filename: str
-    method_checksums: List[int] = None
+    file_checksum: int = None  # Single checksum for the entire file
     mtime: float = None  # optimization helper, not really a part of the data structure fundamentally
-    fsha: int = None  # optimization helper, not really a part of the data structure fundamentally
-    fingerprint_id: int = None  # optimization helper,
+    fsha: str = None  # optimization helper, git blob SHA for fast change detection
+    fingerprint_id: int = None  # optimization helper
 
 
 TestName = str
@@ -238,6 +243,28 @@ def compute_changed_packages(old_packages_str: str, new_packages_str: str) -> se
             changed.add(pkg)
 
     return changed
+
+
+def compute_package_diff(old_packages_str: str, new_packages_str: str):
+    """Return (added, removed, changed) package name sets."""
+    old_pkgs = parse_system_packages(old_packages_str)
+    new_pkgs = parse_system_packages(new_packages_str)
+
+    added = set()
+    removed = set()
+    changed = set()
+
+    for pkg in new_pkgs:
+        if pkg not in old_pkgs:
+            added.add(pkg)
+        elif old_pkgs[pkg] != new_pkgs[pkg]:
+            changed.add(pkg)
+
+    for pkg in old_pkgs:
+        if pkg not in new_pkgs:
+            removed.add(pkg)
+
+    return added, removed, changed
 
 
 #

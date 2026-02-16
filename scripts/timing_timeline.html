@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ezmon Timing Timeline</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f4ef;
+        --panel: #fffaf3;
+        --ink: #1f1b16;
+        --muted: #6b5f55;
+        --accent: #b86f3a;
+        --line: #e6d9cc;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      h1 {
+        margin: 0;
+        font-weight: 600;
+        font-size: 22px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+      }
+      .controls {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      input[type="file"] {
+        font-size: 14px;
+      }
+      select {
+        font-size: 14px;
+        padding: 4px 6px;
+      }
+      #timeline {
+        margin-top: 16px;
+        display: grid;
+        gap: 8px;
+      }
+      .event {
+        display: grid;
+        grid-template-columns: 160px 1fr;
+        gap: 12px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+      }
+      .event .time {
+        font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .event .name {
+        font-weight: 600;
+        color: var(--accent);
+        font-size: 13px;
+      }
+      .event .detail {
+        font-size: 12px;
+        color: var(--ink);
+        white-space: pre-wrap;
+      }
+      .summary {
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="panel">
+      <h1>Ezmon Timing Timeline</h1>
+      <div class="controls">
+        <label>
+          Load JSONL files:
+          <input id="fileInput" type="file" multiple accept=".jsonl">
+        </label>
+        <button id="autoLoadBtn" type="button">Auto-load JSONL files</button>
+        <label>
+          Actor:
+          <select id="actorSelect">
+            <option value="all">All</option>
+          </select>
+        </label>
+      </div>
+      <div class="summary" id="summary"></div>
+    </header>
+
+    <div class="panel" id="dropZone" style="margin-top: 12px;">
+      Drag & drop JSONL files here (or use the picker above).
+    </div>
+
+    <div id="timeline"></div>
+
+    <script>
+      const fileInput = document.getElementById('fileInput');
+      const actorSelect = document.getElementById('actorSelect');
+      const timeline = document.getElementById('timeline');
+      const summary = document.getElementById('summary');
+      const dropZone = document.getElementById('dropZone');
+      const autoLoadBtn = document.getElementById('autoLoadBtn');
+
+      let allEvents = [];
+
+      function render() {
+        const actor = actorSelect.value;
+        let events = allEvents;
+        if (actor !== 'all') {
+          events = allEvents.filter(e => e.actor === actor);
+        }
+        events = events.slice().sort((a, b) => a.mono - b.mono);
+        timeline.innerHTML = '';
+        if (events.length === 0) {
+          summary.textContent = 'No events loaded.';
+          return;
+        }
+        const start = events[0].mono;
+        const end = events[events.length - 1].mono;
+        summary.textContent = `${events.length} events, span ${(end - start).toFixed(2)}s`;
+        for (const e of events) {
+          const div = document.createElement('div');
+          div.className = 'event';
+          const rel = (e.mono - start).toFixed(4);
+          const time = document.createElement('div');
+          time.className = 'time';
+          time.textContent = `+${rel}s`;
+          const content = document.createElement('div');
+          const name = document.createElement('div');
+          name.className = 'name';
+          name.textContent = `${e.actor} • ${e.event}`;
+          const detail = document.createElement('div');
+          detail.className = 'detail';
+          const {event, actor, mono, ts, ...rest} = e;
+          detail.textContent = JSON.stringify(rest, null, 2);
+          content.appendChild(name);
+          content.appendChild(detail);
+          div.appendChild(time);
+          div.appendChild(content);
+          timeline.appendChild(div);
+        }
+      }
+
+      function populateActors() {
+        const actors = Array.from(new Set(allEvents.map(e => e.actor))).sort();
+        actorSelect.innerHTML = '<option value="all">All</option>';
+        for (const a of actors) {
+          const opt = document.createElement('option');
+          opt.value = a;
+          opt.textContent = a;
+          actorSelect.appendChild(opt);
+        }
+      }
+
+      function readFileWithReader(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(reader.error);
+          reader.onload = () => resolve(reader.result || '');
+          reader.readAsText(file);
+        });
+      }
+
+      async function readFile(file) {
+        let text = '';
+        try {
+          if (typeof file.text === 'function') {
+            text = await file.text();
+          } else {
+            text = await readFileWithReader(file);
+          }
+        } catch (err) {
+          return { events: [], error: err };
+        }
+        let parsed = 0;
+        let failed = 0;
+        const events = text.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+          try {
+            if (line.charCodeAt(0) === 0xFEFF) {
+              line = line.slice(1);
+            }
+            if (line[0] !== '{') {
+              failed += 1;
+              return null;
+            }
+            const obj = JSON.parse(line);
+            parsed += 1;
+            return obj;
+          } catch {
+            failed += 1;
+            return null;
+          }
+        }).filter(Boolean);
+        return { events, error: null, parsed, failed, size: text.length, sample: text.slice(0, 200) };
+      }
+
+      async function loadFiles(files) {
+        allEvents = [];
+        let errorCount = 0;
+        let parsedCount = 0;
+        let failedCount = 0;
+        for (const file of files) {
+          const result = await readFile(file);
+          if (result.error) {
+            errorCount += 1;
+          }
+          allEvents.push(...result.events);
+          parsedCount += result.parsed || 0;
+          failedCount += result.failed || 0;
+        }
+        populateActors();
+        render();
+        if (files.length === 0) {
+          summary.textContent = 'No files selected.';
+        } else if (allEvents.length === 0) {
+          summary.textContent = `No events parsed. Files: ${files.length}, errors: ${errorCount}, parsed: ${parsedCount}, failed: ${failedCount}.`;
+        }
+      }
+
+      fileInput.addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files);
+        await loadFiles(files);
+      });
+
+      dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.style.borderColor = '#b86f3a';
+      });
+
+      dropZone.addEventListener('dragleave', () => {
+        dropZone.style.borderColor = '#e6d9cc';
+      });
+
+      dropZone.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        dropZone.style.borderColor = '#e6d9cc';
+        const files = Array.from(e.dataTransfer.files || []).filter(f => f.name.endsWith('.jsonl'));
+        await loadFiles(files);
+      });
+
+      async function tryAutoLoadRelative() {
+        if (location.protocol === 'file:') {
+          summary.textContent = 'Open via a local web server to auto-load relative JSONL files.';
+          return;
+        }
+        let files = [];
+        try {
+          const res = await fetch('./');
+          if (res.ok) {
+            const html = await res.text();
+            const matches = [];
+            const re1 = /href=\"([^\"]+\\.jsonl)\"/g;
+            const re2 = /href='([^']+\\.jsonl)'/g;
+            const re3 = /([A-Za-z0-9_.-]+\\.jsonl)/g;
+            let m;
+            while ((m = re1.exec(html)) !== null) matches.push(m[1]);
+            while ((m = re2.exec(html)) !== null) matches.push(m[1]);
+            if (matches.length === 0) {
+              while ((m = re3.exec(html)) !== null) matches.push(m[1]);
+            }
+            files = Array.from(new Set(matches));
+          }
+        } catch {
+          // ignore
+        }
+        if (files.length === 0) {
+          files = ['controller.jsonl'];
+        }
+        const loaded = [];
+        let attempted = 0;
+        let okCount = 0;
+        for (const name of files) {
+          attempted += 1;
+          try {
+            const res = await fetch(`${name}?_=${Date.now()}`);
+            if (!res.ok) continue;
+            const text = await res.text();
+            const events = text.split('\n').filter(Boolean).map(line => {
+              try { return JSON.parse(line); } catch { return null; }
+            }).filter(Boolean);
+            if (events.length) {
+              loaded.push(...events);
+              okCount += 1;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (loaded.length) {
+          allEvents = loaded;
+          populateActors();
+          render();
+        } else {
+          summary.textContent = `Auto-load found no events. Attempted ${attempted} files, loaded ${okCount}.`;
+        }
+      }
+
+      autoLoadBtn.addEventListener('click', tryAutoLoadRelative);
+      tryAutoLoadRelative();
+
+      actorSelect.addEventListener('change', render);
+    </script>
+  </body>
+</html>

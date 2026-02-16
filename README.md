@@ -1,28 +1,149 @@
-<img src=https://user-images.githubusercontent.com/135344/219700265-0a9b152f-7285-4607-bbce-0c9aeddd520b.svg width=300>
+# pytest-ezmon-nocov
 
-This is a pytest plug-in which automatically selects and re-executes
-only tests affected by recent changes. How is this possible in dynamic
-language like Python and how reliable is it? Read here: [Determining
-affected tests](https://testmon.org/blog/determining-affected-tests/)
+A pytest plugin that automatically selects and re-executes only tests affected by recent changes.
+
+**This is a fork of [pytest-testmon](https://github.com/tarpas/pytest-testmon)** that uses **import-based tracking** instead of coverage.py for faster execution and more reliable dependency detection.
+
+## Key Differences from Original testmon
+
+| Feature | pytest-testmon | pytest-ezmon-nocov |
+|---------|----------------|-------------------|
+| Dependency tracking | coverage.py contexts | Import hooks |
+| Granularity | Line/method-level | File-level |
+| First-run speed | Slower (coverage overhead) | ~3x faster |
+| False negatives | Possible (coverage limitations) | Never (conservative) |
+| Transitive imports | Not fully tracked | Fully tracked |
+| Storage | Junction tables | Roaring bitmaps + zstd |
+| Python support | 3.10+ | 3.7+ |
+
+## Installation
+
+```bash
+pip install pytest-ezmon-nocov
+```
 
 ## Quickstart
 
-    pip install pytest-testmon
+```bash
+# Build the dependency database and save it to .testmondata
+pytest --ezmon
 
-    # build the dependency database and save it to .testmondata
-    pytest --testmon
+# Change some of your code
 
-    # change some of your code (with test coverage)
+# Only run tests affected by recent changes
+pytest --ezmon
+```
 
-    # only run tests affected by recent changes
-    pytest --testmon
+## How It Works
 
-To learn more about different options you can use with testmon, please
-head to [testmon.org](https://testmon.org)
+**Core Principle**: No code in Python outside the current module can execute unless it is imported.
 
-## Call for opensource projects: try testmon in CI with no effort or risk.
+By hooking Python's import system, ezmon-nocov tracks which files each test imports (directly or transitively). On subsequent runs, it compares **the last recorded commit** to **HEAD** and selects only tests affected by those committed changes.
 
-We would like to run testmon within your project, collect data and improve!
-We'll prepare the PR for you and set everything up so that no tests are deselected initially.
-You can start using the full functionality whenever the reliability and time savings seem right!
-Please <a href="https://www.testmon.net/">SIGN UP</a> and we'll contact you shortly.
+### Import-Based Tracking
+
+```python
+# When your test does:
+from src.calculator import Calculator
+
+# Ezmon tracks:
+# - src/calculator.py (direct import)
+# - src/math_utils.py (if calculator imports it)
+# - Any other transitive dependencies
+```
+
+### File Dependency Tracking
+
+Ezmon also tracks non-Python file dependencies (git-tracked files only):
+
+```python
+def test_config():
+    with open("config.json") as f:
+        config = json.load(f)
+    # Ezmon tracks config.json as a dependency
+```
+
+### AST-Based Fingerprinting (Committed Files Only)
+
+Changes are detected via AST (Abstract Syntax Tree) checksums:
+- **Triggers tests**: Code changes, function signatures, import statements
+- **Ignored**: Comments, docstrings (stripped from AST before checksum)
+Note: Selection is based on **committed** changes between the previous run’s commit and `HEAD`, not on a dirty working tree.
+
+### External Package Dependencies
+
+External packages are tracked by **package name + version** when available. Package changes are compared between runs and only tests that used changed/removed packages are selected.
+
+## Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--ezmon` | Enable test selection and dependency collection |
+| `--ezmon-noselect` | Collect dependencies but don't deselect tests |
+| `--ezmon-nocollect` | Selection only, no dependency collection |
+| `--ezmon-forceselect` | Force selection even with pytest selectors (-k, -m) |
+| `--no-ezmon` | Disable ezmon completely |
+| `--ezmon-env` | Separate dependency data for different environments |
+| `--ezmon-graph` | Generate interactive dependency graph |
+| `--ezmon-no-reorder` | Disable duration-based test reordering |
+
+## Storage
+
+Test dependencies are stored in `.testmondata` (SQLite database):
+- **Roaring bitmaps** for compact dependency storage (~50-200 bytes per test)
+- **zstd compression** for minimal disk usage
+- Pure Python fallbacks for maximum compatibility
+
+## Parallel Execution
+
+Fully supports pytest-xdist for parallel test execution. The controller computes selection once and workers reuse that decision without reloading the database. Workers only collect dependency data, while the controller computes checksums and writes to the database. Collection is pruned to only the selected test files.
+
+```bash
+pytest --ezmon -n auto
+```
+
+## Server Mode (CI Integration)
+
+For CI environments, ezmon supports direct server communication:
+
+```bash
+export TESTMON_NET_ENABLED=true
+export TESTMON_SERVER=https://your-server.com
+export REPO_ID=owner/repo
+export JOB_ID=test-py311
+pytest --ezmon
+```
+
+If `TESTMON_SERVER` points at the ezmon public backend, the plugin stays local and does not make network calls.
+
+## Trade-offs
+
+**Pros of Import-Based Tracking:**
+- Faster test execution (no coverage.py overhead)
+- No false negatives - if code changes, dependent tests run
+- Reliable transitive import tracking
+- Simpler mental model
+
+**Cons of Import-Based Tracking:**
+- Less precise: changes to any code in a file trigger all tests importing that file
+- May run more tests than strictly necessary (conservative approach)
+ - Only git-tracked non-Python files are tracked
+
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed technical documentation
+- [CHANGELOG.md](CHANGELOG.md) - Version history and changes
+- [integration_tests/README.md](integration_tests/README.md) - Integration test documentation
+
+## Python Version Support
+
+- Python 3.7+
+- Tested through Python 3.14
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Credits
+
+This project is a fork of [pytest-testmon](https://github.com/tarpas/pytest-testmon) by Tibor Arpas.

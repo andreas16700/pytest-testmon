@@ -18,6 +18,7 @@ from pathlib import Path
 from flask_cors import CORS
 from dotenv import load_dotenv
 import sqlite3
+import base64
 import json
 import os
 from typing import Optional, Dict
@@ -32,6 +33,11 @@ import traceback
 from urllib.parse import urlencode
 import array
 from github import Github, GithubException
+
+# Ensure repo root is on sys.path so ezmon modules are importable.
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
 
 # OpenAI is optional - only needed for AI-assisted workflow modification
 try:
@@ -119,11 +125,17 @@ app = Flask(__name__)
 load_dotenv()
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
 allowed_origin = os.environ.get("ORIGIN")
-CORS(app,
-     supports_credentials=True,
-     origins=allowed_origin,
-     allow_headers=["Content-Type"],
-     methods=["GET", "POST", "OPTIONS"])
+if allowed_origin:
+    cors_origins = allowed_origin
+else:
+    cors_origins = "*"
+CORS(
+    app,
+    supports_credentials=True,
+    origins=cors_origins,
+    allow_headers=["Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
+)
 
 BASE_DATA_DIR = Path(os.getenv("TESTMON_DATA_DIR", "./testmon_data"))
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -281,6 +293,26 @@ def connect_db_with_retry(db_path: Path, max_retries: int = 5, base_delay: float
             else:
                 raise
     raise last_error
+
+
+def _ensure_run_infos_commit_id(cursor):
+    """Ensure run_infos has commit_id column for existing DBs."""
+    try:
+        columns = {row["name"] for row in cursor.execute("PRAGMA table_info(run_infos)")}
+    except Exception:
+        return
+    if "commit_id" not in columns:
+        cursor.execute("ALTER TABLE run_infos ADD COLUMN commit_id TEXT")
+
+
+def _ensure_tests_table_columns(cursor):
+    """Ensure tests table has test_file column for existing DBs."""
+    try:
+        columns = {row["name"] for row in cursor.execute("PRAGMA table_info(tests)")}
+    except Exception:
+        return
+    if "test_file" not in columns:
+        cursor.execute("ALTER TABLE tests ADD COLUMN test_file TEXT")
 
 
 def cleanup_old_environments(cursor, environment_name: str, keep_id: int):
@@ -2254,6 +2286,7 @@ def rpc_session_initiate():
                 tests_saved INTEGER,
                 tests_all INTEGER,
                 run_uid INTEGER,
+                commit_id TEXT,
                 FOREIGN KEY(run_uid) REFERENCES run_uid(id)
             );
 
@@ -2303,7 +2336,40 @@ def rpc_session_initiate():
                 FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id) ON DELETE CASCADE
             );
             CREATE UNIQUE INDEX IF NOT EXISTS sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
+
+            -- New simplified bitmap schema tables
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                checksum INTEGER,
+                fsha TEXT,
+                file_type TEXT DEFAULT 'python' CHECK (file_type IN ('python', 'data'))
+            );
+            CREATE INDEX IF NOT EXISTS files_path ON files (path);
+            CREATE INDEX IF NOT EXISTS files_checksum ON files (checksum);
+
+            CREATE TABLE IF NOT EXISTS tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                environment_id INTEGER,
+                name TEXT NOT NULL,
+                test_file TEXT,
+                duration REAL,
+                failed INTEGER DEFAULT 0,
+                UNIQUE (environment_id, name),
+                FOREIGN KEY(environment_id) REFERENCES environment(id)
+            );
+            CREATE INDEX IF NOT EXISTS tests_env_name ON tests (environment_id, name);
+
+            CREATE TABLE IF NOT EXISTS test_deps (
+                test_id INTEGER PRIMARY KEY,
+                file_bitmap BLOB NOT NULL,
+                external_packages TEXT,
+                FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+            );
         """)
+
+        _ensure_run_infos_commit_id(cursor)
+        _ensure_tests_table_columns(cursor)
 
         # Fetch or create environment with GRANULAR package change tracking
         env = cursor.execute(
@@ -2410,6 +2476,7 @@ def rpc_session_finish():
     job_id = request.headers.get("X-Job-ID")
     exec_id = data.get("exec_id")
     select = data.get("select", True)
+    commit_id = data.get("commit_id")
     # Allow clients to skip heavy history operations for faster response
     skip_history = data.get("skip_history", False)
 
@@ -2466,10 +2533,10 @@ def rpc_session_finish():
 
         cursor.execute(
             """
-            INSERT INTO run_infos (run_time_saved, run_time_all, tests_saved, tests_all, run_uid)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO run_infos (run_time_saved, run_time_all, tests_saved, tests_all, run_uid, commit_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (run_saved_time, run_all_time, run_saved_tests, run_all_tests, run_uid),
+            (run_saved_time, run_all_time, run_saved_tests, run_all_tests, run_uid, commit_id),
         )
         conn.commit()
 
@@ -2691,6 +2758,510 @@ def rpc_tests_all():
 
     except Exception as e:
         log_exception("rpc_tests_all", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/id_map", methods=["GET"])
+@rpc_auth_required
+def rpc_files_id_map():
+    """Return mapping of file paths to stable IDs."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"file_id_map": {}})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT path, id FROM files").fetchall()
+        conn.close()
+
+        return jsonify({"file_id_map": {row["path"]: row["id"] for row in rows}})
+    except Exception as e:
+        log_exception("rpc_files_id_map", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/get_or_create_id", methods=["POST"])
+@rpc_auth_required
+def rpc_files_get_or_create_id():
+    """Get or create a stable file ID for a path."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    path = data.get("path")
+    checksum = data.get("checksum")
+    fsha = data.get("fsha")
+    file_type = data.get("file_type", "python")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not path:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = connect_db_with_retry(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("BEGIN IMMEDIATE")
+        row = cursor.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
+        if row:
+            file_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+            if checksum is not None or fsha is not None:
+                cursor.execute(
+                    """UPDATE files SET checksum = COALESCE(?, checksum),
+                       fsha = COALESCE(?, fsha) WHERE id = ?""",
+                    (checksum, fsha, file_id),
+                )
+        else:
+            cursor.execute(
+                """INSERT INTO files (path, checksum, fsha, file_type)
+                   VALUES (?, ?, ?, ?)""",
+                (path, checksum, fsha, file_type),
+            )
+            file_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+        return jsonify({"file_id": file_id})
+    except Exception as e:
+        log_exception("rpc_files_get_or_create_id", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/checksums", methods=["GET"])
+@rpc_auth_required
+def rpc_files_checksums():
+    """Return mapping of file paths to checksums."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        if not db_path.exists():
+            return jsonify({"checksums": {}})
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT path, checksum FROM files").fetchall()
+        conn.close()
+        return jsonify({"checksums": {row["path"]: row["checksum"] for row in rows}})
+    except Exception as e:
+        log_exception("rpc_files_checksums", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/update_checksum", methods=["POST"])
+@rpc_auth_required
+def rpc_files_update_checksum():
+    """Update checksum (and optional fsha) for a single file."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    path = data.get("path")
+    checksum = data.get("checksum")
+    fsha = data.get("fsha")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or path is None:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = connect_db_with_retry(db_path)
+        conn.execute(
+            """UPDATE files SET checksum = ?, fsha = COALESCE(?, fsha)
+               WHERE path = ?""",
+            (checksum, fsha, path),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        log_exception("rpc_files_update_checksum", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/ids_for_paths", methods=["POST"])
+@rpc_auth_required
+def rpc_files_ids_for_paths():
+    """Return file IDs for provided paths."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    paths = data.get("paths", [])
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        if not paths:
+            return jsonify({"file_ids": []})
+
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" * len(paths))
+        rows = conn.execute(
+            f"SELECT id FROM files WHERE path IN ({placeholders})",
+            tuple(sorted(paths)),
+        ).fetchall()
+        conn.close()
+        return jsonify({"file_ids": [row["id"] for row in rows]})
+    except Exception as e:
+        log_exception("rpc_files_ids_for_paths", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/files/get_changed_ids", methods=["POST"])
+@rpc_auth_required
+def rpc_files_get_changed_ids():
+    """Return file IDs whose checksums differ from stored values."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    files_checksums = data.get("files_checksums", {})
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = connect_db_with_retry(db_path)
+        cursor = conn.cursor()
+        changed_ids = set()
+
+        for path, current_checksum in files_checksums.items():
+            row = cursor.execute(
+                "SELECT id, checksum FROM files WHERE path = ?", (path,)
+            ).fetchone()
+            if row:
+                if row["checksum"] != current_checksum:
+                    changed_ids.add(row["id"])
+            else:
+                cursor.execute(
+                    """INSERT INTO files (path, checksum, file_type)
+                       VALUES (?, ?, 'python')""",
+                    (path, current_checksum),
+                )
+                changed_ids.add(cursor.lastrowid)
+
+        conn.commit()
+        conn.close()
+        return jsonify({"changed_ids": list(changed_ids)})
+    except Exception as e:
+        log_exception("rpc_files_get_changed_ids", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/get_or_create_id", methods=["POST"])
+@rpc_auth_required
+def rpc_tests_get_or_create_id():
+    """Get or create a test ID for a given test name."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    test_name = data.get("test_name")
+    duration = data.get("duration")
+    failed = data.get("failed", False)
+    test_file = data.get("test_file")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id or not test_name:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = connect_db_with_retry(db_path)
+        cursor = conn.cursor()
+        row = cursor.execute(
+            "SELECT id FROM tests WHERE environment_id = ? AND name = ?",
+            (exec_id, test_name),
+        ).fetchone()
+
+        if row:
+            test_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+            cursor.execute(
+                """UPDATE tests SET duration = COALESCE(?, duration),
+                   failed = ?, test_file = COALESCE(?, test_file) WHERE id = ?""",
+                (duration, 1 if failed else 0, test_file, test_id),
+            )
+        else:
+            cursor.execute(
+                """INSERT INTO tests (environment_id, name, test_file, duration, failed)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (exec_id, test_name, test_file, duration, 1 if failed else 0),
+            )
+            test_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+        return jsonify({"test_id": test_id})
+    except Exception as e:
+        log_exception("rpc_tests_get_or_create_id", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/failing", methods=["GET"])
+@rpc_auth_required
+def rpc_tests_failing():
+    """Return failing tests for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT name FROM tests WHERE environment_id = ? AND failed = 1",
+            (exec_id,),
+        ).fetchall()
+        conn.close()
+        return jsonify({"failing": [row["name"] for row in rows]})
+    except Exception as e:
+        log_exception("rpc_tests_failing", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/test_files", methods=["POST"])
+@rpc_auth_required
+def rpc_tests_test_files():
+    """Return test files for provided test names."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    test_names = data.get("test_names", [])
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        if not test_names:
+            return jsonify({"test_files": []})
+
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" * len(test_names))
+        rows = conn.execute(
+            f"""SELECT DISTINCT test_file FROM tests
+                WHERE environment_id = ? AND name IN ({placeholders})""",
+            (exec_id, *sorted(test_names)),
+        ).fetchall()
+        conn.close()
+        return jsonify({"test_files": [row["test_file"] for row in rows if row["test_file"]]})
+    except Exception as e:
+        log_exception("rpc_tests_test_files", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/all_files", methods=["GET"])
+@rpc_auth_required
+def rpc_tests_all_files():
+    """Return all known test files for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT DISTINCT test_file FROM tests WHERE environment_id = ?",
+            (exec_id,),
+        ).fetchall()
+        conn.close()
+        return jsonify({"test_files": [row["test_file"] for row in rows if row["test_file"]]})
+    except Exception as e:
+        log_exception("rpc_tests_all_files", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/test_deps/save", methods=["POST"])
+@rpc_auth_required
+def rpc_test_deps_save():
+    """Save test dependencies bitmap for a test."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    test_id = data.get("test_id")
+    file_bitmap_b64 = data.get("file_bitmap")
+    external_packages = data.get("external_packages")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not test_id or file_bitmap_b64 is None:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = connect_db_with_retry(db_path)
+        cursor = conn.cursor()
+        blob = base64.b64decode(file_bitmap_b64)
+        cursor.execute(
+            """INSERT OR REPLACE INTO test_deps (test_id, file_bitmap, external_packages)
+               VALUES (?, ?, ?)""",
+            (test_id, blob, external_packages),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        log_exception("rpc_test_deps_save", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/test_deps/all", methods=["GET"])
+@rpc_auth_required
+def rpc_test_deps_all():
+    """Return all test dependency bitmaps for an environment."""
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = request.args.get("exec_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT t.id, td.file_bitmap, td.external_packages
+               FROM tests t
+               JOIN test_deps td ON t.id = td.test_id
+               WHERE t.environment_id = ?""",
+            (exec_id,),
+        ).fetchall()
+        conn.close()
+
+        deps = []
+        for row in rows:
+            deps.append(
+                {
+                    "test_id": row["id"],
+                    "file_bitmap": base64.b64encode(row["file_bitmap"]).decode("ascii"),
+                    "external_packages": row["external_packages"],
+                }
+            )
+        return jsonify({"deps": deps})
+    except Exception as e:
+        log_exception("rpc_test_deps_all", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rpc/tests/find_affected_bitmap", methods=["POST"])
+@rpc_auth_required
+def rpc_tests_find_affected_bitmap():
+    """Find affected tests via bitmap intersection."""
+    data = decompress_request_data()
+    if not data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    repo_id = request.headers.get("X-Repo-ID")
+    job_id = request.headers.get("X-Job-ID")
+    exec_id = data.get("exec_id")
+    changed_file_ids = set(data.get("changed_file_ids", []))
+    changed_packages = set(data.get("changed_packages", []))
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not repo_id or not job_id or not exec_id:
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    try:
+        from ezmon.bitmap_deps import TestDeps, find_affected_tests
+
+        db_path = get_job_db_path(repo_id, job_id)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT t.id, td.file_bitmap, td.external_packages
+               FROM tests t
+               JOIN test_deps td ON t.id = td.test_id
+               WHERE t.environment_id = ?""",
+            (exec_id,),
+        ).fetchall()
+
+        deps_list = [
+            TestDeps.deserialize(row["id"], row["file_bitmap"], row["external_packages"])
+            for row in rows
+        ]
+        affected_ids = find_affected_tests(deps_list, changed_file_ids, changed_packages)
+        if not affected_ids:
+            conn.close()
+            return jsonify({"affected": []})
+
+        placeholders = ",".join("?" * len(affected_ids))
+        name_rows = conn.execute(
+            f"SELECT name FROM tests WHERE id IN ({placeholders})",
+            tuple(affected_ids),
+        ).fetchall()
+        conn.close()
+
+        return jsonify({"affected": [row["name"] for row in name_rows]})
+    except Exception as e:
+        log_exception("rpc_tests_find_affected_bitmap", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": str(e)}), 500
 
 

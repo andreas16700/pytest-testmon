@@ -1,0 +1,10 @@
+ninja: error: WriteFile(.ninja_lock): Unable to create file. Operation not permitted
+ImportError while loading conftest '/Users/andrew_yos/pytest-super/nocov-refactor/profile/pandas/pandas/conftest.py'.
+../../../../mamba/envs/pandas-dev/lib/python3.13/site-packages/_pandas_editable_loader.py:311: in find_spec
+    tree = self._rebuild()
+           ^^^^^^^^^^^^^^^
+../../../../mamba/envs/pandas-dev/lib/python3.13/site-packages/_pandas_editable_loader.py:347: in _rebuild
+    raise ImportError(f're-building the {self._name} meson-python editable wheel package failed') from exc
+E   ImportError: re-building the pandas meson-python editable wheel package failed
+        0.26 real         0.16 user         0.04 sys
+time: sysctl kern.clockrate: Operation not permitted

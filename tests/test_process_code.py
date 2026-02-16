@@ -2,163 +2,93 @@
 Unit tests for ezmon's code processing and fingerprinting logic.
 
 These tests verify that:
-1. Code blocks are correctly identified (module-level vs function bodies)
-2. Checksums are calculated correctly
-3. Comments are stripped before checksum calculation
-4. Fingerprints match/mismatch as expected
+1. File checksums are correctly calculated
+2. Comments and docstrings are stripped before checksum calculation
+3. Fingerprints match/mismatch as expected
 """
 import pytest
 from ezmon.process_code import (
     Module,
-    Block,
-    methods_to_checksums,
-    checksums_to_blob,
-    blob_to_checksums,
+    compute_file_checksum,
     match_fingerprint,
     create_fingerprint,
-    _strip_comment_lines,
+    _strip_docstrings,
 )
+import ast
 
 
-class TestBlockExtraction:
-    """Tests for extracting code blocks from source."""
+class TestFileChecksum:
+    """Tests for single-file checksum calculation."""
 
-    def test_simple_function_creates_block(self):
-        """A simple function should create one block."""
-        source = '''
-def hello():
-    return "hello"
-'''
-        module = Module(source_code=source)
-        blocks = module.blocks
+    def test_identical_code_same_checksum(self):
+        """Identical code should produce identical checksums."""
+        code = "def foo():\n    return 1\n"
+        checksum1 = compute_file_checksum(code)
+        checksum2 = compute_file_checksum(code)
+        assert checksum1 == checksum2
 
-        # Should have 2 blocks: module-level and function body
-        assert len(blocks) == 2
-        # One block should be named 'hello'
-        block_names = [b.name for b in blocks]
-        assert "hello" in block_names
+    def test_different_code_different_checksum(self):
+        """Different code should produce different checksums."""
+        code1 = "def foo():\n    return 1\n"
+        code2 = "def foo():\n    return 2\n"
+        checksum1 = compute_file_checksum(code1)
+        checksum2 = compute_file_checksum(code2)
+        assert checksum1 != checksum2
 
-    def test_multiple_functions_create_multiple_blocks(self):
-        """Multiple functions should create multiple blocks."""
-        source = '''
+    def test_cosmetic_whitespace_does_not_matter(self):
+        """Cosmetic whitespace differences should NOT affect checksums.
+
+        The AST normalizes whitespace in expressions, so extra spaces
+        in return statements etc. don't change the checksum. This is
+        desirable - cosmetic changes shouldn't trigger test re-runs.
+        """
+        code1 = "def foo():\n    return  1\n"  # Extra space
+        code2 = "def foo():\n    return 1\n"
+        checksum1 = compute_file_checksum(code1)
+        checksum2 = compute_file_checksum(code2)
+        # AST normalizes whitespace, so checksums should match
+        assert checksum1 == checksum2
+
+    def test_comment_changes_do_not_affect_checksum(self):
+        """Comments should not affect the checksum (AST-based)."""
+        code_with_comment = '''
 def foo():
-    return 1
-
-def bar():
-    return 2
-
-def baz():
-    return 3
-'''
-        module = Module(source_code=source)
-        blocks = module.blocks
-
-        # 4 blocks: module-level + 3 functions
-        assert len(blocks) == 4
-        block_names = [b.name for b in blocks]
-        assert "foo" in block_names
-        assert "bar" in block_names
-        assert "baz" in block_names
-
-    def test_class_methods_create_blocks(self):
-        """Class methods should create separate blocks."""
-        source = '''
-class MyClass:
-    def method_one(self):
-        return 1
-
-    def method_two(self):
-        return 2
-'''
-        module = Module(source_code=source)
-        blocks = module.blocks
-
-        block_names = [b.name for b in blocks]
-        assert "method_one" in block_names
-        assert "method_two" in block_names
-
-    def test_nested_function_creates_block(self):
-        """Nested functions should create separate blocks."""
-        source = '''
-def outer():
-    def inner():
-        return "inner"
-    return inner()
-'''
-        module = Module(source_code=source)
-        blocks = module.blocks
-
-        block_names = [b.name for b in blocks]
-        assert "outer" in block_names
-        assert "inner" in block_names
-
-    def test_async_function_creates_block(self):
-        """Async functions should create blocks."""
-        source = '''
-async def async_func():
-    return await something()
-'''
-        module = Module(source_code=source)
-        blocks = module.blocks
-
-        block_names = [b.name for b in blocks]
-        assert "async_func" in block_names
-
-
-class TestCommentStripping:
-    """Tests for comment stripping before checksum calculation."""
-
-    def test_strip_single_line_comment(self):
-        """Single-line comments should be stripped."""
-        text = '''
-# This is a comment
-x = 1
-# Another comment
-y = 2
-'''
-        result = _strip_comment_lines(text)
-        assert "# This is a comment" not in result
-        assert "# Another comment" not in result
-        assert "x = 1" in result
-        assert "y = 2" in result
-
-    def test_strip_indented_comment(self):
-        """Indented comments should be stripped."""
-        text = '''
-def foo():
-    # comment inside function
+    # This is a comment
     return 1
 '''
-        result = _strip_comment_lines(text)
-        assert "# comment inside function" not in result
-        assert "return 1" in result
-
-    def test_inline_comment_preserved(self):
-        """Inline comments (code # comment) are preserved (whole line kept)."""
-        text = '''x = 1  # inline comment'''
-        result = _strip_comment_lines(text)
-        # The line is kept because it doesn't START with #
-        assert "x = 1" in result
-
-    def test_empty_after_stripping(self):
-        """File with only comments should produce empty result."""
-        text = '''
-# comment 1
-# comment 2
-# comment 3
+        code_without_comment = '''
+def foo():
+    return 1
 '''
-        result = _strip_comment_lines(text)
-        # Should be empty or just whitespace
-        assert result.strip() == ""
+        checksum1 = compute_file_checksum(code_with_comment)
+        checksum2 = compute_file_checksum(code_without_comment)
+        # AST doesn't include comments, so checksums should match
+        assert checksum1 == checksum2
+
+    def test_syntax_error_falls_back_to_content_hash(self):
+        """Files with syntax errors should still get a checksum."""
+        bad_code = "def broken(\n"  # Syntax error
+        checksum = compute_file_checksum(bad_code)
+        # Should return a valid checksum (content-based fallback)
+        assert isinstance(checksum, int)
+
+    def test_non_python_file_uses_content_hash(self):
+        """Non-Python files should use content-based hashing."""
+        content = "Some text content\nthat is not Python\n"
+        checksum = compute_file_checksum(content, ext="txt")
+        assert isinstance(checksum, int)
+
+    def test_non_python_file_different_content(self):
+        """Non-Python files with different content have different checksums."""
+        content1 = "version: 1.0\n"
+        content2 = "version: 2.0\n"
+        checksum1 = compute_file_checksum(content1, ext="yaml")
+        checksum2 = compute_file_checksum(content2, ext="yaml")
+        assert checksum1 != checksum2
 
 
 class TestDocstringStripping:
-    """Tests for docstring stripping before checksum calculation.
-
-    Docstrings should NOT affect fingerprints because:
-    1. They don't change code behavior
-    2. Documentation changes shouldn't trigger test re-runs
-    """
+    """Tests for docstring stripping before checksum calculation."""
 
     def test_module_docstring_stripped(self):
         """Module docstrings should not affect checksums."""
@@ -172,9 +102,9 @@ def foo():
 def foo():
     return 42
 '''
-        m1 = Module(source_code=code_with_docstring)
-        m2 = Module(source_code=code_without_docstring)
-        assert m1.checksums == m2.checksums
+        checksum1 = compute_file_checksum(code_with_docstring)
+        checksum2 = compute_file_checksum(code_without_docstring)
+        assert checksum1 == checksum2
 
     def test_function_docstring_stripped(self):
         """Function docstrings should not affect checksums."""
@@ -187,9 +117,9 @@ def foo():
 def foo():
     return 42
 '''
-        m1 = Module(source_code=code_with_docstring)
-        m2 = Module(source_code=code_without_docstring)
-        assert m1.checksums == m2.checksums
+        checksum1 = compute_file_checksum(code_with_docstring)
+        checksum2 = compute_file_checksum(code_without_docstring)
+        assert checksum1 == checksum2
 
     def test_class_docstring_stripped(self):
         """Class docstrings should not affect checksums."""
@@ -205,9 +135,9 @@ class Foo:
     def method(self):
         return 42
 '''
-        m1 = Module(source_code=code_with_docstring)
-        m2 = Module(source_code=code_without_docstring)
-        assert m1.checksums == m2.checksums
+        checksum1 = compute_file_checksum(code_with_docstring)
+        checksum2 = compute_file_checksum(code_without_docstring)
+        assert checksum1 == checksum2
 
     def test_different_docstrings_same_checksum(self):
         """Changing only the docstring should not change the checksum."""
@@ -218,12 +148,12 @@ def foo():
 '''
         code_v2 = '''
 def foo():
-    """Completely different docstring with more details about the function."""
+    """Completely different docstring with more details."""
     return 42
 '''
-        m1 = Module(source_code=code_v1)
-        m2 = Module(source_code=code_v2)
-        assert m1.checksums == m2.checksums
+        checksum1 = compute_file_checksum(code_v1)
+        checksum2 = compute_file_checksum(code_v2)
+        assert checksum1 == checksum2
 
     def test_logic_change_still_detected(self):
         """Actual code changes should still be detected even with docstrings."""
@@ -237,46 +167,70 @@ def foo():
     """Same docstring."""
     return 43  # Changed!
 '''
-        m1 = Module(source_code=code_v1)
-        m2 = Module(source_code=code_v2)
-        assert m1.checksums != m2.checksums
+        checksum1 = compute_file_checksum(code_v1)
+        checksum2 = compute_file_checksum(code_v2)
+        assert checksum1 != checksum2
 
 
-class TestChecksums:
-    """Tests for checksum calculation and conversion."""
+class TestModule:
+    """Tests for the Module class."""
 
-    def test_identical_code_same_checksum(self):
-        """Identical code should produce identical checksums."""
-        blocks = ["return 1", "return 1"]
-        checksums = methods_to_checksums(blocks)
-        assert checksums[0] == checksums[1]
+    def test_module_has_single_checksum(self):
+        """A Module should have a single checksum property."""
+        source = '''
+def hello():
+    return "hello"
+'''
+        module = Module(source_code=source)
+        checksum = module.checksum
+        assert isinstance(checksum, int)
 
-    def test_different_code_different_checksum(self):
-        """Different code should produce different checksums."""
-        blocks = ["return 1", "return 2"]
-        checksums = methods_to_checksums(blocks)
-        assert checksums[0] != checksums[1]
+    def test_module_checksum_cached(self):
+        """The checksum should be cached after first access."""
+        source = '''
+def hello():
+    return "hello"
+'''
+        module = Module(source_code=source)
+        checksum1 = module.checksum
+        checksum2 = module.checksum
+        assert checksum1 == checksum2
 
-    def test_whitespace_matters(self):
-        """Whitespace differences should produce different checksums."""
-        blocks = ["return  1", "return 1"]
-        checksums = methods_to_checksums(blocks)
-        # Extra space means different checksum
-        assert checksums[0] != checksums[1]
+    def test_module_with_multiple_functions(self):
+        """A module with multiple functions should have one checksum."""
+        source = '''
+def foo():
+    return 1
 
-    def test_comments_stripped_before_checksum(self):
-        """Comments should be stripped before checksum, so same code = same checksum."""
-        block1 = "# comment\nreturn 1"
-        block2 = "return 1"
-        checksums = methods_to_checksums([block1, block2])
-        assert checksums[0] == checksums[1]
+def bar():
+    return 2
 
-    def test_blob_roundtrip(self):
-        """Checksums should survive blob conversion roundtrip."""
-        original = [12345, -67890, 0, 2147483647, -2147483648]
-        blob = checksums_to_blob(original)
-        restored = blob_to_checksums(blob)
-        assert restored == original
+def baz():
+    return 3
+'''
+        module = Module(source_code=source)
+        checksum = module.checksum
+        assert isinstance(checksum, int)
+
+    def test_module_checksum_changes_with_any_function(self):
+        """Changing any function should change the module checksum."""
+        source1 = '''
+def foo():
+    return 1
+
+def bar():
+    return 2
+'''
+        source2 = '''
+def foo():
+    return 1
+
+def bar():
+    return 3  # Changed!
+'''
+        module1 = Module(source_code=source1)
+        module2 = Module(source_code=source2)
+        assert module1.checksum != module2.checksum
 
 
 class TestFingerprintMatching:
@@ -287,18 +241,15 @@ class TestFingerprintMatching:
         source = '''
 def foo():
     return 1
-
-def bar():
-    return 2
 '''
         module = Module(source_code=source)
-        fingerprint = module.checksums
+        fingerprint = create_fingerprint(module)
 
         # Same source should match
         assert match_fingerprint(module, fingerprint)
 
-    def test_changed_function_does_not_match(self):
-        """Changed function should not match old fingerprint."""
+    def test_changed_code_does_not_match(self):
+        """Changed code should not match old fingerprint."""
         source1 = '''
 def foo():
     return 1
@@ -308,18 +259,14 @@ def foo():
     return 2
 '''
         module1 = Module(source_code=source1)
-        fingerprint1 = module1.checksums
+        fingerprint1 = create_fingerprint(module1)
 
         module2 = Module(source_code=source2)
         # New module should NOT match old fingerprint
         assert not match_fingerprint(module2, fingerprint1)
 
-    def test_added_function_changes_module_checksum(self):
-        """Adding a new function changes the module-level checksum.
-
-        This is expected behavior - the module block includes function definitions
-        (not bodies), so adding a function changes the module block's checksum.
-        """
+    def test_added_function_changes_fingerprint(self):
+        """Adding a new function should change the fingerprint."""
         source1 = '''
 def foo():
     return 1
@@ -332,82 +279,42 @@ def bar():
     return 2
 '''
         module1 = Module(source_code=source1)
-        fingerprint1 = module1.checksums
+        fingerprint1 = create_fingerprint(module1)
 
         module2 = Module(source_code=source2)
-        # Adding a function changes the module-level block, so fingerprint won't match
-        # This is correct behavior - if a test executed the module level code,
-        # it should be re-run when a new function is added
+        # Adding a function changes the checksum
         assert not match_fingerprint(module2, fingerprint1)
-
-    def test_removed_function_does_not_match(self):
-        """Removing a function means old fingerprint has checksums no longer present."""
-        source1 = '''
-def foo():
-    return 1
-
-def bar():
-    return 2
-'''
-        source2 = '''
-def foo():
-    return 1
-'''
-        module1 = Module(source_code=source1)
-        # Create fingerprint that includes both functions
-        fingerprint_both = module1.checksums
-
-        module2 = Module(source_code=source2)
-        # Module2 doesn't have bar's checksum, so fingerprint with bar won't match
-        # But wait - this depends on whether the test actually USED bar
-        # If fingerprint only had foo's checksum, it would still match
-
-        # To properly test, let's create a fingerprint that explicitly includes bar
-        # by getting checksums for specific blocks
 
 
 class TestCreateFingerprint:
-    """Tests for creating fingerprints from covered lines."""
+    """Tests for creating fingerprints."""
 
-    def test_fingerprint_includes_covered_blocks(self):
-        """Fingerprint should include checksums of blocks that contain covered lines."""
-        source = '''
-def foo():
-    x = 1
-    return x
-
-def bar():
-    y = 2
-    return y
-'''
-        module = Module(source_code=source)
-
-        # Cover only foo (lines 2-4)
-        fingerprint = create_fingerprint(module, {2, 3, 4})
-
-        # Fingerprint should have checksums, but we need to verify
-        # it's the right ones. Let's just check it's not empty.
-        assert len(fingerprint) > 0
-
-    def test_fingerprint_empty_for_no_coverage(self):
-        """No covered lines should produce minimal fingerprint."""
+    def test_fingerprint_is_integer(self):
+        """Fingerprint should be a single integer."""
         source = '''
 def foo():
     return 1
 '''
         module = Module(source_code=source)
-        fingerprint = create_fingerprint(module, set())
+        fingerprint = create_fingerprint(module)
+        assert isinstance(fingerprint, int)
 
-        # With no lines covered, fingerprint might include module-level only
-        # or be empty depending on implementation
-        assert isinstance(fingerprint, list)
+    def test_fingerprint_matches_checksum(self):
+        """Fingerprint should equal the module's checksum."""
+        source = '''
+def foo():
+    return 1
+'''
+        module = Module(source_code=source)
+        fingerprint = create_fingerprint(module)
+        assert fingerprint == module.checksum
 
 
-class TestModuleChecksums:
-    """Tests for module-level checksum behavior."""
+class TestModuleChanges:
+    """Tests for detecting module-level changes."""
 
     def test_module_constant_change_detected(self):
-        """Changing a module-level constant should change the module checksum."""
+        """Changing a module-level constant should change the checksum."""
         source1 = '''
 CONSTANT = 42
 
@@ -422,12 +329,10 @@ def foo():
 '''
         module1 = Module(source_code=source1)
         module2 = Module(source_code=source2)
-
-        # The module-level block checksums should differ
-        assert module1.checksums != module2.checksums
+        assert module1.checksum != module2.checksum
 
     def test_import_change_detected(self):
-        """Changing imports should change the module checksum."""
+        """Changing imports should change the checksum."""
         source1 = '''
 import os
 
@@ -442,37 +347,41 @@ def foo():
 '''
         module1 = Module(source_code=source1)
         module2 = Module(source_code=source2)
-
-        assert module1.checksums != module2.checksums
+        assert module1.checksum != module2.checksum
 
 
 class TestSyntaxErrorHandling:
     """Tests for handling invalid Python syntax."""
 
-    def test_syntax_error_produces_empty_blocks(self):
-        """Invalid syntax should produce empty blocks, not crash."""
+    def test_syntax_error_produces_valid_checksum(self):
+        """Invalid syntax should produce a valid checksum, not crash."""
         source = '''
 def broken(
     # Missing closing paren
 '''
         module = Module(source_code=source)
-        # Should not raise, just have empty blocks
-        blocks = module.blocks
-        assert isinstance(blocks, list)
+        checksum = module.checksum
+        # Should return a valid checksum (content-based fallback)
+        assert isinstance(checksum, int)
 
 
 class TestNonPythonFiles:
     """Tests for non-Python file handling."""
 
-    def test_non_py_file_single_block(self):
-        """Non-Python files should be treated as single block."""
+    def test_non_py_file_has_checksum(self):
+        """Non-Python files should have a checksum."""
         source = '''
 Some text content
 that is not Python
 '''
         module = Module(source_code=source, ext="txt")
-        blocks = module.blocks
+        checksum = module.checksum
+        assert isinstance(checksum, int)
 
-        # Should have exactly one block containing the whole file
-        assert len(blocks) == 1
-        assert blocks[0].start == 1
+    def test_non_py_file_content_change_detected(self):
+        """Content changes in non-Python files should change the checksum."""
+        source1 = "version: 1.0\n"
+        source2 = "version: 2.0\n"
+        module1 = Module(source_code=source1, ext="yaml")
+        module2 = Module(source_code=source2, ext="yaml")
+        assert module1.checksum != module2.checksum

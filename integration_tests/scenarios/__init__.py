@@ -1,5 +1,5 @@
 """
-Test scenarios for ezmon integration testing.
+Test scenarios for ezmon-nocov integration testing.
 
 Each scenario defines:
 - name: Human-readable name
@@ -8,70 +8,50 @@ Each scenario defines:
 - expected_selected: Individual tests that SHOULD run
 - expected_deselected: Individual tests that should NOT run
 
-IMPORTANT: Ezmon uses AST-based fingerprinting, so modifications must
-change the code structure, not just comments!
+## AST-Based Checksums
 
-## Block-Based Fingerprinting
+Ezmon-nocov computes file checksums using AST (Abstract Syntax Tree) parsing:
 
-Ezmon tracks dependencies at the BLOCK level. For each module, there are two types of blocks:
+1. Parse source code into AST (comments are automatically excluded)
+2. Strip docstrings from the AST
+3. Compute CRC32 checksum of the AST dump
 
-1. **Module-Level Block**: Contains AST of module with function bodies REPLACED by placeholders.
-   Represents imports, class definitions, function signatures, module-level code.
+### Changes that DO NOT trigger test re-runs:
+- Comments (any # comments) - AST parsing ignores them
+- Docstrings (module, class, function) - explicitly stripped
+- Whitespace changes - AST normalizes whitespace
 
-2. **Function Body Blocks**: Each function/method body is a separate block containing
-   the implementation code.
+### Changes that DO trigger test re-runs:
+- Function/method body changes
+- Import statement changes
+- Class/function signature changes
+- Module-level code (constants, globals)
 
-When a function BODY changes:
-- Module-level block: UNCHANGED (function signature is the same)
-- Function body block: CHANGED
+## File-Level Granularity
 
-Therefore, only tests that EXECUTE that function are affected. Tests that merely
-IMPORT the module but don't call the function are NOT affected.
-
-## Two-Phase Tracking
-
-### Collection Phase (per test file)
-- Coverage captures lines executed during import (module-level code)
-- Import tracker captures module imports and file reads
-- This becomes the BASELINE for all tests in that file
-
-### Execution Phase (per test)
-- Coverage captures lines executed during the test
-- Import tracker captures dynamic imports and file reads
-- Merged with collection baseline
-
-## Per-Test Coverage
-
-Ezmon uses TEST_BATCH_SIZE=1 to ensure each test gets accurate coverage.
-Coverage is erased after each test, so every test that calls a function
-gets that function recorded as a dependency.
+When a file's checksum changes, ALL tests that import that file re-run.
+This is less precise than coverage-based tracking but:
+- ~3x faster on first run (no coverage.py overhead)
+- Never misses affected tests (conservative, always correct)
+- Simpler implementation
 
 ## Test Dependencies
 
-test_calculator.py:
-  TestCalculator::test_add → calls add()
-  TestCalculator::test_subtract → calls subtract()
-  TestCalculator::test_multiply → calls multiply()
-  TestCalculator::test_divide → calls divide()
-  TestCalculator::test_divide_by_zero → calls divide()
-  TestCalculator::test_unknown_operator → no math function calls (module-level only)
-  TestCalculatorHistory::test_history_recording → calls add()
-  TestCalculatorHistory::test_clear_history → calls clear_history()
+For file-level tracking, what matters is which files each test imports:
 
-test_formatter.py:
-  TestFormatter::test_upper_style → calls uppercase()
-  TestFormatter::test_lower_style → calls lowercase()
-  TestFormatter::test_title_style → calls capitalize()
-  TestFormatter::test_default_style → calls uppercase() (default style)
-  TestFormatter::test_unknown_style → no string function calls (module-level only)
-  TestFormatterStyleChange::test_change_style → calls set_style(), uppercase(), lowercase()
+test_calculator.py imports:
+  - src/calculator.py
+  - src/math_utils.py (via calculator)
 
-## Key Principle
+test_math_utils.py imports:
+  - src/math_utils.py
 
-Tests are only affected by changes to code blocks they EXECUTE.
-If a test imports a module but doesn't call a specific function:
-- When that function's BODY changes → test is NOT affected
-- When module-level code changes (imports, signatures) → test IS affected
+test_string_utils.py imports:
+  - src/string_utils.py
+
+test_formatter.py imports:
+  - src/formatter.py
+  - src/string_utils.py (via formatter)
 """
 
 from dataclasses import dataclass, field
@@ -178,15 +158,13 @@ def register(scenario: Scenario) -> Scenario:
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify math_utils.add()
-# Tests that call add() are selected via block-level tracking.
-# Tests that call OTHER math functions have those function body blocks in
-# their fingerprints, but NOT the add() body block, so they're NOT selected.
-# Tests that don't call ANY math function only have the module-level block,
-# which is UNCHANGED when a function body changes, so they're NOT selected.
+# With file-level tracking, ALL tests importing math_utils.py are selected.
+# This includes test_calculator.py tests (via calculator.py -> math_utils.py)
+# and test_math_utils.py tests (direct import).
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_math_utils",
-    description="Change math_utils.add() body - only tests calling add() selected",
+    description="Change math_utils.py - all tests importing it are selected (file-level)",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -195,38 +173,22 @@ register(Scenario(
             content="result = a + b\n    return result",
         )
     ],
-    # Selected: only tests that actually EXECUTE add()
-    expected_selected=[
-        TEST_CALC_ADD,       # calls add() via calculator
-        TEST_CALC_HISTORY,   # calls add() via calc.calculate(2, '+', 3)
-        TEST_CALC_CLEAR,     # calls add() via calc.calculate(2, '+', 3)
-        TEST_MATH_ADD_POS,   # calls add() directly
-        TEST_MATH_ADD_NEG,   # calls add() directly
-        TEST_MATH_ADD_MIX,   # calls add() directly
-    ],
-    # Deselected: tests that don't execute add()
-    # - Tests calling OTHER math functions: have those body blocks, not add() body
-    # - test_unknown_operator: only has module-level block (unchanged by body change)
-    expected_deselected=[
-        TEST_CALC_SUBTRACT,    # only calls subtract()
-        TEST_CALC_MULTIPLY,    # only calls multiply()
-        TEST_CALC_DIVIDE,      # only calls divide()
-        TEST_CALC_DIVIDE_ZERO, # only calls divide()
-        TEST_CALC_UNKNOWN_OP,  # no math function calls, only module-level dep
-    ],
+    # Selected: ALL tests that import math_utils.py (directly or transitively)
+    expected_selected=ALL_CALC_TESTS + ALL_MATH_TESTS,
+    # No deselection with file-level granularity - all importers run
+    expected_deselected=[],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify string_utils.uppercase()
-# Tests that call uppercase() are selected via block-level tracking.
-# Tests that call OTHER string functions have those body blocks, not uppercase().
-# Tests that don't call ANY string function only have module-level block,
-# which is UNCHANGED when a function body changes.
+# With file-level tracking, ALL tests importing string_utils.py are selected.
+# This includes test_formatter.py tests (via formatter.py -> string_utils.py)
+# and test_string_utils.py tests (direct import).
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_string_utils",
-    description="Change string_utils.uppercase() body - only tests calling uppercase() selected",
+    description="Change string_utils.py - all tests importing it are selected (file-level)",
     modifications=[
         Modification(
             file="src/string_utils.py",
@@ -235,33 +197,20 @@ register(Scenario(
             content="upper_result = s.upper()\n    return upper_result",
         )
     ],
-    # Selected: only tests that actually EXECUTE uppercase()
-    expected_selected=[
-        TEST_FMT_UPPER,      # calls uppercase() via formatter
-        TEST_FMT_DEFAULT,    # default style is "upper", calls uppercase()
-        TEST_FMT_CHANGE,     # calls both uppercase() and lowercase()
-        TEST_STR_UPPER_LOW,  # calls uppercase() directly
-        TEST_STR_UPPER_MIX,  # calls uppercase() directly
-    ],
-    # Deselected: tests that don't execute uppercase()
-    # - Tests calling OTHER string functions: have those body blocks, not uppercase() body
-    # - test_unknown_style: only has module-level block (unchanged by body change)
-    expected_deselected=[
-        TEST_FMT_LOWER,   # only calls lowercase()
-        TEST_FMT_TITLE,   # only calls capitalize()
-        TEST_FMT_UNKNOWN, # no string function calls, only module-level dep
-    ],
+    # Selected: ALL tests that import string_utils.py (directly or transitively)
+    expected_selected=ALL_FMT_TESTS + ALL_STR_TESTS,
+    # No deselection with file-level granularity - all importers run
+    expected_deselected=[],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify calculator.clear_history()
-# test_clear_history calls clear_history() directly.
-# Method-level tracking ensures only the test that calls this method is selected.
+# With file-level tracking, ALL tests importing calculator.py are selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_calculator_only",
-    description="Change Calculator.clear_history() - only test calling it is selected",
+    description="Change calculator.py - all tests importing it are selected (file-level)",
     modifications=[
         Modification(
             file="src/calculator.py",
@@ -271,20 +220,19 @@ register(Scenario(
             content="def clear_history(self):\n        self.history = list()",
         )
     ],
-    # Only test_clear_history calls clear_history() directly
-    expected_selected=[TEST_CALC_CLEAR],
+    # All tests importing calculator.py
+    expected_selected=ALL_CALC_TESTS,
     expected_deselected=[],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify formatter.set_style()
-# test_change_style calls set_style() directly.
-# Method-level tracking ensures only the test that calls this method is selected.
+# With file-level tracking, ALL tests importing formatter.py are selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_formatter_only",
-    description="Change Formatter.set_style() - only test calling it is selected",
+    description="Change formatter.py - all tests importing it are selected (file-level)",
     modifications=[
         Modification(
             file="src/formatter.py",
@@ -294,19 +242,19 @@ register(Scenario(
             content="def set_style(self, style):\n        self.style = str(style)",
         )
     ],
-    # Only test_change_style calls set_style() directly
-    expected_selected=[TEST_FMT_CHANGE],
+    # All tests importing formatter.py
+    expected_selected=ALL_FMT_TESTS,
     expected_deselected=[],
 ))
 
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify test file only
-# Only the specific test being modified should run
+# With file-level tracking, ALL tests in the modified test file run.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_test_only",
-    description="Change test_math_utils.py::TestAdd::test_positive_numbers - only that test runs",
+    description="Change test_math_utils.py - all tests in that file run (file-level)",
     modifications=[
         Modification(
             file="tests/test_math_utils.py",
@@ -315,8 +263,9 @@ register(Scenario(
             content="result = add(2, 3)\n        assert result == 5",
         )
     ],
-    expected_selected=[TEST_MATH_ADD_POS],
-    expected_deselected=[t for t in ALL_TESTS if t != TEST_MATH_ADD_POS],
+    # All tests in test_math_utils.py
+    expected_selected=ALL_MATH_TESTS,
+    expected_deselected=[],
 ))
 
 
@@ -330,6 +279,46 @@ register(Scenario(
     modifications=[],
     expected_selected=[],
     expected_deselected=ALL_TESTS,
+))
+
+
+# -----------------------------------------------------------------------------
+# Scenario: Comment-only changes
+# Comments are stripped by AST parsing, so NO tests should run
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="comment_only_change",
+    description="Add/change comments only - no tests should run (AST ignores comments)",
+    modifications=[
+        Modification(
+            file="src/math_utils.py",
+            action="replace",
+            target="def add(a, b):",
+            content="# This is a new comment about the add function\ndef add(a, b):",
+        )
+    ],
+    expected_selected=[],
+    expected_deselected=[],  # Not checking deselection, just that nothing is selected
+))
+
+
+# -----------------------------------------------------------------------------
+# Scenario: Docstring-only changes
+# Docstrings are stripped before checksum, so NO tests should run
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="docstring_only_change",
+    description="Change docstrings only - no tests should run (docstrings stripped)",
+    modifications=[
+        Modification(
+            file="src/math_utils.py",
+            action="replace",
+            target='def add(a, b):\n    return a + b',
+            content='def add(a, b):\n    """Add two numbers together and return the sum."""\n    return a + b',
+        )
+    ],
+    expected_selected=[],
+    expected_deselected=[],  # Not checking deselection, just that nothing is selected
 ))
 
 
@@ -366,12 +355,11 @@ def test_another_new():
 
 # -----------------------------------------------------------------------------
 # Scenario: Multiple modifications
-# Modify subtract() and lowercase() body - only tests executing those functions selected.
-# Tests with only module-level deps are NOT selected (module-level block unchanged).
+# With file-level tracking, ALL tests importing modified files are selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="multiple_modifications",
-    description="Change subtract() and lowercase() bodies - only tests calling them selected",
+    description="Change math_utils.py and string_utils.py - all tests importing them selected (file-level)",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -386,30 +374,9 @@ register(Scenario(
             content="lower_result = s.lower()\n    return lower_result",
         ),
     ],
-    # Selected: only tests that actually EXECUTE subtract() or lowercase()
-    expected_selected=[
-        # Tests calling subtract()
-        TEST_CALC_SUBTRACT,
-        TEST_MATH_SUB_POS,
-        TEST_MATH_SUB_NEG,
-        # Tests calling lowercase()
-        TEST_FMT_LOWER,
-        TEST_FMT_CHANGE,  # calls both uppercase() and lowercase()
-        TEST_STR_LOWER_UP,
-        TEST_STR_LOWER_MIX,
-    ],
-    # Deselected: tests that don't execute subtract() or lowercase()
-    # - Tests calling OTHER functions: have those body blocks, not subtract()/lowercase()
-    # - Tests with module-level only: unchanged by body changes
-    expected_deselected=[
-        TEST_CALC_ADD,        # only calls add()
-        TEST_CALC_MULTIPLY,   # only calls multiply()
-        TEST_CALC_DIVIDE,     # only calls divide()
-        TEST_CALC_UNKNOWN_OP, # only module-level dep
-        TEST_FMT_UPPER,       # only calls uppercase()
-        TEST_FMT_TITLE,       # only calls capitalize()
-        TEST_FMT_UNKNOWN,     # only module-level dep
-    ],
+    # All tests importing math_utils.py or string_utils.py
+    expected_selected=ALL_CALC_TESTS + ALL_MATH_TESTS + ALL_FMT_TESTS + ALL_STR_TESTS,
+    expected_deselected=[],
 ))
 
 
@@ -562,13 +529,13 @@ ALL_IMPORT_TESTS = [
 
 
 # -----------------------------------------------------------------------------
-# LIMITATION: File dependency not tracked
-# Changes to config.json should trigger tests but currently won't
-# This test should FAIL until file dependency tracking is implemented
+# Non-Python file dependency tracking
+# Tests that read config.json via open() are tracked as dependencies.
+# Ezmon intercepts file I/O and tracks git-committed non-Python files.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_config_file",
-    description="LIMITATION: Change config.json - tests that read it should run",
+    description="Change config.json - tests that read it should run",
     modifications=[
         Modification(
             file="config.json",
@@ -577,9 +544,8 @@ register(Scenario(
             content='"threshold": 75',
         )
     ],
-    # IDEAL behavior: Tests that depend on config.json should be selected
-    # This scenario will FAIL until file dependency tracking is implemented
-    expected_selected=[TEST_CONFIG_PROCESS, TEST_CONFIG_GET_THRESHOLD],
+    # All tests in test_config_reader.py read config.json via load_config()
+    expected_selected=ALL_CONFIG_TESTS,
     expected_deselected=[],
 ))
 
@@ -753,13 +719,11 @@ register(Scenario(
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify math_utils.add() and verify dynamic imports are tracked
-# Tests that use importlib.import_module("src.math_utils") AND call add()
-# should be selected when math_utils.add() body changes.
-# Tests with only module-level deps are NOT selected.
+# With file-level tracking, ALL tests importing math_utils.py are selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_dynamic_import_dependency",
-    description="Dynamic imports - only tests calling add() selected when add() body changes",
+    description="Dynamic imports - all tests importing math_utils.py selected (file-level)",
     modifications=[
         Modification(
             file="src/math_utils.py",
@@ -768,25 +732,13 @@ register(Scenario(
             content="sum_result = a + b\n    return sum_result",
         )
     ],
-    # Tests that actually EXECUTE add() should be selected
+    # All tests importing math_utils.py (including dynamic imports)
     expected_selected=[
-        TEST_DYNAMIC_MATH_ADD,   # calls get_math_add() which uses importlib.import_module and calls add()
-        TEST_DYNAMIC_COMPUTE,    # calls compute_with_dynamic_import() which uses importlib.import_module and calls add()
-        # Also include regular tests that call add()
-        TEST_CALC_ADD,
-        TEST_CALC_HISTORY,
-        TEST_CALC_CLEAR,
-        TEST_MATH_ADD_POS,
-        TEST_MATH_ADD_NEG,
-        TEST_MATH_ADD_MIX,
-    ],
-    expected_deselected=[
-        # Dynamic string import tests that use string_utils, not math_utils
-        TEST_DYNAMIC_CAPITALIZE,
-        TEST_DYNAMIC_FORMAT,
-        # Tests with only module-level dep (don't execute add())
-        TEST_CALC_UNKNOWN_OP,
-    ],
+        TEST_DYNAMIC_MATH_ADD,
+        TEST_DYNAMIC_COMPUTE,
+        # All regular tests that import math_utils.py
+    ] + ALL_CALC_TESTS + ALL_MATH_TESTS,
+    expected_deselected=[],
 ))
 
 
@@ -837,12 +789,11 @@ register(Scenario(
 
 # -----------------------------------------------------------------------------
 # Scenario: Modify helper_not_at_module_level() which is NOT executed at module level
-# Since this function is only called inside test_calls_helper(), only that
-# test should be selected when the function body changes.
+# With file-level tracking, ALL tests importing collection_executed.py are selected.
 # -----------------------------------------------------------------------------
 register(Scenario(
     name="modify_helper_not_collection_time",
-    description="Non-collection function - only test that calls it selected",
+    description="Non-collection function - all tests importing file selected (file-level)",
     modifications=[
         Modification(
             file="src/collection_executed.py",
@@ -851,17 +802,128 @@ register(Scenario(
             content="def helper_not_at_module_level():\n    \"\"\"A function NOT called at module level in any test file.\n\n    Only tests that explicitly call this function depend on it.\n    \"\"\"\n    result = \"helper_result\"\n    return result",
         )
     ],
-    # ONLY test_calls_helper should be selected because it's the only test
-    # that actually calls helper_not_at_module_level().
-    # Other tests don't call it (even though the module is imported).
-    expected_selected=[TEST_COLL_CALLS_HELPER],
-    expected_deselected=[
-        # These tests don't call helper_not_at_module_level()
-        TEST_COLL_USES_COMPUTED,
-        TEST_COLL_USES_STRING,
-        TEST_COLL_USES_BOTH,
-        TEST_COLL_USES_STATIC,
-        TEST_COLL_COMPUTED_PLUS_STATIC,
-        TEST_COLL_NOT_CALLS_HELPER,
+    # All tests importing collection_executed.py
+    expected_selected=ALL_COLLECTION_EXECUTED_TESTS,
+    expected_deselected=[],
+))
+
+
+# =============================================================================
+# CLASS RE-EXPORT SCENARIOS (from package import ClassName)
+# Tests that classes imported via package re-exports are tracked correctly
+#
+# This tests the pattern used by pandas, django, etc.:
+#   from pandas import Series  # Series defined in pandas.core.series
+#   from src.models import User  # User defined in src/models/user.py
+#
+# BUG: Currently the tracker checks hasattr(User, '__file__') which is False
+# for classes. It should also check User.__module__ to find the defining module.
+# =============================================================================
+
+# test_user_only.py tests (imports ONLY User)
+TEST_USER_ONLY_CREATE = "tests/test_user_only.py::TestUserOnly::test_create_user"
+TEST_USER_ONLY_DISPLAY = "tests/test_user_only.py::TestUserOnly::test_user_display"
+
+# test_product_only.py tests (imports ONLY Product)
+TEST_PRODUCT_ONLY_CREATE = "tests/test_product_only.py::TestProductOnly::test_create_product"
+TEST_PRODUCT_ONLY_PRICE = "tests/test_product_only.py::TestProductOnly::test_product_price"
+
+ALL_USER_ONLY_TESTS = [TEST_USER_ONLY_CREATE, TEST_USER_ONLY_DISPLAY]
+ALL_PRODUCT_ONLY_TESTS = [TEST_PRODUCT_ONLY_CREATE, TEST_PRODUCT_ONLY_PRICE]
+
+
+# -----------------------------------------------------------------------------
+# Scenario: from package import ClassName - track to defining module
+#
+# Setup:
+# - test_user_only.py does: `from src.models import User`
+# - test_product_only.py does: `from src.models import Product`
+# - User is defined in src/models/user.py
+# - Product is defined in src/models/product.py
+#
+# When user.py changes:
+# - test_user_only.py tests SHOULD run (imports User from user.py)
+# - test_product_only.py tests SHOULD ALSO run because src/models/__init__.py
+#   imports BOTH user.py and product.py, so Python executes user.py even when
+#   tests only import Product from the package.
+#
+# This reflects the core rule: never deselect files that Python actually
+# imports during test execution (package __init__ side effects included).
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="from_package_import_class",
+    description="from package import ClassName - only tests importing User run when user.py changes",
+    modifications=[
+        Modification(
+            file="src/models/user.py",
+            action="replace",
+            target="return self.name",
+            content="display = self.name\n        return display",
+        )
     ],
+    # Both User-only and Product-only tests run because package __init__ imports both
+    expected_selected=ALL_USER_ONLY_TESTS + ALL_PRODUCT_ONLY_TESTS,
+    expected_deselected=[],
+))
+
+
+# -----------------------------------------------------------------------------
+# Scenario: Modify product.py - verify Product class is tracked correctly
+# Same pattern as above but for the Product class.
+#
+# Note: Due to Python's package import semantics with __init__.py:
+# - test_product_only.py tests SHOULD run (imports Product from product.py)
+# - test_user_only.py tests SHOULD ALSO run because src/models/__init__.py
+#   imports BOTH user.py and product.py, so Python executes product.py even
+#   when tests only import User from the package.
+#
+# This behavior is symmetric with from_package_import_class.
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="from_package_import_class_product",
+    description="from package import ClassName - tests run when product.py changes (via __init__.py)",
+    modifications=[
+        Modification(
+            file="src/models/product.py",
+            action="replace",
+            target='return f"${self.price:.2f}"',
+            content='formatted = f"${self.price:.2f}"\n        return formatted',
+        )
+    ],
+    # Both User-only and Product-only tests run because package __init__ imports both
+    expected_selected=ALL_USER_ONLY_TESTS + ALL_PRODUCT_ONLY_TESTS,
+    expected_deselected=[],
+))
+
+
+# =============================================================================
+# CHANGE DETECTION VERIFICATION SCENARIOS
+# These scenarios verify that file changes are properly detected by the
+# bitmap-based schema. The previous refactoring updated writes but not reads,
+# causing change detection to fail.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Scenario: Verify change detection works end-to-end
+# This is a fundamental sanity check that changes to source files trigger
+# the appropriate test selection. If this fails, the bitmap schema read
+# operations are still pointing at the old empty tables.
+#
+# Note: We use a real code change (not a comment) because comments are
+# stripped by AST parsing and don't trigger checksum changes.
+# -----------------------------------------------------------------------------
+register(Scenario(
+    name="verify_change_detection",
+    description="Verify that file changes are actually detected end-to-end",
+    modifications=[
+        Modification(
+            file="src/math_utils.py",
+            action="append",
+            content="\n\ndef _change_detection_trigger():\n    return 42\n"
+        )
+    ],
+    # All tests that depend on math_utils.py should be selected
+    expected_selected=ALL_CALC_TESTS + ALL_MATH_TESTS,
+    # String utils tests should NOT be selected (no dependency on math_utils)
+    expected_deselected=ALL_STR_TESTS,
 ))

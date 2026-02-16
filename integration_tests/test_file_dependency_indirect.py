@@ -41,6 +41,12 @@ import tempfile
 import sqlite3
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from ezmon.bitmap_deps import TestDeps
+
 
 class Colors:
     GREEN = '\033[92m'
@@ -243,11 +249,25 @@ def create_venv_and_install(workspace: Path) -> Path:
     # Upgrade pip
     subprocess.run([str(pip), "install", "--upgrade", "pip"], capture_output=True)
 
+    # Ensure no previously installed ezmon distribution remains in the venv.
+    subprocess.run(
+        [
+            str(pip),
+            "uninstall",
+            "-y",
+            "pytest-ezmon",
+            "pytest-ezmon-nocov",
+            "ezmon",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
     # Install pytest-ezmon from the parent repo
     repo_root = Path(__file__).parent.parent
     log(f"Installing pytest-ezmon from {repo_root}...")
     result = subprocess.run(
-        [str(pip), "install", str(repo_root)],
+        [str(pip), "install", "--no-cache-dir", "--force-reinstall", str(repo_root)],
         capture_output=True,
         text=True,
     )
@@ -258,7 +278,7 @@ def create_venv_and_install(workspace: Path) -> Path:
     # Install mylib as editable package
     log("Installing mylib...")
     result = subprocess.run(
-        [str(pip), "install", "-e", str(workspace)],
+        [str(pip), "install", "--no-cache-dir", "-e", str(workspace)],
         capture_output=True,
         text=True,
     )
@@ -284,6 +304,7 @@ def run_pytest_ezmon(workspace: Path, python_venv: Path) -> tuple:
         "PYTHONPATH": str(workspace),
         "TESTMON_NET_ENABLED": "false",
     }
+    env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
 
     result = subprocess.run(
         cmd,
@@ -296,12 +317,51 @@ def run_pytest_ezmon(workspace: Path, python_venv: Path) -> tuple:
     return result.returncode, result.stdout, result.stderr
 
 
-def check_file_dependency_recorded(workspace: Path) -> bool:
+def check_file_dependency_recorded(workspace: Path, python_venv: Path) -> bool:
     """Check if config.rs is recorded as a file dependency in the database."""
     db_path = workspace / ".testmondata"
     if not db_path.exists():
         log("Database not found!", "error")
         return False
+
+    if python_venv:
+        check_script = f"""
+import sqlite3
+from ezmon.bitmap_deps import TestDeps
+
+db_path = r\"{db_path}\"
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+cursor = conn.cursor()
+cursor.execute(\"SELECT id FROM files WHERE path LIKE '%config.rs%' AND file_type = 'data'\")
+row = cursor.fetchone()
+if not row:
+    print(\"RESULT=0\")
+    raise SystemExit
+config_id = row[\"id\"]
+rows = cursor.execute(\"SELECT test_id, file_bitmap, external_packages FROM test_deps\").fetchall()
+found = False
+for dep_row in rows:
+    deps = TestDeps.deserialize(
+        test_id=dep_row[\"test_id\"],
+        blob=dep_row[\"file_bitmap\"],
+        external_packages_str=dep_row[\"external_packages\"],
+    )
+    if deps.depends_on_any({{config_id}}):
+        found = True
+        break
+print(\"RESULT=1\" if found else \"RESULT=0\")
+"""
+        result = subprocess.run(
+            [str(python_venv), "-c", check_script],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            log(f"Dependency check failed: {result.stderr}", "error")
+            return False
+        if "RESULT=1" in result.stdout:
+            return True
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -312,36 +372,59 @@ def check_file_dependency_recorded(workspace: Path) -> bool:
     tables = [row['name'] for row in cursor.fetchall()]
     log(f"Database tables: {tables}", "debug")
 
-    # Check file_dependency table for config.rs
-    cursor.execute("SELECT * FROM file_dependency WHERE filename LIKE '%config.rs%'")
-    rows = cursor.fetchall()
-
-    if rows:
-        log(f"Found file dependency records for config.rs: {len(rows)}", "success")
-        for row in rows:
-            log(f"  filename={row['filename']}, sha={row['sha'][:12]}...", "debug")
-        conn.close()
-        return True
-    else:
-        log("No file dependency record for config.rs found", "error")
-
-        # Debug: show what file dependencies ARE recorded
-        cursor.execute("SELECT * FROM file_dependency")
-        all_deps = cursor.fetchall()
-        if all_deps:
-            log("File dependencies found:", "debug")
-            for row in all_deps:
-                log(f"  {row['filename']}", "debug")
-        else:
-            log("No file dependencies recorded at all", "debug")
-
-        # Debug: check test_execution table
-        cursor.execute("SELECT test_name FROM test_execution LIMIT 10")
-        tests = cursor.fetchall()
-        log(f"Test executions recorded: {[row['test_name'] for row in tests]}", "debug")
-
+    # Find config.rs in files table
+    cursor.execute("SELECT id, path FROM files WHERE path LIKE '%config.rs%' AND file_type = 'data'")
+    row = cursor.fetchone()
+    if not row:
+        log("No config.rs entry found in files table", "error")
         conn.close()
         return False
+
+    config_id = row["id"]
+    log(f"Found config.rs in files table: id={config_id}, path={row['path']}", "debug")
+
+    # Check test_deps bitmaps to see if any test depends on config.rs
+    cursor.execute("SELECT test_id, file_bitmap, external_packages FROM test_deps")
+    deps_rows = cursor.fetchall()
+    if not deps_rows:
+        log("No test_deps rows found", "error")
+        conn.close()
+        return False
+
+    depends = False
+    file_ids_seen = set()
+    for dep_row in deps_rows:
+        deps = TestDeps.deserialize(
+            test_id=dep_row["test_id"],
+            blob=dep_row["file_bitmap"],
+            external_packages_str=dep_row["external_packages"],
+        )
+        file_ids_seen.update(deps.get_file_ids_set())
+        if deps.depends_on_any({config_id}):
+            depends = True
+            break
+
+    if depends:
+        log("config.rs recorded as a file dependency", "success")
+        conn.close()
+        return True
+
+    log("config.rs not referenced by any test_deps bitmap", "error")
+    if file_ids_seen:
+        cursor.execute(
+            f"SELECT id, path, file_type FROM files WHERE id IN ({','.join(['?'] * len(file_ids_seen))})",
+            tuple(sorted(file_ids_seen)),
+        )
+        files = cursor.fetchall()
+        log(f"Files referenced by test_deps: {[f'{row['id']}:{row['path']}:{row['file_type']}' for row in files]}", "debug")
+
+    # Debug: check tests table
+    cursor.execute("SELECT name FROM tests LIMIT 10")
+    tests = cursor.fetchall()
+    log(f"Tests recorded: {[row['name'] for row in tests]}", "debug")
+
+    conn.close()
+    return False
 
 
 def modify_config_rs(workspace: Path):
@@ -416,7 +499,7 @@ def run_test():
 
         # Step 2: Check if config.rs is recorded as file dependency
         print(f"\n{Colors.BOLD}Step 2: Check file dependency recording{Colors.END}")
-        if not check_file_dependency_recorded(workspace):
+        if not check_file_dependency_recorded(workspace, python_venv):
             log("FAILED: config.rs not recorded as file dependency", "error")
             return False
 

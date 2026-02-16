@@ -223,6 +223,16 @@ class NetDBIntegrationTestRunner:
             capture_output=True,
         )
         subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=workspace,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=workspace,
+            capture_output=True,
+        )
+        subprocess.run(
             ["git", "add", "."],
             cwd=workspace,
             capture_output=True,
@@ -266,13 +276,34 @@ class NetDBIntegrationTestRunner:
             capture_output=not self.verbose,
         )
 
+        # Ensure we always install exactly one ezmon plugin distribution.
+        subprocess.run(
+            [
+                str(pip),
+                "uninstall",
+                "-y",
+                "pytest-ezmon",
+                "pytest-ezmon-nocov",
+                "ezmon",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
         # Install ezmon from local repo
         install_spec = str(REPO_ROOT) if is_valid_ezmon_repo(REPO_ROOT) else "pytest-ezmon"
         self.log(f"Installing pytest-ezmon from: {install_spec}", "debug")
 
         # Install ezmon and its dependencies
         result = subprocess.run(
-            [str(pip), "install", install_spec, "requests"],
+            [
+                str(pip),
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                install_spec,
+                "requests",
+            ],
             capture_output=True,
             text=True,
         )
@@ -318,6 +349,7 @@ class NetDBIntegrationTestRunner:
             "JOB_ID": job_id,
             "RUN_ID": self.run_id,
         }
+        test_env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
         if self.auth_token:
             test_env["TESTMON_AUTH_TOKEN"] = self.auth_token
 
@@ -428,11 +460,18 @@ class NetDBIntegrationTestRunner:
                     cwd=workspace,
                     capture_output=True,
                 )
-                subprocess.run(
-                    ["git", "commit", "-m", f"Apply modifications for {scenario.name}"],
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
                     cwd=workspace,
                     capture_output=True,
+                    text=True,
                 )
+                if status.stdout.strip():
+                    subprocess.run(
+                        ["git", "commit", "-m", f"Apply modifications for {scenario.name}"],
+                        cwd=workspace,
+                        capture_output=True,
+                    )
 
             # Run again after modifications
             self.log("Running pytest --ezmon after modifications...", "debug")

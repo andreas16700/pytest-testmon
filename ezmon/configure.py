@@ -1,11 +1,6 @@
 import sys
 import re
 
-try:
-    from coverage.tracer import CTracer as Tracer  # pylint: disable=no-name-in-module
-except ImportError:
-    from coverage.pytracer import PyTracer as Tracer
-
 from dataclasses import dataclass
 
 
@@ -14,7 +9,8 @@ def _is_dogfooding(coverage_stack):
 
 
 def _is_debugger():
-    return sys.gettrace() and not isinstance(sys.gettrace(), Tracer)
+    # In nocov mode, we don't track via sys.settrace, so debugger is always "compatible"
+    return False
 
 
 def _is_coverage():
@@ -22,7 +18,7 @@ def _is_coverage():
 
 
 def _get_notestmon_reasons(options):
-    if options["no-ezmon"]:
+    if options.get("no-ezmon") or options.get("no_ezmon"):
         return "deactivated through --no-ezmon"
 
     if not any(
