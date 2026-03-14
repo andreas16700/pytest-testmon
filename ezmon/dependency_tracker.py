@@ -1,10 +1,16 @@
 """
 Dependency tracking for ezmon.
 
-This tracker captures dependencies at three levels without sys.modules checkpointing:
-1. Global: dependencies seen before test-file collection starts (e.g. conftest imports)
-2. Test-file: dependencies newly seen while collecting each test file
-3. Test: dependencies newly seen while running each individual test
+Event-driven model:
+1. on_collect_file_start(test_file): establish global checkpoint once, then keep
+   per-file collection context.
+2. on_test_start(test_id, test_file): establish file checkpoint once, then restore
+   to global+file state for subsequent tests.
+3. on_test_end(test_id): compute per-test unique module/read deltas.
+
+Checkpoints are tracked as:
+- module key sets (sys.modules keys)
+- file-read sets (TrackedFile entries)
 """
 
 import builtins
@@ -19,26 +25,13 @@ import types
 from functools import lru_cache
 from typing import Dict, NamedTuple, Optional, Set, Tuple
 
-from ezmon.common import get_logger
 from ezmon.file_cache import FileInfoCache
 from ezmon.trie import get_encoder
 
-logger = get_logger(__name__)
-
 
 class TrackedFile(NamedTuple):
-    """A tracked file dependency."""
-
-    path: str  # Relative path from rootdir or encoded path
-    sha: Optional[str]  # Git blob SHA (None if deferred)
-
-
-class TrackedImport(NamedTuple):
-    """A tracked import dependency."""
-
-    name: str
     path: str
-    is_local: bool
+    sha: Optional[str]
 
 
 def _get_stdlib_prefix() -> str:
@@ -67,8 +60,6 @@ _STDLIB_NAMES = getattr(sys, "stdlib_module_names", frozenset())
 
 
 class DependencyTracker:
-    """Tracks file and import dependencies during collection and test execution."""
-
     def __init__(self, rootdir: str):
         self.rootdir = os.path.realpath(rootdir)
         self._root_prefix = self.rootdir + os.sep
@@ -78,47 +69,64 @@ class DependencyTracker:
         self._lock = threading.RLock()
         self._file_cache = FileInfoCache(self.rootdir)
 
-        # Original functions to restore
         self._original_open = None
         self._original_io_open = None
         self._original_import = None
         self._original_import_module = None
 
-        # Activity state
-        self._active = False  # Test-level tracking active
+        # Session/checkpoint state
+        self._session_started = False
         self._collection_mode = False
-        self._global_tracking_active = False
-        self._collection_context: Optional[str] = None
+        self._session_start_module_keys: Set[str] = set()
+        self._global_module_keys: Optional[Set[str]] = None
+        self._global_unique_module_keys: Set[str] = set()
+        self._file_module_keys: Dict[str, Set[str]] = {}
+        self._global_seen_module_keys: Set[str] = set()
+        self._file_seen_module_keys: Dict[str, Set[str]] = {}
+
+        self._active_collection_file: Optional[str] = None
+
+        self._stdlib_keep_keys: Set[str] = set()
+        self._stdlib_keep_tops: Set[str] = set()
+
+        self._real_modules: Dict[str, types.ModuleType] = {}
+
+        # Read checkpoints
+        self._global_file_reads: Set[TrackedFile] = set()
+        self._file_file_reads: Dict[str, Set[TrackedFile]] = {}
+
+        # Runtime test scope
+        self._active = False
         self._current_context: Optional[str] = None
         self._current_test_file: Optional[str] = None
+        self._test_files: Dict[str, str] = {}
+        self._current_test_reads: Set[TrackedFile] = set()
+        self._current_test_seen_module_keys: Set[str] = set()
 
-        # Per-test tracked deltas (returned by stop/end_test)
         self._tracked_files: Dict[str, Set[TrackedFile]] = {}
         self._tracked_local_imports: Dict[str, Set[str]] = {}
         self._tracked_external_imports: Dict[str, Set[str]] = {}
-        self._test_files: Dict[str, str] = {}
 
-        # Global-level dependencies (before per-file collection context is set)
-        self._global_file_deps: Set[TrackedFile] = set()
-        self._global_local_imports: Set[str] = set()
-        self._global_external_imports: Set[str] = set()
-
-        # Backwards-compatible aliases consumed by existing code
-        self._checkpoint_file_deps = self._global_file_deps
-        self._checkpoint_local_imports = self._global_local_imports
-
-        # Per-test-file collection-time deltas (new after global)
-        self._collection_file_deps: Dict[str, Set[TrackedFile]] = {}
+        # Back-compat public attributes used elsewhere
+        self._checkpoint_file_deps = self._global_file_reads
+        self._checkpoint_local_imports: Set[str] = set()
+        self._collection_file_deps = self._file_file_reads
         self._collection_local_imports: Dict[str, Set[str]] = {}
         self._collection_external_imports: Dict[str, Set[str]] = {}
 
-        # Caches
+        # Resolution caches
         self._path_cache: Dict[str, Optional[str]] = {}
         self._module_kind_cache: Dict[str, str] = {}
-        self._local_packages_cache: Dict[str, bool] = {}
+        self._module_dep_cache: Dict[str, Tuple[Optional[str], Optional[TrackedFile], Optional[str]]] = {}
         self._local_pkgs = self._scan_local_packages()
 
-        # Directories to skip
+        # Filters
+        self._expected_imports: Optional[Set[str]] = None
+        self._expected_reads: Optional[Set[str]] = None
+        self._expected_packages: Optional[Set[str]] = None
+        self._expected_package_index: Optional[Dict[str, int]] = None
+        self._compute_shas = True
+
         self._skip_dirs = frozenset(
             [
                 ".venv",
@@ -135,18 +143,13 @@ class DependencyTracker:
             ]
         )
 
-        # Expected tracking filters (None means track all)
-        self._expected_imports: Optional[Set[str]] = None
-        self._expected_reads: Optional[Set[str]] = None
-        self._expected_packages: Optional[Set[str]] = None
-        self._compute_shas = True
-        self._expected_package_index: Optional[Dict[str, int]] = None
+    # ---------------------------------------------------------------------
+    # Utilities
+    # ---------------------------------------------------------------------
 
     def _scan_local_packages(self) -> Set[str]:
-        """Best-effort scan of local package/module roots under project paths."""
         pkgs: Set[str] = set()
-        search_dirs = ["", "src", "lib", "source", "packages"]
-        for search_dir in search_dirs:
+        for search_dir in ("", "src", "lib", "source", "packages"):
             root = os.path.join(self.rootdir, search_dir) if search_dir else self.rootdir
             try:
                 for entry in os.scandir(root):
@@ -159,15 +162,24 @@ class DependencyTracker:
                 continue
         return pkgs
 
+    def _snapshot_module_keys(self) -> Set[str]:
+        return set(sys.modules.keys())
+
+    def _refresh_real_modules(self) -> None:
+        for key, module in sys.modules.items():
+            if isinstance(module, types.ModuleType):
+                self._real_modules[key] = module
+
     def _is_in_project(self, filepath: str) -> Optional[str]:
-        """Return normalized relpath when filepath belongs to project; else None."""
-        if filepath in self._path_cache:
-            return self._path_cache[filepath]
+        if not filepath:
+            return None
+        cached = self._path_cache.get(filepath)
+        if cached is not None:
+            return cached
 
         try:
             abspath = os.path.realpath(filepath)
             relpath = os.path.relpath(abspath, self.rootdir)
-
             if relpath.startswith("..") or os.path.isabs(relpath):
                 self._path_cache[filepath] = None
                 return None
@@ -181,12 +193,11 @@ class DependencyTracker:
             relpath = relpath.replace(os.sep, "/")
             self._path_cache[filepath] = relpath
             return relpath
-        except (ValueError, TypeError):
+        except Exception:
             self._path_cache[filepath] = None
             return None
 
     def _get_committed_file_sha(self, relpath: str) -> Optional[str]:
-        """Return git blob SHA for relpath tracked in repo, else None."""
         cache_key = f"git_sha:{relpath}"
         if cache_key in self._path_cache:
             return self._path_cache[cache_key]
@@ -195,7 +206,6 @@ class DependencyTracker:
         return sha
 
     def _get_module_filepath(self, module) -> Optional[str]:
-        """Resolve module file path from spec/file attributes."""
         spec = getattr(module, "__spec__", None)
         origin = getattr(spec, "origin", None) if spec else None
         if spec and getattr(spec, "has_location", False) and origin:
@@ -210,7 +220,7 @@ class DependencyTracker:
                 source_path = importlib.util.source_from_cache(filepath)
                 if source_path and os.path.exists(source_path):
                     filepath = source_path
-            except (ImportError, ValueError, TypeError):
+            except Exception:
                 source_path = filepath[:-1]
                 if os.path.exists(source_path):
                     filepath = source_path
@@ -218,15 +228,14 @@ class DependencyTracker:
         return os.path.realpath(filepath)
 
     def _module_kind(self, mod_name: str, module=None) -> str:
-        """Classify module as local|external|stdlib."""
         cached = self._module_kind_cache.get(mod_name)
         if cached is not None:
             return cached
 
         if module is None:
-            module = sys.modules.get(mod_name)
-        top = mod_name.split(".")[0]
+            module = sys.modules.get(mod_name) or self._real_modules.get(mod_name)
 
+        top = mod_name.split(".")[0]
         filepath = self._get_module_filepath(module) if module else None
         if filepath:
             if filepath.startswith(self._stdlib_prefix):
@@ -251,69 +260,209 @@ class DependencyTracker:
         return kind
 
     def _local_source(self, mod_name: str) -> Optional[str]:
-        """Map module name to local .py source under root, if present."""
         parts = mod_name.split(".")
-        pkg_init = os.path.join(self.rootdir, *parts, "__init__.py")
-        if os.path.isfile(pkg_init):
-            return pkg_init
-        module_py = os.path.join(self.rootdir, *parts) + ".py"
-        if os.path.isfile(module_py):
-            return module_py
-
-        for prefix in ("src", "lib", "source", "packages"):
-            pkg_init = os.path.join(self.rootdir, prefix, *parts, "__init__.py")
+        for prefix in ("", "src", "lib", "source", "packages"):
+            base = os.path.join(self.rootdir, prefix) if prefix else self.rootdir
+            pkg_init = os.path.join(base, *parts, "__init__.py")
             if os.path.isfile(pkg_init):
                 return pkg_init
-            module_py = os.path.join(self.rootdir, prefix, *parts) + ".py"
+            module_py = os.path.join(base, *parts) + ".py"
             if os.path.isfile(module_py):
                 return module_py
-
         return None
 
-    def _get_module_file(self, module) -> Optional[Tuple[str, bool]]:
-        """Resolve module to tracked project file.
+    def _classify_and_capture_stdlib(self, module_keys: Set[str]) -> Set[str]:
+        stdlib_keys: Set[str] = set()
+        for mod_name in module_keys:
+            top = mod_name.split(".")[0]
+            if top in _STDLIB_NAMES:
+                stdlib_keys.add(mod_name)
+                self._stdlib_keep_keys.add(mod_name)
+                self._stdlib_keep_tops.add(top)
+                continue
 
-        Returns (path, is_python_file) where path is encoded if expected filters are active.
-        """
+            module = sys.modules.get(mod_name) or self._real_modules.get(mod_name)
+            if module is None:
+                continue
+            if self._module_kind(mod_name, module) == "stdlib":
+                stdlib_keys.add(mod_name)
+                self._stdlib_keep_keys.add(mod_name)
+                self._stdlib_keep_tops.add(top)
+        return stdlib_keys
+
+    def _process_checkpoint_delta(self, current_keys: Set[str], base_keys: Set[str]) -> Set[str]:
+        delta = current_keys - base_keys
+        stdlib_delta = self._classify_and_capture_stdlib(delta)
+        return delta - stdlib_delta
+
+    def _restore_to_module_checkpoint(self, keep_non_stdlib_keys: Set[str]) -> None:
+        keep = set(keep_non_stdlib_keys) | self._stdlib_keep_keys
+        current = set(sys.modules.keys())
+
+        # remove everything not in target keep set, except stdlib tops
+        to_remove = current - keep
+        for key in to_remove:
+            if key.split(".")[0] in self._stdlib_keep_tops:
+                continue
+            sys.modules.pop(key, None)
+
+        # rehydrate missing keep keys from real module cache
+        missing = keep - set(sys.modules.keys())
+        for key in missing:
+            module = self._real_modules.get(key)
+            if module is not None:
+                sys.modules[key] = module
+
+    def _resolve_module_key(self, mod_name: str) -> Tuple[Optional[str], Optional[TrackedFile], Optional[str]]:
+        cached = self._module_dep_cache.get(mod_name)
+        if cached is not None:
+            return cached
+
+        local_dep: Optional[str] = None
+        file_dep: Optional[TrackedFile] = None
+        external_dep: Optional[str] = None
+
+        module = sys.modules.get(mod_name) or self._real_modules.get(mod_name)
         if module is None:
-            return None
+            out = (None, None, None)
+            self._module_dep_cache[mod_name] = out
+            return out
 
         filepath = self._get_module_filepath(module)
         relpath = self._is_in_project(filepath) if filepath else None
 
-        # Local namespace/builtins without __file__: map via module name when local.
-        if not relpath:
-            mod_name = getattr(module, "__name__", None)
-            if mod_name and mod_name.split(".")[0] in self._local_pkgs:
-                local_source = self._local_source(mod_name)
-                if local_source:
-                    relpath = self._is_in_project(local_source)
-
-        if not relpath:
-            return None
-
-        encoder = get_encoder(self.rootdir)
-
-        if relpath.endswith(".py"):
+        if relpath and relpath.endswith(".py"):
             if self._expected_imports is not None:
-                encoded = encoder.encode(relpath)
-                if encoded not in self._expected_imports:
-                    return None
-                return encoded, True
-            if self._file_cache.is_tracked(relpath):
-                return relpath, True
-            return None
+                encoded = get_encoder(self.rootdir).encode(relpath)
+                if encoded in self._expected_imports:
+                    local_dep = encoded
+            elif self._file_cache.is_tracked(relpath):
+                local_dep = relpath
+            out = (local_dep, None, None)
+            self._module_dep_cache[mod_name] = out
+            return out
 
+        if relpath and not relpath.endswith(".py"):
+            encoded_or_rel = relpath
+            if self._expected_reads is not None:
+                encoded = get_encoder(self.rootdir).encode(relpath)
+                if encoded not in self._expected_reads:
+                    out = (None, None, None)
+                    self._module_dep_cache[mod_name] = out
+                    return out
+                encoded_or_rel = encoded
+
+            sha = None
+            if self._compute_shas:
+                sha = self._get_committed_file_sha(relpath)
+                if not sha:
+                    out = (None, None, None)
+                    self._module_dep_cache[mod_name] = out
+                    return out
+            file_dep = TrackedFile(path=encoded_or_rel, sha=sha)
+            out = (None, file_dep, None)
+            self._module_dep_cache[mod_name] = out
+            return out
+
+        kind = self._module_kind(mod_name, module)
+        if kind == "local":
+            source = self._local_source(mod_name)
+            rel = self._is_in_project(source) if source else None
+            if rel and rel.endswith(".py"):
+                if self._expected_imports is not None:
+                    encoded = get_encoder(self.rootdir).encode(rel)
+                    if encoded in self._expected_imports:
+                        local_dep = encoded
+                else:
+                    local_dep = rel
+        elif kind == "external":
+            pkg = mod_name.split(".")[0]
+            if pkg and pkg not in _STDLIB_NAMES and not pkg.startswith("_"):
+                if self._expected_packages is not None:
+                    encoded_pkg = (
+                        self._expected_package_index.get(pkg, pkg)
+                        if self._expected_package_index is not None
+                        else pkg
+                    )
+                    if encoded_pkg in self._expected_packages:
+                        external_dep = encoded_pkg
+                elif self._expected_package_index is not None:
+                    external_dep = self._expected_package_index.get(pkg, pkg)
+                else:
+                    external_dep = pkg
+
+        out = (local_dep, file_dep, external_dep)
+        self._module_dep_cache[mod_name] = out
+        return out
+
+    def _resolve_module_key_set(self, module_keys: Set[str]) -> Tuple[Set[str], Set[TrackedFile], Set[str]]:
+        local_imports: Set[str] = set()
+        file_deps: Set[TrackedFile] = set()
+        external_imports: Set[str] = set()
+        for key in module_keys:
+            local_dep, file_dep, external_dep = self._resolve_module_key(key)
+            if local_dep:
+                local_imports.add(local_dep)
+            if file_dep:
+                file_deps.add(file_dep)
+            if external_dep:
+                external_imports.add(external_dep)
+        return local_imports, file_deps, external_imports
+
+    # ---------------------------------------------------------------------
+    # Hooked functions
+    # ---------------------------------------------------------------------
+
+    def _track_file(self, filepath: str, mode: str) -> None:
+        if "r" not in mode and "+" not in mode:
+            return
+
+        relpath = self._is_in_project(filepath)
+        if not relpath or relpath.endswith(".py"):
+            return
+
+        path = relpath
         if self._expected_reads is not None:
-            encoded = encoder.encode(relpath)
+            encoded = get_encoder(self.rootdir).encode(relpath)
             if encoded not in self._expected_reads:
-                return None
-            return encoded, False
+                return
+            path = encoded
 
-        sha = self._get_committed_file_sha(relpath)
-        if sha:
-            return relpath, False
-        return None
+        sha = None
+        if self._compute_shas:
+            sha = self._get_committed_file_sha(relpath)
+            if not sha:
+                return
+
+        tracked = TrackedFile(path=path, sha=sha)
+
+        if self._active and self._current_context:
+            self._current_test_reads.add(tracked)
+            return
+
+        if not self._collection_mode:
+            return
+
+        if self._global_module_keys is None:
+            self._global_file_reads.add(tracked)
+            return
+
+        if self._active_collection_file:
+            self._file_file_reads.setdefault(self._active_collection_file, set()).add(tracked)
+
+    def _tracking_open(self, file, mode="r", *args, **kwargs):
+        result = self._original_open(file, mode, *args, **kwargs)
+        if self._collection_mode or self._active:
+            try:
+                path = os.fspath(file)
+            except Exception:
+                path = None
+            if path:
+                try:
+                    self._track_file(path, mode)
+                except Exception:
+                    pass
+        return result
 
     def _resolve_name(self, name, globals_dict, level) -> str:
         if level == 0:
@@ -326,260 +475,103 @@ class DependencyTracker:
         except Exception:
             return name
 
-    def _record_file_dep(self, tracked_file: TrackedFile) -> None:
-        """Route a tracked file dependency to global/file/test scopes."""
-        in_test_mode = self._active and self._current_context
-
-        if self._collection_mode:
-            if self._collection_context:
-                if tracked_file not in self._global_file_deps:
-                    self._collection_file_deps.setdefault(self._collection_context, set()).add(tracked_file)
-            elif self._global_tracking_active:
-                self._global_file_deps.add(tracked_file)
-
-        if in_test_mode:
-            ctx = self._current_context
-            self._tracked_files.setdefault(ctx, set()).add(tracked_file)
-
-    def _record_local_import(self, relpath: str) -> None:
-        """Route a local python import to global/file/test scopes."""
-        in_test_mode = self._active and self._current_context
-
-        if self._collection_mode:
-            if self._collection_context:
-                if relpath not in self._global_local_imports:
-                    self._collection_local_imports.setdefault(self._collection_context, set()).add(relpath)
-            elif self._global_tracking_active:
-                self._global_local_imports.add(relpath)
-
-        if in_test_mode:
-            ctx = self._current_context
-            self._tracked_local_imports.setdefault(ctx, set()).add(relpath)
-
-    def _record_external_import(self, pkg_name: str) -> None:
-        """Route an external package dependency to global/file/test scopes."""
-        in_test_mode = self._active and self._current_context
-
-        if self._expected_packages is not None:
-            encoded_pkg = (
-                self._expected_package_index.get(pkg_name, pkg_name)
-                if self._expected_package_index is not None
-                else pkg_name
-            )
-            if encoded_pkg not in self._expected_packages:
-                return
-            pkg_name = encoded_pkg
-        elif self._expected_package_index is not None:
-            pkg_name = self._expected_package_index.get(pkg_name, pkg_name)
-
-        if self._collection_mode:
-            if self._collection_context:
-                if pkg_name not in self._global_external_imports:
-                    self._collection_external_imports.setdefault(self._collection_context, set()).add(pkg_name)
-            elif self._global_tracking_active:
-                self._global_external_imports.add(pkg_name)
-
-        if in_test_mode:
-            ctx = self._current_context
-            self._tracked_external_imports.setdefault(ctx, set()).add(pkg_name)
-
-    def _record_import_name(self, mod_name: str) -> None:
-        """Record a single module name dependency from sys.modules."""
-        if not mod_name:
-            return
-
-        module = sys.modules.get(mod_name)
-        if module is None:
-            return
-
-        module_info = self._get_module_file(module)
-        if module_info:
-            path, is_python = module_info
-            if is_python:
-                self._record_local_import(path)
-            else:
-                # For encoded paths we need original relpath to resolve git sha.
-                relpath_for_sha = path
-                if self._expected_reads is not None:
-                    try:
-                        decoded = get_encoder(self.rootdir).decode(path)
-                        if str(decoded).startswith(str(self.rootdir)):
-                            relpath_for_sha = str(decoded.relative_to(self.rootdir))
-                        else:
-                            relpath_for_sha = str(decoded)
-                    except Exception:
-                        relpath_for_sha = path
-
-                sha = None
-                if self._compute_shas:
-                    sha = self._get_committed_file_sha(relpath_for_sha)
-                    if not sha:
-                        return
-
-                self._record_file_dep(TrackedFile(path=path, sha=sha))
-            return
-
-        kind = self._module_kind(mod_name, module)
-        if kind == "stdlib":
-            return
-        if kind == "local":
-            # Local module not resolved from __file__; map by name.
-            local_source = self._local_source(mod_name)
-            if local_source:
-                relpath = self._is_in_project(local_source)
-                if relpath and relpath.endswith(".py"):
-                    if self._expected_imports is not None:
-                        encoded = get_encoder(self.rootdir).encode(relpath)
-                        if encoded not in self._expected_imports:
-                            return
-                        relpath = encoded
-                    self._record_local_import(relpath)
-            return
-
-        pkg_name = mod_name.split(".")[0]
-        if not pkg_name or pkg_name.startswith("_"):
-            return
-        if pkg_name in _STDLIB_NAMES:
-            return
-        self._record_external_import(pkg_name)
-
-    def _track_file(self, filepath: str, mode: str) -> None:
-        """Track a file read operation."""
-        should_track = self._collection_mode or (self._active and self._current_context)
-        if not should_track:
-            return
-        if "r" not in mode and "+" not in mode:
-            return
-
-        relpath = self._is_in_project(filepath)
-        if not relpath or relpath.endswith(".py"):
-            return
-
-        original_relpath = relpath
-        if self._expected_reads is not None:
-            encoded = get_encoder(self.rootdir).encode(relpath)
-            if encoded not in self._expected_reads:
-                return
-            relpath = encoded
-
-        sha = None
-        if self._compute_shas:
-            sha = self._get_committed_file_sha(original_relpath)
-            if not sha:
-                return
-
-        self._record_file_dep(TrackedFile(path=relpath, sha=sha))
-
-    def _tracking_open(self, file, mode="r", *args, **kwargs):
-        """Replacement for builtins.open that tracks file access."""
-        result = self._original_open(file, mode, *args, **kwargs)
-        if self._collection_mode or self._active:
-            if isinstance(file, str):
-                filepath = file
-            elif isinstance(file, os.PathLike):
-                filepath = os.fspath(file)
-            else:
-                filepath = None
-            if filepath:
-                try:
-                    self._track_file(filepath, mode)
-                except Exception:
-                    pass
-        return result
-
     def _tracking_import(self, name, globals=None, locals=None, fromlist=(), level=0):
-        """Replacement for builtins.__import__ that tracks import dependencies."""
-        should_track = self._collection_mode or (self._active and self._current_context)
+        resolved = self._resolve_name(name, globals, level)
+        requested: Set[str] = set()
+        if resolved:
+            parts = resolved.split(".")
+            requested.update(".".join(parts[: i + 1]) for i in range(len(parts)))
+            for attr in fromlist or ():
+                if attr != "*":
+                    requested.add(f"{resolved}.{attr}")
 
-        resolved_name = self._resolve_name(name, globals, level)
-        names = []
-        if resolved_name:
-            parts = resolved_name.split(".")
-            names.extend(".".join(parts[: i + 1]) for i in range(len(parts)))
-            if fromlist:
-                for attr in fromlist:
-                    if attr != "*":
-                        names.append(f"{resolved_name}.{attr}")
+        for mod_name in requested:
+            if mod_name not in sys.modules:
+                module = self._real_modules.get(mod_name)
+                if module is not None:
+                    sys.modules[mod_name] = module
 
         result = self._original_import(name, globals, locals, fromlist, level)
 
-        if should_track:
-            try:
-                # Import path hierarchy + fromlist candidates.
-                for mod_name in names:
-                    self._record_import_name(mod_name)
+        known = set(requested)
+        try:
+            result_name = getattr(result, "__name__", None)
+            if result_name:
+                known.add(result_name)
+            for attr in fromlist or ():
+                if attr == "*":
+                    continue
+                obj = getattr(result, attr, None)
+                if isinstance(obj, types.ModuleType):
+                    n = getattr(obj, "__name__", None)
+                    if n:
+                        known.add(n)
+        except Exception:
+            pass
 
-                # Track returned module itself.
-                result_name = getattr(result, "__name__", None)
-                if result_name:
-                    self._record_import_name(result_name)
-                    # For local package imports, also include already-loaded
-                    # local submodules under that package. This keeps dependency
-                    # attribution stable whether submodules were loaded earlier
-                    # or loaded fresh in this import.
-                    should_expand_package = bool(fromlist) or (name == result_name)
-                    if (
-                        should_expand_package
-                        and hasattr(result, "__path__")
-                        and self._module_kind(result_name, result) == "local"
-                    ):
-                        prefix = result_name + "."
-                        for dep_name in list(sys.modules.keys()):
-                            if dep_name.startswith(prefix):
-                                self._record_import_name(dep_name)
-
-                # For `from X import Y`, Y may be class/function; track defining module.
-                for attr_name in fromlist or ():
-                    if attr_name == "*":
-                        continue
-                    imported_obj = getattr(result, attr_name, None)
-                    if imported_obj is None:
-                        continue
-                    if isinstance(imported_obj, types.ModuleType):
-                        self._record_import_name(getattr(imported_obj, "__name__", ""))
-                    else:
-                        defining_mod = getattr(imported_obj, "__module__", None)
-                        if defining_mod:
-                            self._record_import_name(defining_mod)
-            except Exception:
-                pass
+        for mod_name in known:
+            module = sys.modules.get(mod_name)
+            if isinstance(module, types.ModuleType):
+                self._real_modules[mod_name] = module
+        self._record_seen_module_keys(known)
 
         return result
 
     def _tracking_import_module(self, name, package=None):
-        """Replacement for importlib.import_module that tracks dependencies."""
+        abs_name = name
+        if name.startswith("."):
+            if package is None:
+                return self._original_import_module(name, package)
+            try:
+                abs_name = importlib.util.resolve_name(name, package)
+            except Exception:
+                abs_name = name
+
+        if abs_name:
+            parts = abs_name.split(".")
+            for i in range(len(parts)):
+                mod_name = ".".join(parts[: i + 1])
+                if mod_name not in sys.modules:
+                    module = self._real_modules.get(mod_name)
+                    if module is not None:
+                        sys.modules[mod_name] = module
+
         result = self._original_import_module(name, package)
 
-        should_track = self._collection_mode or (self._active and self._current_context)
-        if not should_track:
-            return result
-
         try:
-            if name.startswith("."):
-                if package is None:
-                    return result
-                abs_name = importlib.util.resolve_name(name, package)
-            else:
-                abs_name = name
-            self._record_import_name(abs_name)
-            module_name = getattr(result, "__name__", None)
-            if module_name:
-                self._record_import_name(module_name)
+            known: Set[str] = set()
+            if abs_name:
+                parts = abs_name.split(".")
+                for i in range(len(parts)):
+                    mod_name = ".".join(parts[: i + 1])
+                    known.add(mod_name)
+                    module = sys.modules.get(mod_name)
+                    if isinstance(module, types.ModuleType):
+                        self._real_modules[mod_name] = module
+            result_name = getattr(result, "__name__", None)
+            if result_name and isinstance(sys.modules.get(result_name), types.ModuleType):
+                self._real_modules[result_name] = sys.modules[result_name]
+                known.add(result_name)
+            self._record_seen_module_keys(known)
         except Exception:
             pass
 
         return result
 
-    @lru_cache(maxsize=256)
-    def _is_installed_package(self, pkg_name: str) -> bool:
-        try:
-            spec = importlib.util.find_spec(pkg_name)
-            return spec is not None
-        except (ModuleNotFoundError, ImportError, ValueError):
-            return False
+    def _record_seen_module_keys(self, names: Set[str]) -> None:
+        if not names:
+            return
+        if self._active and self._current_context:
+            self._current_test_seen_module_keys.update(names)
+            return
+        if not self._collection_mode:
+            return
+        if self._global_module_keys is None or not self._active_collection_file:
+            self._global_seen_module_keys.update(names)
+            return
+        self._file_seen_module_keys.setdefault(self._active_collection_file, set()).update(names)
 
     def _install_hooks(self) -> None:
-        """Install tracking hooks for open() and imports."""
         if self._original_open is None:
             self._original_open = builtins.open
             builtins.open = self._tracking_open
@@ -594,7 +586,6 @@ class DependencyTracker:
             importlib.import_module = self._tracking_import_module
 
     def _restore_hooks(self) -> None:
-        """Restore all original functions."""
         if self._original_open is not None:
             builtins.open = self._original_open
             self._original_open = None
@@ -607,7 +598,10 @@ class DependencyTracker:
         if self._original_import_module is not None:
             importlib.import_module = self._original_import_module
             self._original_import_module = None
-        self._active = False
+
+    # ---------------------------------------------------------------------
+    # External configuration
+    # ---------------------------------------------------------------------
 
     def set_expected(
         self,
@@ -632,161 +626,297 @@ class DependencyTracker:
         with self._lock:
             self._expected_package_index = package_index
 
-    # =========================================================================
-    # Collection-time tracking methods
-    # =========================================================================
+    # ---------------------------------------------------------------------
+    # Event model
+    # ---------------------------------------------------------------------
 
     def start_collection_tracking(self) -> None:
-        """Start tracking dependencies during collection phase."""
         with self._lock:
             self._collection_mode = True
-            self._global_tracking_active = True
-            self._collection_context = None
-            self._global_file_deps.clear()
-            self._global_local_imports.clear()
-            self._global_external_imports.clear()
-            self._collection_file_deps = {}
-            self._collection_local_imports = {}
-            self._collection_external_imports = {}
+            self._session_started = True
+            self._active = False
+            self._active_collection_file = None
+
+            self._session_start_module_keys = self._snapshot_module_keys()
+            self._refresh_real_modules()
+
+            self._global_module_keys = None
+            self._global_unique_module_keys = set()
+            self._file_module_keys = {}
+            self._global_seen_module_keys = set()
+            self._file_seen_module_keys = {}
+
+            self._stdlib_keep_keys = set()
+            self._stdlib_keep_tops = set()
+
+            self._global_file_reads.clear()
+            self._file_file_reads = {}
+
+            self._tracked_files.clear()
+            self._tracked_local_imports.clear()
+            self._tracked_external_imports.clear()
+            self._test_files.clear()
+            self._current_context = None
+            self._current_test_file = None
+            self._current_test_reads = set()
+
             self._module_kind_cache.clear()
+            self._module_dep_cache.clear()
+            self._path_cache.clear()
+
             self._install_hooks()
 
-    def stop_global_tracking(self) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
-        """Freeze global collection phase and return global dependencies."""
-        with self._lock:
-            self._global_tracking_active = False
-            return (
-                self._global_file_deps.copy(),
-                self._global_local_imports.copy(),
-                self._global_external_imports.copy(),
-            )
+    def mark_collection_started(self) -> None:
+        # No-op in event model; global checkpoint is established at first
+        # on_collect_file_start.
+        return
 
-    def start_file_tracking(self, test_file: str) -> None:
-        """Start collection tracking for a specific test file."""
-        self.set_collection_context(test_file)
-
-    def stop_file_tracking(self, test_file: Optional[str] = None) -> None:
-        """Stop collection tracking for the current test file context."""
-        with self._lock:
-            if test_file is None or self._collection_context == test_file:
-                self._collection_context = None
-
-    def set_collection_context(self, test_file: str) -> None:
-        """Set current test file being collected."""
-        with self._lock:
-            if self._global_tracking_active:
-                self._global_tracking_active = False
-            self._collection_context = test_file
-            self._collection_file_deps.setdefault(test_file, set())
-            self._collection_local_imports.setdefault(test_file, set())
-            self._collection_external_imports.setdefault(test_file, set())
-
-    def clear_collection_context(self) -> None:
-        """Clear current collection context."""
-        with self._lock:
-            self._collection_context = None
-
-    def stop_collection_tracking(self) -> tuple:
-        """Stop collection tracking and return per-file collection dependencies."""
-        with self._lock:
-            self._collection_mode = False
-            self._global_tracking_active = False
-            self._collection_context = None
-            return (
-                {k: v.copy() for k, v in self._collection_file_deps.items()},
-                {k: v.copy() for k, v in self._collection_local_imports.items()},
-                {k: v.copy() for k, v in self._collection_external_imports.items()},
-            )
-
-    def get_collection_file_deps(self) -> Dict[str, Set[TrackedFile]]:
-        with self._lock:
-            return {k: v.copy() for k, v in self._collection_file_deps.items()}
-
-    def get_collection_imports(self) -> tuple:
-        with self._lock:
-            return (
-                {k: v.copy() for k, v in self._collection_local_imports.items()},
-                {k: v.copy() for k, v in self._collection_external_imports.items()},
-            )
-
-    # =========================================================================
-    # Test execution tracking methods
-    # =========================================================================
-
-    def start_test_file(self, test_file: str) -> None:
-        """Notify tracker that a test file is starting execution."""
+    def begin_test_file_collection(self, test_file: str) -> None:
         if not test_file:
             return
         with self._lock:
-            self._current_test_file = test_file
+            if not self._session_started:
+                self.start_collection_tracking()
 
-    def end_test_file(self, test_file: str) -> None:
-        """Notify tracker that a test file finished execution."""
-        with self._lock:
-            if self._current_test_file == test_file:
-                self._current_test_file = None
+            self._refresh_real_modules()
+            current = self._snapshot_module_keys()
+
+            # First file: establish global checkpoint once.
+            if self._global_module_keys is None:
+                # Process delta first to capture stdlib keys quickly.
+                self._process_checkpoint_delta(current, self._session_start_module_keys)
+                # Ensure stdlib keep set also includes currently loaded stdlib.
+                self._classify_and_capture_stdlib(current)
+                self._global_module_keys = set(current) - self._stdlib_keep_keys
+                global_delta = self._process_checkpoint_delta(current, self._session_start_module_keys)
+                seen_delta = set(self._global_seen_module_keys) - self._stdlib_keep_keys
+                self._global_unique_module_keys = global_delta | seen_delta
+                self._checkpoint_local_imports = set()
+                self._active_collection_file = test_file
+                self._file_file_reads.setdefault(test_file, set())
+                self._file_seen_module_keys.setdefault(test_file, set())
+                return
+
+            # Subsequent files: finalize previous file from current view first.
+            if self._active_collection_file and self._active_collection_file != test_file:
+                self._finalize_active_file_checkpoint()
+
+            # Then restore to global checkpoint view.
+            self._restore_to_module_checkpoint(self._global_module_keys)
+            self._refresh_real_modules()
+            self._active_collection_file = test_file
+            self._file_file_reads.setdefault(test_file, set())
+            self._file_seen_module_keys.setdefault(test_file, set())
+
+    def _finalize_active_file_checkpoint(self) -> None:
+        active = self._active_collection_file
+        if not active or active in self._file_module_keys or self._global_module_keys is None:
+            return
+        self._refresh_real_modules()
+        current = self._snapshot_module_keys()
+        sys_delta = self._process_checkpoint_delta(current, self._global_module_keys)
+        seen_delta = (
+            set(self._file_seen_module_keys.get(active, set()))
+            - self._global_module_keys
+            - self._stdlib_keep_keys
+        )
+        self._file_module_keys[active] = sys_delta | seen_delta
 
     def start_test(self, context: str, test_file: Optional[str] = None) -> None:
         self.start(context, test_file=test_file)
 
-    def end_test(self) -> Tuple[Set[TrackedFile], Set[str], Set[str], Optional[str]]:
-        return self.stop()
-
     def start(self, context: str, test_file: Optional[str] = None) -> None:
-        """Start tracking dependencies for a test context."""
         with self._lock:
+            if not self._session_started:
+                self.start_collection_tracking()
+
+            active_file = test_file or self._current_test_file
+            if not active_file:
+                active_file = "<unknown>"
+
+            self._refresh_real_modules()
+            current = self._snapshot_module_keys()
+
+            if self._global_module_keys is None:
+                self._process_checkpoint_delta(current, self._session_start_module_keys)
+                self._classify_and_capture_stdlib(current)
+                self._global_module_keys = set(current) - self._stdlib_keep_keys
+                self._global_unique_module_keys = self._process_checkpoint_delta(
+                    current, self._session_start_module_keys
+                )
+
+            # First test in file: create file checkpoint from current-global delta.
+            if active_file not in self._file_module_keys:
+                file_unique = self._process_checkpoint_delta(current, self._global_module_keys)
+                self._file_module_keys[active_file] = file_unique
+                self._file_file_reads.setdefault(active_file, set())
+                # As requested: skip restore when checkpoint is first set.
+            else:
+                keep = self._global_module_keys | self._file_module_keys.get(active_file, set())
+                self._restore_to_module_checkpoint(keep)
+                self._refresh_real_modules()
+
             self._current_context = context
+            self._current_test_file = active_file
+            self._test_files[context] = active_file
+            self._current_test_reads = set()
+            self._current_test_seen_module_keys = set()
             self._tracked_files[context] = set()
             self._tracked_local_imports[context] = set()
             self._tracked_external_imports[context] = set()
-            if test_file:
-                self._test_files[context] = test_file
-                self.start_test_file(test_file)
-            elif self._current_test_file:
-                self._test_files[context] = self._current_test_file
-
-            self._install_hooks()
             self._active = True
 
+            self._install_hooks()
+
+    def end_test(self) -> Tuple[Set[TrackedFile], Set[str], Set[str], Optional[str]]:
+        return self.stop()
+
     def stop(self) -> Tuple[Set[TrackedFile], Set[str], Set[str], Optional[str]]:
-        """Stop current test tracking and return test-level deltas."""
-        with self._lock:
-            context = self._current_context
-            files = self._tracked_files.pop(context, set()) if context else set()
-            local_imports = self._tracked_local_imports.pop(context, set()) if context else set()
-            external_imports = self._tracked_external_imports.pop(context, set()) if context else set()
-            test_file = self._test_files.pop(context, None) if context else None
-            self._current_context = None
-            return files, local_imports, external_imports, test_file
-
-    def switch_context(self, new_context: str) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
-        with self._lock:
-            old_context = self._current_context
-            files = self._tracked_files.pop(old_context, set()) if old_context else set()
-            local_imports = self._tracked_local_imports.pop(old_context, set()) if old_context else set()
-            external_imports = self._tracked_external_imports.pop(old_context, set()) if old_context else set()
-
-            self._current_context = new_context
-            self._tracked_files[new_context] = set()
-            self._tracked_local_imports[new_context] = set()
-            self._tracked_external_imports[new_context] = set()
-            if self._current_test_file:
-                self._test_files[new_context] = self._current_test_file
-
-            return files, local_imports, external_imports
-
-    def get_current(self) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
         with self._lock:
             context = self._current_context
             if not context:
-                return set(), set(), set()
-            return (
-                self._tracked_files.get(context, set()).copy(),
-                self._tracked_local_imports.get(context, set()).copy(),
-                self._tracked_external_imports.get(context, set()).copy(),
+                return set(), set(), set(), None
+
+            self._refresh_real_modules()
+            current = self._snapshot_module_keys()
+
+            test_file = self._test_files.get(context)
+            base = set(self._global_module_keys or set())
+            if test_file:
+                base.update(self._file_module_keys.get(test_file, set()))
+
+            test_unique_module_keys = self._process_checkpoint_delta(current, base)
+            seen_unique = set(self._current_test_seen_module_keys) - base - self._stdlib_keep_keys
+            test_unique_module_keys |= seen_unique
+            local_imports, module_file_deps, external_imports = self._resolve_module_key_set(
+                test_unique_module_keys
             )
 
-    # Compatibility no-ops retained for older call sites.
+            read_unique = set(self._current_test_reads)
+            read_unique -= self._global_file_reads
+            if test_file:
+                read_unique -= self._file_file_reads.get(test_file, set())
+
+            file_deps = module_file_deps | read_unique
+
+            self._tracked_local_imports[context].update(local_imports)
+            self._tracked_external_imports[context].update(external_imports)
+            self._tracked_files[context].update(file_deps)
+
+            out_files = self._tracked_files.pop(context, set())
+            out_local = self._tracked_local_imports.pop(context, set())
+            out_external = self._tracked_external_imports.pop(context, set())
+            out_file = self._test_files.pop(context, None)
+
+            self._current_context = None
+            self._current_test_reads = set()
+            self._current_test_seen_module_keys = set()
+            self._active = False
+
+            return out_files, out_local, out_external, out_file
+
+    # ---------------------------------------------------------------------
+    # Aggregated dependency access
+    # ---------------------------------------------------------------------
+
+    def get_global_import_deps(self) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
+        with self._lock:
+            local, module_files, external = self._resolve_module_key_set(
+                set(self._global_unique_module_keys)
+            )
+            return self._global_file_reads | module_files, local, external
+
+    def get_file_import_deps(self, test_file: str) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
+        with self._lock:
+            local, module_files, external = self._resolve_module_key_set(
+                set(self._file_module_keys.get(test_file, set()))
+            )
+            return self._file_file_reads.get(test_file, set()) | module_files, local, external
+
+    # ---------------------------------------------------------------------
+    # Collection end + compatibility surface
+    # ---------------------------------------------------------------------
+
+    def stop_collection_tracking(self) -> tuple:
+        with self._lock:
+            self._finalize_active_file_checkpoint()
+            self._collection_mode = False
+            self._active_collection_file = None
+
+            # Keep compatibility dictionaries for callers expecting these snapshots.
+            collection_local: Dict[str, Set[str]] = {}
+            collection_external: Dict[str, Set[str]] = {}
+            for test_file in self._file_module_keys.keys():
+                _files, local, external = self.get_file_import_deps(test_file)
+                collection_local[test_file] = local
+                collection_external[test_file] = external
+
+            self._collection_local_imports = collection_local
+            self._collection_external_imports = collection_external
+
+            return (
+                {k: v.copy() for k, v in self._file_file_reads.items()},
+                {k: v.copy() for k, v in collection_local.items()},
+                {k: v.copy() for k, v in collection_external.items()},
+            )
+
+    # Legacy API wrappers still used by some call sites.
+    def stop_global_tracking(self) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
+        return self.get_global_import_deps()
+
+    def start_file_tracking(self, test_file: str) -> None:
+        self.begin_test_file_collection(test_file)
+
+    def stop_file_tracking(self, test_file: Optional[str] = None) -> None:
+        return
+
+    def set_collection_context(self, test_file: str) -> None:
+        self.begin_test_file_collection(test_file)
+
+    def clear_collection_context(self) -> None:
+        self._active_collection_file = None
+
+    def get_collection_file_deps(self) -> Dict[str, Set[TrackedFile]]:
+        with self._lock:
+            return {k: v.copy() for k, v in self._file_file_reads.items()}
+
+    def get_collection_imports(self) -> tuple:
+        with self._lock:
+            local = {}
+            external = {}
+            for test_file in self._file_module_keys:
+                _files, loc, ext = self.get_file_import_deps(test_file)
+                local[test_file] = loc
+                external[test_file] = ext
+            return local, external
+
+    # Runtime helpers expected by pytest plugin.
+    def start_test_file(self, test_file: str) -> None:
+        with self._lock:
+            self._current_test_file = test_file
+
+    def end_test_file(self, test_file: str) -> None:
+        with self._lock:
+            if self._current_test_file == test_file:
+                self._current_test_file = None
+
+    def switch_context(self, new_context: str) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
+        files, local, external, _ = self.stop()
+        self.start(new_context, test_file=self._current_test_file)
+        return files, local, external
+
+    def get_current(self) -> Tuple[Set[TrackedFile], Set[str], Set[str]]:
+        with self._lock:
+            ctx = self._current_context
+            if not ctx:
+                return set(), set(), set()
+            return (
+                self._tracked_files.get(ctx, set()).copy(),
+                self._tracked_local_imports.get(ctx, set()).copy(),
+                self._tracked_external_imports.get(ctx, set()).copy(),
+            )
+
+    # Old checkpoint API retained as no-op compatibility.
     def save_checkpoint(self) -> None:
         return
 
@@ -803,27 +933,46 @@ class DependencyTracker:
         return
 
     def close(self) -> None:
-        """Fully close tracker and restore hooks."""
         with self._lock:
             self._restore_hooks()
+            self._session_started = False
+            self._collection_mode = False
+            self._active = False
             self._current_context = None
             self._current_test_file = None
+            self._active_collection_file = None
+
             self._tracked_files.clear()
             self._tracked_local_imports.clear()
             self._tracked_external_imports.clear()
             self._test_files.clear()
-            self._collection_file_deps.clear()
-            self._collection_local_imports.clear()
-            self._collection_external_imports.clear()
+            self._current_test_reads = set()
+            self._current_test_seen_module_keys = set()
+
+            self._global_module_keys = None
+            self._global_unique_module_keys.clear()
+            self._file_module_keys.clear()
+            self._global_seen_module_keys.clear()
+            self._file_seen_module_keys.clear()
+            self._session_start_module_keys.clear()
+
+            self._global_file_reads.clear()
+            self._file_file_reads.clear()
+            self._checkpoint_local_imports = set()
+            self._collection_local_imports = {}
+            self._collection_external_imports = {}
+
+            self._stdlib_keep_keys.clear()
+            self._stdlib_keep_tops.clear()
+            self._real_modules.clear()
+
             self._path_cache.clear()
             self._module_kind_cache.clear()
+            self._module_dep_cache.clear()
 
 
-# Special checksum marker for file dependencies
 FILE_DEPENDENCY_MARKER = "__file_dep__"
 
 
-
 def file_sha_to_checksum(sha: str) -> int:
-    """Convert a file SHA to a checksum integer for fingerprinting."""
     return int(sha[:8], 16) & 0x7FFFFFFF

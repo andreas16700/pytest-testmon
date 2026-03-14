@@ -1,6 +1,19 @@
 # ezmon-nocov Plugin Status
 
-**Last Updated**: 2026-02-01
+**Last Updated**: 2026-03-14
+
+## Import Tracking Refactor (2026-03-14)
+
+The import tracking subsystem has been refactored from `sys.modules` diffing to a pure import hook approach with deferred reconciliation. The hook records raw `(name, result.__name__, fromlist)` tuples with zero processing at import time; all path resolution and deduplication happens once per test at reconciliation.
+
+This resolves three classes of failures documented in the old approach:
+1. **Fromlist resolution gap** — re-exported classes (e.g., `from pkg import Class`) now correctly traced via `__module__`
+2. **Checkpoint absorption** — already-loaded modules now captured because `builtins.__import__` fires on every import statement
+3. **O(N) performance** — eliminated `sys.modules` scanning (329M `str.startswith` calls, 33s of overhead at pandas scale)
+
+26 edge-case tests validate the approach in `tests/test_import_hook_approach.py`, covering relative imports, star imports, circular imports, namespace packages, failed imports, `importlib.import_module`, deep re-export chains, and `__module__ = None`.
+
+See `docs/checkpoint-import-tracking.md` for the full design reference.
 
 ## Recent Fixes
 
@@ -147,10 +160,12 @@ cd /Users/andrew_yos/pytest-super/pandas-eval
 
 ## Performance Profiling
 
-See `docs/profiling-analysis.md` for detailed bottleneck analysis.
+See `docs/profiling-analysis.md` for detailed bottleneck analysis from the old `sys.modules` diffing approach.
 
-Key bottlenecks:
-1. sqlite3.executemany: 31.1s (15%)
-2. db.determine_tests: 29.4s (14%)
-3. str.startswith: 21.3s (329M calls)
-4. Module set creation: 33s total
+**Note (2026-03-14):** The bottlenecks below are from the old approach and have been largely eliminated by the import hook refactor. The `str.startswith` (329M calls, 21.3s) and module set creation (33s) overhead no longer exists. Re-profiling is needed to identify current bottlenecks.
+
+Previous bottlenecks (old approach):
+1. sqlite3.executemany: 31.1s (15%) — still relevant
+2. db.determine_tests: 29.4s (14%) — still relevant
+3. str.startswith: 21.3s (329M calls) — **eliminated** by hook refactor
+4. Module set creation: 33s total — **eliminated** by hook refactor

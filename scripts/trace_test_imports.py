@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -25,38 +24,43 @@ class ImportTracePlugin:
     def __init__(self, rootdir: str) -> None:
         self.rootdir = rootdir
         self.tracker = DependencyTracker(rootdir)
-        self._global_stopped = False
+        self._active_collection_file: str | None = None
         self.collection_imports: Dict[str, Set[str]] = {}
         self.collection_file_deps: Dict[str, Set[str]] = {}
-        self.test_imports: Dict[str, Set[str]] = defaultdict(set)
+        self.nodeid: str | None = None
+        self.test_imports: Set[str] = set()
 
     def pytest_configure(self, config):
         # Ensure only our plugin runs to avoid interference.
         os.environ.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
         self.tracker.start_collection_tracking()
 
-    def pytest_collectstart(self, collector):
-        if not self._global_stopped:
-            self.tracker.stop_global_tracking()
-            self._global_stopped = True
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collect_file(self, file_path, parent):  # pylint: disable=unused-argument
+        return None
 
+    def pytest_collectstart(self, collector):
+        self.tracker.mark_collection_started()
         try:
-            path_str = str(collector.path)
+            path_str = str(getattr(collector, "path", ""))
         except Exception:
             return
-
         if not path_str.endswith(".py"):
             return
         base = os.path.basename(path_str)
-        if base == "conftest.py":
+        if base in {"conftest.py", "__init__.py"}:
             return
         try:
             rel = os.path.relpath(path_str, self.rootdir).replace(os.sep, "/")
-            self.tracker.start_file_tracking(rel)
-        except (AttributeError, ValueError):
+            if self._active_collection_file == rel:
+                return
+            self.tracker.begin_test_file_collection(rel)
+            self._active_collection_file = rel
+        except Exception:
             return
 
     def pytest_collection_modifyitems(self, session, config, items):
+        self._active_collection_file = None
         file_deps, local_imports, _external_imports = self.tracker.stop_collection_tracking()
         # Keep both Python imports and non-Python file dependencies so output
         # matches database dependency sets.
@@ -66,9 +70,14 @@ class ImportTracePlugin:
         }
         self.collection_imports = {k: set(v) for k, v in local_imports.items()}
 
+    @pytest.hookimpl(tryfirst=True, hookwrapper=True)
+    def pytest_pycollect_makeitem(self, collector, name, obj):  # pylint: disable=unused-argument
+        yield
+
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(self, item, nextitem):
         nodeid = item.nodeid
+        self.nodeid = nodeid
         test_file = nodeid.split("::")[0] if "::" in nodeid else nodeid
         self.tracker.start_test(nodeid, test_file=test_file)
         result = yield
@@ -76,31 +85,32 @@ class ImportTracePlugin:
         # Combine execution + collection dependencies for the test file.
         merged = set(local_imports or set())
         merged.update({tracked.path for tracked in (files or set())})
+        global_files, global_local, _global_external = self.tracker.get_global_import_deps()
+        merged.update(global_local)
+        merged.update({tracked.path for tracked in global_files})
         if test_file:
             merged.update(self.collection_imports.get(test_file, set()))
             merged.update(self.collection_file_deps.get(test_file, set()))
-        if test_file:
-            merged.add(test_file)
-        self.test_imports[nodeid].update(merged)
+            file_files, file_local, _file_external = self.tracker.get_file_import_deps(test_file)
+            merged.update(file_local)
+            merged.update({tracked.path for tracked in file_files})
+        self.test_imports = merged
 
 
-def _as_json(data: Dict[str, Set[str]]) -> str:
-    payload = {k: sorted(v) for k, v in data.items()}
-    return json.dumps(payload, indent=2, sort_keys=True)
+def _as_json(nodeid: str, deps: Set[str]) -> str:
+    return json.dumps({nodeid: sorted(deps)}, indent=2, sort_keys=True)
 
 
-def _as_text(data: Dict[str, Set[str]]) -> str:
-    lines: List[str] = []
-    for nodeid in sorted(data.keys()):
-        lines.append(nodeid)
-        for path in sorted(data[nodeid]):
-            lines.append(f"  {path}")
+def _as_text(nodeid: str, deps: Set[str]) -> str:
+    lines: List[str] = [nodeid]
+    for path in sorted(deps):
+        lines.append(f"  {path}")
     return "\n".join(lines)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trace local Python imports for tests.")
-    parser.add_argument("tests", nargs="+", help="Test nodeids or paths to run.")
+    parser.add_argument("test", help="Single test nodeid or path to run.")
     parser.add_argument("--format", choices=("json", "text"), default="text")
     parser.add_argument("--output", help="Write output to file instead of stdout.")
     parser.add_argument("--no-stdout", action="store_true", help="Suppress stdout output.")
@@ -109,8 +119,9 @@ def main() -> int:
     rootdir = str(Path.cwd())
     plugin = ImportTracePlugin(rootdir)
     os.environ.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
-    code = pytest.main(["-q", *args.tests], plugins=[plugin])
-    output = _as_json(plugin.test_imports) if args.format == "json" else _as_text(plugin.test_imports)
+    code = pytest.main(["-q", args.test], plugins=[plugin])
+    nodeid = plugin.nodeid or args.test
+    output = _as_json(nodeid, plugin.test_imports) if args.format == "json" else _as_text(nodeid, plugin.test_imports)
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")
     if not args.no_stdout:

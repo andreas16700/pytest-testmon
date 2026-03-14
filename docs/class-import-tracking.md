@@ -1,5 +1,7 @@
 # Class Import Tracking Fix
 
+> **Historical context (2026-03-14):** This document describes the Phase 1 and Phase 2 fixes applied when the tracker used `sys.modules` diffing. The underlying problem — tracking re-exported classes to their defining modules — is now handled by the reconciliation-time `__module__` tracing in the pure import hook approach. The Phase 2 cache-restoration workaround is no longer needed because reconciliation reads `__module__` from live objects after all imports have completed. See `docs/checkpoint-import-tracking.md` for the current design.
+
 ## Problem
 
 When a test file imports a class via a package re-export, the dependency tracker was not tracking the module where the class is defined.
@@ -151,4 +153,5 @@ This fix improves test selection accuracy for codebases that use package re-expo
 
 - **Phase 1 fix**: Added `__module__` check for classes/functions
 - **Phase 2 fix**: Restore defining module from cache when missing from `sys.modules`
+- **Phase 3 (current)**: Pure import hook with deferred reconciliation. `__module__` tracing happens at reconciliation time, after all imports have completed, so the defining module is always in `sys.modules`. The Phase 2 cache-restoration workaround is no longer needed.
 - **Version**: 3.0.0-nocov

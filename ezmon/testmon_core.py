@@ -390,20 +390,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             deps_set = deps_payload.get("deps", set())
             file_deps_set = deps_payload.get("file_deps", set())
             external_deps_set = deps_payload.get("external_deps", set())
-            extra_deps = set()  # Encoded init paths
-
             for encoded in deps_set:
                 if isinstance(encoded, int):
                     if 0 <= encoded < len(self.expected_files_list):
                         encoded = self.expected_files_list[encoded]
                     else:
                         continue
-                # Decode only to check .py extension and compute init deps
-                decoded = self._decode_path(encoded)
-                if decoded and decoded.endswith(".py"):
-                    # Get init deps as decoded paths, then encode them
-                    for init_path in self._package_init_deps_for_path(decoded):
-                        extra_deps.add(self.path_encoder.encode(init_path))
                 record = self._get_cached_fingerprint(encoded)
                 if record:
                     deps_n_outcomes["deps"].append(record)
@@ -423,11 +415,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     if not sha:
                         continue
                 deps_n_outcomes["file_deps"].append({"filename": decoded, "sha": sha})
-
-            for encoded in sorted(extra_deps):
-                record = self._get_cached_fingerprint(encoded)
-                if record:
-                    deps_n_outcomes["deps"].append(record)
 
             resolved_packages = []
             for pkg in external_deps_set:
@@ -544,20 +531,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         to_delete = list(set(self.all_tests) - collected)
         with self.db as database:
             database.delete_test_executions(to_delete, self.exec_id)
-
-    def _package_init_deps_for_path(self, relpath: Optional[str]) -> Set[str]:
-        if not relpath:
-            return set()
-        parts = Path(relpath).parts
-        if len(parts) <= 1:
-            return set()
-        deps = set()
-        for i in range(1, len(parts)):
-            init_rel = Path(*parts[:i]) / "__init__.py"
-            init_abs = Path(self.rootdir) / init_rel
-            if init_abs.exists():
-                deps.add(str(init_rel).replace(os.sep, "/"))
-        return deps
 
     def determine_stable(self):
         """Determine which tests are stable (unchanged) vs unstable (need to run).
@@ -990,38 +963,6 @@ class TestmonCollector:
         # Store tracked dependencies per test for batch processing
         self._tracked_deps = {}  # {test_name: (files, local_imports, external_imports)}
 
-    def _package_init_deps_for_path(self, relpath: Optional[str]) -> Set[str]:
-        """Return package __init__.py files for a given relative module path."""
-        if not relpath:
-            return set()
-        parts = Path(relpath).parts
-        if len(parts) <= 1:
-            return set()
-        deps = set()
-        for i in range(1, len(parts)):
-            init_rel = Path(*parts[:i]) / "__init__.py"
-            init_abs = Path(self.rootdir) / init_rel
-            if init_abs.exists():
-                deps.add(str(init_rel).replace(os.sep, "/"))
-        return deps
-
-    def _decode_import_path(self, path):
-        if isinstance(path, int):
-            if 0 <= path < len(self._expected_files_list):
-                return self._expected_files_list[path]
-            return None
-        try:
-            decoded = self.path_encoder.decode(path)
-            if str(decoded).startswith(str(self.rootdir)):
-                return str(decoded.relative_to(self.rootdir))
-            return str(decoded)
-        except Exception:
-            return path
-        return path
-
-    def _encode_import_path(self, path: str):
-        return self.path_encoder.encode(path)
-
     def start_testmon(self, test_name, next_test_name=None):
         """Start tracking dependencies for a test.
 
@@ -1050,21 +991,6 @@ class TestmonCollector:
         }
         if local_imports:
             deps_payload["deps"].update(local_imports)
-        for rel in local_imports or []:
-            decoded = self._decode_import_path(rel)
-            if not decoded:
-                continue
-            for init_path in self._package_init_deps_for_path(decoded):
-                deps_payload["deps"].add(self._encode_import_path(init_path))
-        for init_path in self._package_init_deps_for_path(test_file):
-            deps_payload["deps"].add(self._encode_import_path(init_path))
-        if test_file:
-            deps_payload["deps"].add(test_file)
-        test_home = home_file(self._test_name)
-        deps_payload["deps"].add(test_home)
-        global_deps = getattr(self.dependency_tracker, "_checkpoint_local_imports", set())
-        if global_deps:
-            deps_payload["deps"].update(global_deps)
         if files:
             deps_payload["file_deps"].update({(tf.path, tf.sha) for tf in files})
         if external_imports:
@@ -1102,7 +1028,6 @@ class TestmonCollector:
     def _build_nodes_files_lines(self):
         """Build nodes_files_lines from dependency tracker data."""
         nodes_files_lines = {}
-        global_deps = getattr(self.dependency_tracker, "_checkpoint_local_imports", set())
         for test_name in self.batched_test_names:
             if test_name == self._interrupted_at:
                 continue
@@ -1115,22 +1040,6 @@ class TestmonCollector:
             if test_name in self._tracked_deps:
                 _files, local_imports, _external_imports, test_file = self._tracked_deps[test_name]
                 deps_payload["deps"].update(local_imports)
-                if test_file:
-                    for init_path in self._package_init_deps_for_path(test_file):
-                        deps_payload["deps"].add(self._encode_import_path(init_path))
-                    deps_payload["deps"].add(test_file)
-                for rel in local_imports or []:
-                    decoded = self._decode_import_path(rel)
-                    if not decoded:
-                        continue
-                    for init_path in self._package_init_deps_for_path(decoded):
-                        deps_payload["deps"].add(self._encode_import_path(init_path))
-
-            test_home = home_file(test_name)
-            deps_payload["deps"].add(test_home)
-            if global_deps:
-                deps_payload["deps"].update(global_deps)
-
             nodes_files_lines[test_name] = deps_payload
 
         return nodes_files_lines

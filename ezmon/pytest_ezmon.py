@@ -616,7 +616,6 @@ class TestmonCollect:
         self._collection_file_deps = {}  # {test_file: set of TrackedFile}
         self._collection_local_imports = {}  # {test_file: set of module paths}
         self._collection_external_imports = {}  # {test_file: set of package names}
-        self._global_collection_stopped = False
         self._active_collection_file = None
 
         # Start collection-time tracking to capture import-time dependencies
@@ -686,40 +685,29 @@ class TestmonCollect:
             _timing_log(self._config, "controller_drain_queue_end")
 
     @pytest.hookimpl(tryfirst=True)
+    def pytest_collect_file(self, file_path, parent):  # pylint: disable=unused-argument
+        return None
+
+    @pytest.hookimpl(tryfirst=True)
     def pytest_collectstart(self, collector):
-        """Called when pytest starts collecting from a collector.
-
-        For test modules (files), this sets the collection context so that
-        file reads and imports during collection are associated with this test file.
-        """
-        # Freeze global tracking at the first collection event so global deps
-        # are strictly pre-test-file-collection dependencies.
-        if not self._global_collection_stopped:
-            self.testmon.dependency_tracker.stop_global_tracking()
-            self._global_collection_stopped = True
-
+        self.testmon.dependency_tracker.mark_collection_started()
         try:
-            path_str = str(collector.path)
+            path_str = str(getattr(collector, "path", ""))
         except Exception:
             return
-
         if not path_str.endswith(".py"):
             return
         base = os.path.basename(path_str)
-        if base == "conftest.py":
+        if base in {"conftest.py", "__init__.py"}:
             return
-
         try:
-            test_file = cached_relpath(
-                path_str,
-                str(collector.config.rootdir)
-            )
-            if self._active_collection_file and self._active_collection_file != test_file:
-                self.testmon.dependency_tracker.stop_file_tracking(self._active_collection_file)
-            self.testmon.dependency_tracker.start_file_tracking(test_file)
+            test_file = cached_relpath(path_str, str(collector.config.rootdir))
+            if self._active_collection_file == test_file:
+                return
+            self.testmon.dependency_tracker.begin_test_file_collection(test_file)
             self._active_collection_file = test_file
-        except (AttributeError, ValueError):
-            pass
+        except Exception:
+            return
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
     def pytest_pycollect_makeitem(
@@ -880,13 +868,20 @@ class TestmonCollect:
         has_file_deps = bool(self._collection_file_deps)
         has_local_imports = bool(self._collection_local_imports)
         has_external_imports = bool(self._collection_external_imports)
+        global_file_deps, global_base_deps, global_external_deps = self.testmon.dependency_tracker.get_global_import_deps()
+        has_file_checkpoint_imports = False
 
-        # Include global baseline deps captured before per-file collection begins.
-        global_base_deps = getattr(self.testmon.dependency_tracker, "_checkpoint_local_imports", set())
-        global_file_deps = getattr(self.testmon.dependency_tracker, "_checkpoint_file_deps", set())
         has_global_deps = bool(global_base_deps) or bool(global_file_deps)
+        has_global_external = bool(global_external_deps)
 
-        if not (has_file_deps or has_local_imports or has_external_imports or has_global_deps):
+        if not (
+            has_file_deps
+            or has_local_imports
+            or has_external_imports
+            or has_global_deps
+            or has_file_checkpoint_imports
+            or has_global_external
+        ):
             self._timing_totals["merge_collection_deps"] += time.monotonic() - t0
             self._timing_counts["merge_collection_deps"] += 1
             return nodes_files_lines
@@ -906,10 +901,17 @@ class TestmonCollect:
                 for tracked_file in collection_file_deps:
                     data["file_deps"].add((tracked_file.path, tracked_file.sha))
 
+            file_checkpoint_file_deps, file_checkpoint_imports, file_checkpoint_external = self.testmon.dependency_tracker.get_file_import_deps(test_file)
+            has_file_checkpoint_imports = bool(file_checkpoint_imports)
             if has_local_imports:
                 imported_modules = self._collection_local_imports.get(test_file, set())
                 if imported_modules:
                     data["deps"].update(imported_modules)
+            if has_file_checkpoint_imports:
+                data["deps"].update(file_checkpoint_imports)
+            if file_checkpoint_file_deps:
+                for tracked_file in file_checkpoint_file_deps:
+                    data["file_deps"].add((tracked_file.path, tracked_file.sha))
 
             if global_base_deps:
                 data["deps"].update(global_base_deps)
@@ -922,6 +924,10 @@ class TestmonCollect:
                 collection_external_imports = self._collection_external_imports.get(test_file, set())
                 if collection_external_imports:
                     data["external_deps"].update(collection_external_imports)
+            if file_checkpoint_external:
+                data["external_deps"].update(file_checkpoint_external)
+            if has_global_external:
+                data["external_deps"].update(global_external_deps)
 
         self._timing_totals["merge_collection_deps"] += time.monotonic() - t0
         self._timing_counts["merge_collection_deps"] += 1

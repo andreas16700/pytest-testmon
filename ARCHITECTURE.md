@@ -144,35 +144,28 @@ External package dependencies are tracked by **package name + version** when ava
 
 ### Dependency Phases
 
-Dependency tracking uses explicit phases instead of `sys.modules` checkpoint restore:
+Dependency tracking is event-driven with checkpoint deltas:
 
 ```
-pytest starts
-    |
-    v
-conftest.py loads (imports packages)
-    |
-    v
-[GLOBAL TRACKING ACTIVE] -- dependencies common to ALL tests
-    |
-    v
-For each test file:
-    |
-    +-- [STOP GLOBAL TRACKING]
-    +-- [START FILE TRACKING]
-    +-- Collect test file (imports/reads tracked for this file)
-    +-- [STOP FILE TRACKING]
-    |
-    v
-For each test:
-    |
-    +-- [START TEST TRACKING]
-    +-- Run test (imports/reads tracked for this test)
-    +-- [STOP TEST TRACKING]
-    |
-    v
-Test dependencies = global + file + test dependencies
+collect-file-start(test_file):
+    - set global checkpoint once (lazy)
+    - activate file collection context
+    - for later files, restore sys.modules to global checkpoint
+
+test-start(test_id, test_file):
+    - set file checkpoint once per file (lazy)
+    - for later tests in that file, restore sys.modules to global+file
+
+test-end(test_id):
+    - compute test-unique module/read deltas over global+file
 ```
+
+Dependencies persisted for each test are:
+`global + file + test_unique`.
+
+Checkpoints include both:
+1. module keys (`sys.modules`)
+2. file-read sets (non-Python reads)
 
 ## Roaring Bitmap Storage
 
@@ -307,41 +300,43 @@ pytest-ezmon-nocov/
 
 ## Dependency Tracking Details
 
-### Import Hook
+### Import Hook: Zero-Processing Approach
 
-The `DependencyTracker` hooks `builtins.__import__` to intercept all imports:
+The `DependencyTracker` hooks `builtins.__import__` to intercept all imports. The hook records raw data with zero processing in the hot path:
 
 ```python
-def _tracking_import(self, name, globals=None, locals=None, fromlist=(), level=0):
+def _hook(self, name, globals=None, locals=None, fromlist=(), level=0):
     result = self._original_import(name, globals, locals, fromlist, level)
-
-    # Track the imported module
-    self._track_import(result, name)
-
-    # For 'from X import Y', also track Y's defining module
-    if fromlist:
-        for attr_name in fromlist:
-            imported_obj = getattr(result, attr_name, None)
-            if hasattr(imported_obj, '__module__'):
-                # Class/function - track its defining module
-                defining_module = sys.modules.get(imported_obj.__module__)
-                if defining_module:
-                    self._track_import(defining_module, imported_obj.__module__)
-
+    fl = tuple(fromlist) if fromlist is not None else None
+    self._current[name].add(fl)
+    self._current[result.__name__].add(fl)
     return result
 ```
 
+Two keys are recorded per import: the raw `name` (captures dotted paths like `mypkg.utils`) and `result.__name__` (captures absolute names for relative imports). Both are stored with their associated `fromlist` tuples. All path resolution, deduplication, and classification is deferred to reconciliation time.
+
+The production hook also handles rehydration (pre-populating `sys.modules` from a permanent cache before calling `_original_import`) and wraps `importlib.import_module` separately since it bypasses `builtins.__import__`.
+
+See `docs/checkpoint-import-tracking.md` for the full design rationale, the three approaches that were tried, and how each failure informed the current design.
+
+### Reconciliation: Deferred Processing
+
+After a test completes, reconciliation converts raw recorded data to file paths:
+
+1. **Prefix expansion**: For `"mypkg.sub.deep"`, resolves `mypkg`, `mypkg.sub`, and `mypkg.sub.deep` — capturing all intermediate `__init__.py` files
+2. **Fromlist expansion**: For `from mypkg.models import Product`, tries `mypkg.models.Product` as a submodule (fails), then traces `Product.__module__` = `"mypkg.models.product"` → `models/product.py`
+3. **Project root filtering**: Rejects paths outside the project root (stdlib, third-party)
+
 ### Class Import Tracking
 
-When a class is imported via package re-export (e.g., `from pandas import Series`), we track the defining module using `__module__`:
+When a class is imported via package re-export (e.g., `from pandas import Series`), the reconciliation step traces `Series.__module__` to find the defining module file:
 
 ```python
-# User.__module__ = 'src.models.user'
-# So we track src/models/user.py, not just src/models/__init__.py
+# Series.__module__ = 'pandas.core.series'
+# Reconciliation resolves this to pandas/core/series.py
 ```
 
-The tracker resolves class/function imports via `__module__` so re-exported symbols
-still map back to their defining module file.
+This happens at reconciliation time (not in the hook), so the defining module is always available in `sys.modules`. Earlier approaches that attempted this resolution in the hook itself ran into issues where checkpoint restore had removed the defining module from `sys.modules` — see `docs/class-import-tracking.md` for the full history.
 
 ### File Dependency Tracking
 
