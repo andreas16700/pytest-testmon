@@ -1003,6 +1003,46 @@ class DB:  # pylint: disable=too-many-public-methods
                 (test_id, blob, external_packages)
             )
 
+    def save_test_deps_batch(self, batch: list) -> None:
+        """Save multiple test dependencies in a single transaction.
+
+        Args:
+            batch: List of (test_id, blob, external_packages_str) tuples
+        """
+        if not batch:
+            return
+        with self.con as con:
+            con.executemany(
+                """INSERT OR REPLACE INTO test_deps (test_id, file_bitmap, external_packages)
+                   VALUES (?, ?, ?)""",
+                batch,
+            )
+
+    def get_test_deps_batch(self, test_ids: list) -> Dict[int, bytes]:
+        """Bulk-load existing test_deps blobs for a set of test IDs.
+
+        Args:
+            test_ids: List of test IDs to look up
+
+        Returns:
+            Dict mapping test_id to file_bitmap blob
+        """
+        if not test_ids:
+            return {}
+        result = {}
+        # Process in chunks to avoid exceeding SQLite variable limit
+        chunk_size = 500
+        for i in range(0, len(test_ids), chunk_size):
+            chunk = test_ids[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self.con.execute(
+                f"SELECT test_id, file_bitmap FROM test_deps WHERE test_id IN ({placeholders})",
+                chunk,
+            )
+            for row in cursor:
+                result[row["test_id"]] = bytes(row["file_bitmap"])
+        return result
+
     def get_test_deps(self, test_id: int) -> Optional[TestDeps]:
         """Get test dependencies for a single test.
 

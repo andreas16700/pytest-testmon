@@ -302,7 +302,7 @@ pytest-ezmon-nocov/
 
 ### Import Hook: Zero-Processing Approach
 
-The `DependencyTracker` hooks `builtins.__import__` to intercept all imports. The hook records raw data with zero processing in the hot path:
+The `DependencyTracker` hooks `builtins.__import__` to intercept all imports. The hook records raw data with zero processing in the hot path (applied 2026-03-15 after a false start where `sys.modules` diffing was accidentally re-added during debugging):
 
 ```python
 def _hook(self, name, globals=None, locals=None, fromlist=(), level=0):
@@ -429,37 +429,45 @@ ezmon-nocov fully supports parallel test execution:
 
 1. **Controller** computes selection once before workers spawn
 2. **Controller** passes selection + expected file/package sets via `workerinput`
-3. **Workers** avoid loading the database and skip recomputation
-4. **Workers** prune collection using an explicit no-collect file list
-5. **Workers** track deps only (no SHA/checksum computation)
+3. **Workers** do their own collection, pruning via nocollect file list and deselecting stable tests
+4. **Workers** track deps and merge collection-time dependencies before sending to controller
+5. **Workers** do not compute SHAs/checksums — controller handles that
 6. **Controller** computes checksums and writes dependency updates
 
-Detailed flow:
-- Startup: controller loads the database, diffs last run commit to HEAD, and builds the selected test set.
-- Worker bootstrap: selection data + expected tracking sets are injected into `workerinput`; workers do not compute SHAs or checksums.
-- Collection: workers use `pytest_ignore_collect` to skip explicitly non-collected files.
-- Execution: dependency tracking runs only for collected tests; collection-time dependencies are merged into per-test data.
-- Finish: worker reports are sent to the controller; the controller resolves SHAs/checksums and writes final dependency updates.
+### Detailed flow
+
+**Startup**: Controller loads the database, diffs last run commit to HEAD, and builds the selected test set via `determine_stable()`. This produces:
+- `unstable_test_names`: tests to run (None = run all on fresh DB; set = specific tests)
+- `explicitly_nocollect_files`: test files to skip entirely during collection
+- `expected_imports`/`expected_reads`: plain relative paths of all git-tracked files (filter for dependency tracker)
+
+**Worker bootstrap**: `pytest_configure_node` injects all selection data into `workerinput`. Workers create `TestmonData.for_worker()` from this data — they never access the database. Important: `unstable_test_names=None` (fresh DB, run all) must be preserved as None through the wire; an empty set means "no tests affected".
+
+**Collection**: Each worker collects tests independently. Two selection layers:
+1. `pytest_ignore_collect`: skips entire test files listed in `explicitly_nocollect_files`
+2. `pytest_collection_modifyitems`: deselects individual stable tests within collected files using `selected_tests`
+
+**Execution**: Workers track dependencies via import hooks. The DependencyTracker records per-test unique deps (with global and file-level baseline deps subtracted).
+
+**Finalization**: In `_finalize_worker_test_file`, workers merge collection-time dependencies back into per-test data via `_merge_collection_deps` **before** computing common/unique splits and sending to the controller. This is critical because the controller's DependencyTracker captures nothing (it doesn't import test modules).
+
+**Controller receive**: `_handle_worker_output` expands the wire format into per-test dep payloads (already containing full deps including collection-time imports), computes fingerprints, and writes to the database.
+
+### Path Format
+
+All paths throughout the pipeline are **plain relative paths** (e.g., `lib/matplotlib/figure.py`). There is no encoding or decoding of file paths. Package names use deterministic trie encoding only for the `package_code_map`.
 
 ### Worker Payload Encoding
 
-To reduce xdist overhead, workers encode dependency payloads in two ways:
+Workers encode dependency payloads in a compact wire format:
 
-1) **Deterministic encoding for files + packages**
-- The controller builds deterministic code maps:
-  - git-tracked files are encoded using directory-ordered, stable indices
-  - packages are encoded by sorted package name
-- These maps are shared with workers via `workerinput`.
-- Workers send only integer IDs for dependency paths and package names.
-- The controller decodes IDs back to paths/packages when writing fingerprints.
-
-2) **Per-file test-name prefix encoding**
+1) **Per-file test-name prefix encoding**
 - Each test file payload includes a `pm` prefix map (list of class/param prefixes).
 - Test suffixes are encoded as `prefix_id|last_part`, where `last_part` is the final `::` segment.
 - Prefix IDs are 1-based indexes into `pm` (id 1 maps to `pm[0]`); id 0 means no prefix.
 - The controller expands this into full test suffixes and reattaches the test file.
 
-Payload grouping:
+2) **Payload grouping**
 - Dependencies are grouped by test file.
 - Each file payload has:
   - `com`: deps shared by all tests in the file

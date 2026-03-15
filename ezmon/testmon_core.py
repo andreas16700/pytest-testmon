@@ -40,7 +40,6 @@ from ezmon.deterministic_coding import (
     invert_map,
     encode_packages,
 )
-from ezmon.trie import TrieEncoder, get_encoder
 
 from ezmon.common import DepsNOutcomes, TestExecutions
 from ezmon.dependency_tracker import DependencyTracker, file_sha_to_checksum
@@ -305,8 +304,8 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         instance.system_packages_change = bool(changed_packages)
 
         # Convert unstable_test_names from list to set (xdist serializes sets as lists)
-        # Workers receive the small set of tests to RUN (unstable), not the large set to skip
-        instance.unstable_test_names = set(unstable_test_names) if unstable_test_names else set()
+        # None means "run all" (fresh DB); empty set means "run none affected"
+        instance.unstable_test_names = set(unstable_test_names) if unstable_test_names is not None else None
         instance.stable_test_names = set()  # Workers don't need the full stable set
         instance.stable_files = set()
         instance.unstable_files = set()
@@ -343,17 +342,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 get_system_packages(rootdir=self.rootdir)
             )
         package_names = self._package_names_from_string(packages_str)
-        # Use singleton encoder for cache efficiency
-        self.path_encoder = get_encoder(self.rootdir)
-        # Set db on encoder for file ID caching
-        if hasattr(self, 'db') and self.db:
-            self.path_encoder.set_db(self.db)
         self.file_code_map = {}
         self.file_code_map_rev = {}
         self.package_code_map = build_package_code_map(package_names)
         self.package_code_map_rev = invert_map(self.package_code_map)
         self._fingerprint_cache = {}
         self._fp_stats = defaultdict(int)
+        self._file_id_cache: Dict[str, int] = {}
 
     @property
     def new_db(self):
@@ -377,11 +372,9 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         """Create fingerprints for tests based on file dependencies.
 
         With the simplified model, dependency sets are explicit:
-        - deps: local Python files (encoded paths)
-        - file_deps: non-Python files with (encoded_path, sha)
+        - deps: local Python files (plain relative paths)
+        - file_deps: non-Python files with (relpath, sha)
         - external_deps: external package names
-
-        Paths are kept encoded throughout for efficiency.
         """
         test_executions_fingerprints = {}
         for context, deps_payload in nodes_files_lines.items():
@@ -390,31 +383,27 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             deps_set = deps_payload.get("deps", set())
             file_deps_set = deps_payload.get("file_deps", set())
             external_deps_set = deps_payload.get("external_deps", set())
-            for encoded in deps_set:
-                if isinstance(encoded, int):
-                    if 0 <= encoded < len(self.expected_files_list):
-                        encoded = self.expected_files_list[encoded]
+            for relpath in deps_set:
+                if isinstance(relpath, int):
+                    if 0 <= relpath < len(self.expected_files_list):
+                        relpath = self.expected_files_list[relpath]
                     else:
                         continue
-                record = self._get_cached_fingerprint(encoded)
+                record = self._get_cached_fingerprint(relpath)
                 if record:
                     deps_n_outcomes["deps"].append(record)
 
-            for encoded, sha in file_deps_set:
-                if isinstance(encoded, int):
-                    if 0 <= encoded < len(self.expected_files_list):
-                        encoded = self.expected_files_list[encoded]
+            for relpath, sha in file_deps_set:
+                if isinstance(relpath, int):
+                    if 0 <= relpath < len(self.expected_files_list):
+                        relpath = self.expected_files_list[relpath]
                     else:
                         continue
-                # Decode path for the record (database stores decoded paths)
-                decoded = self._decode_path(encoded)
-                if not decoded:
-                    continue
                 if sha is None:
-                    sha = self.file_cache.get_tracked_sha(decoded)
+                    sha = self.file_cache.get_tracked_sha(relpath)
                     if not sha:
                         continue
-                deps_n_outcomes["file_deps"].append({"filename": decoded, "sha": sha})
+                deps_n_outcomes["file_deps"].append({"filename": relpath, "sha": sha})
 
             resolved_packages = []
             for pkg in external_deps_set:
@@ -436,16 +425,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             test_executions_fingerprints[context] = deps_n_outcomes
         return test_executions_fingerprints
 
-    def _decode_path(self, encoded: str) -> Optional[str]:
-        """Decode an encoded path to relative path string."""
-        try:
-            decoded = self.path_encoder.decode(encoded)
-            if str(decoded).startswith(str(self.rootdir)):
-                return str(decoded.relative_to(self.rootdir))
-            return str(decoded)
-        except Exception:
-            return None
-
     def _compute_file_info(self, path: str):
         abs_path = os.path.join(self.rootdir, path)
         try:
@@ -461,19 +440,19 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         checksum = compute_file_checksum(source, ext if ext else "txt")
         return (checksum, fsha, mtime)
 
-    def _get_cached_fingerprint(self, encoded: str):
-        """Get fingerprint for an encoded path. Returns record with decoded filename."""
-        if not encoded:
+    def _get_cached_fingerprint(self, relpath: str):
+        """Get fingerprint for a relative path. Returns record with filename."""
+        if not relpath:
             return None
-        cached = self._fingerprint_cache.get(encoded)
+        cached = self._fingerprint_cache.get(relpath)
         if cached:
             self._fp_stats["fingerprint_cache_hit"] += 1
             return cached
         self._fp_stats["fingerprint_cache_miss"] += 1
 
-        # Get file info from encoder (uses its cache)
+        # Get file info from file cache
         try:
-            fingerprint, fsha, mtime = self.path_encoder.get_file_info(encoded)
+            fingerprint, fsha, mtime = self.file_cache.get_file_info(relpath)
         except Exception:
             fingerprint = None
 
@@ -482,18 +461,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             return None
         self._fp_stats["source_tree_hit"] += 1
 
-        # Decode path for the record (database stores decoded paths)
-        decoded = self._decode_path(encoded)
-        if not decoded:
-            return None
-
         record = {
-            "filename": decoded,  # Store decoded path for database
+            "filename": relpath,
             "mtime": mtime,
             "fsha": fsha,
             "file_checksum": fingerprint,
         }
-        self._fingerprint_cache[encoded] = record
+        self._fingerprint_cache[relpath] = record
         if os.environ.get("EZMON_CORE_TIMING"):
             _core_timing_log(
                 "fingerprint_cache_stats",
@@ -574,10 +548,8 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 tracked_files=list(head_files),
                 packages_str=curr_packages,
             )
-            self.expected_reads = set(self.path_encoder.encode(p) for p in head_files)
-            self.expected_imports = set(
-                self.path_encoder.encode(p) for p in head_files if p.endswith(".py")
-            )
+            self.expected_reads = set(head_files)
+            self.expected_imports = set(p for p in head_files if p.endswith(".py"))
             self.expected_packages = set(
                 encode_packages(
                     self._package_names_from_string(curr_packages),
@@ -599,15 +571,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         # For dependency tracking, we must include ALL git-tracked files at HEAD,
         # not just changed files, so we never miss actual imports/reads.
         head_files = set(self._git_head_files())
-        # Initialize path encoder before using it
         self._init_deterministic_coding(
             tracked_files=list(head_files),
             packages_str=curr_packages,
         )
-        self.expected_reads = set(self.path_encoder.encode(p) for p in head_files)
-        self.expected_imports = set(
-            self.path_encoder.encode(p) for p in head_files if p.endswith(".py")
-        )
+        self.expected_reads = set(head_files)
+        self.expected_imports = set(p for p in head_files if p.endswith(".py"))
         # Track all current packages (selection still uses pack_affecting).
         self.expected_packages = set(self._package_names_from_string(curr_packages))
         self.expected_files_list = []
@@ -616,9 +585,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         tracked_files = set(self.db.get_file_id_map().keys())
         candidate_files = (git_mod | git_del) & tracked_files
         files_for_cache = (git_new | git_mod) - git_del
-
-        if files_for_cache:
-            self.path_encoder.prefill_file_info(files_for_cache)
 
         db_checksums = self.db.get_file_checksums()
         head_shas = self.file_cache.batch_get_head_shas(candidate_files)
@@ -675,7 +641,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.unstable_files = set(self.git_affected_files)
         self.stable_files = set(self.db.filenames(self.exec_id)) - self.unstable_files
 
-        # expected_reads/imports already encoded via TrieEncoder (called at line 640)
         self.expected_packages = set(
             encode_packages(self.expected_packages, self.package_code_map)
         )
@@ -810,65 +775,257 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     def save_test_deps_bitmap(self, test_executions_fingerprints: TestExecutions) -> None:
         """Save test dependencies using the new Roaring bitmap format.
 
-        This stores dependencies compactly in the new schema while the old schema
-        is also populated for backwards compatibility.
+        All DB reads/writes are wrapped in a single transaction to avoid
+        per-test COMMIT overhead (230K commits -> 1 commit per call).
 
         Args:
             test_executions_fingerprints: Dict mapping test name to DepsNOutcomes
         """
-        # Ensure encoder has db reference for file ID caching
-        if not hasattr(self, 'path_encoder') or self.path_encoder is None:
-            self.path_encoder = get_encoder(self.rootdir)
-        self.path_encoder.set_db(self.db)
+        with self.db.con:
+            # Phase 1: resolve file/test IDs and serialize deps
+            pending = []  # list of (test_id, blob, packages_str)
+            for test_name, deps_n_outcomes in test_executions_fingerprints.items():
+                file_ids = set()
+                external_packages = set()
 
-        for test_name, deps_n_outcomes in test_executions_fingerprints.items():
-            file_ids = set()
-            external_packages = set()
+                # Process Python file dependencies
+                for dep in deps_n_outcomes.get("deps", []):
+                    filename = dep["filename"]
+                    checksum = dep.get("file_checksum")
+                    fsha = dep.get("fsha")
 
-            # Process Python file dependencies
-            for dep in deps_n_outcomes.get("deps", []):
-                filename = dep["filename"]
-                checksum = dep.get("file_checksum")
-                fsha = dep.get("fsha")
+                    file_id = self._file_id_cache.get(filename)
+                    if file_id is None:
+                        file_id = self.db.get_or_create_file_id(
+                            filename, checksum=checksum, fsha=fsha, file_type='python'
+                        )
+                        if file_id is not None:
+                            self._file_id_cache[filename] = file_id
+                    if file_id is not None:
+                        file_ids.add(file_id)
 
-                encoded = self.path_encoder.encode(filename)
-                file_id = self.path_encoder.get_file_id(
-                    encoded, checksum=checksum, fsha=fsha, file_type='python'
+                # Process non-Python file dependencies
+                for file_dep in deps_n_outcomes.get("file_deps", []):
+                    filename = file_dep["filename"]
+                    sha = file_dep.get("sha")
+
+                    checksum = file_sha_to_checksum(sha) if sha else None
+                    file_id = self._file_id_cache.get(filename)
+                    if file_id is None:
+                        file_id = self.db.get_or_create_file_id(
+                            filename, checksum=checksum, fsha=sha, file_type='data'
+                        )
+                        if file_id is not None:
+                            self._file_id_cache[filename] = file_id
+                    if file_id is not None:
+                        file_ids.add(file_id)
+
+                # Process external package dependencies
+                for pkg_name in deps_n_outcomes.get("external_deps", []):
+                    external_packages.add(pkg_name)
+
+                # Get or create test ID
+                test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                test_id = self.db.get_or_create_test_id(
+                    self.exec_id,
+                    test_name,
+                    duration=deps_n_outcomes.get("duration"),
+                    failed=deps_n_outcomes.get("failed", False),
+                    test_file=test_file,
+                )
+
+                # Serialize bitmap
+                deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
+                blob = deps.serialize()
+                packages_str = deps.serialize_external_packages()
+                pending.append((test_id, blob, packages_str))
+
+            # Phase 2: skip unchanged deps (compare with existing blobs)
+            if pending and hasattr(self.db, "get_test_deps_batch"):
+                test_ids = [t[0] for t in pending]
+                existing = self.db.get_test_deps_batch(test_ids)
+                if existing:
+                    pending = [
+                        (tid, blob, pkgs)
+                        for tid, blob, pkgs in pending
+                        if existing.get(tid) != blob
+                    ]
+
+            # Phase 3: batch write all changed deps in one executemany
+            if pending and hasattr(self.db, "save_test_deps_batch"):
+                self.db.save_test_deps_batch(pending)
+            elif pending and hasattr(self.db, "save_test_deps"):
+                for test_id, blob, packages_str in pending:
+                    deps = TestDeps.deserialize(test_id, blob, packages_str)
+                    self.db.save_test_deps(test_id, deps)
+
+    def save_test_deps_raw(self, nodes_files_lines, outcomes):
+        """Save test deps directly from raw worker data, skipping per-test fingerprint iteration.
+
+        This is the fast path for xdist controller. Instead of iterating
+        230K tests × 1000 deps = 230M fingerprint lookups, we collect the
+        ~1000 unique filenames, compute checksums once per file, and resolve
+        file_ids in one pass.
+        """
+        import time as _t
+        _phase_times = {}
+        _t0 = _t.monotonic()
+        with self.db.con:
+            # Phase 0: collect all unique filenames
+            all_python_files = set()
+            all_data_files = {}  # filename -> sha (from file_deps tuples)
+            for deps_payload in nodes_files_lines.values():
+                for relpath in deps_payload.get("deps", set()):
+                    if isinstance(relpath, int):
+                        if 0 <= relpath < len(self.expected_files_list):
+                            all_python_files.add(self.expected_files_list[relpath])
+                    elif relpath:
+                        all_python_files.add(relpath)
+                for relpath_sha in deps_payload.get("file_deps", set()):
+                    relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
+                    sha = relpath_sha[1] if isinstance(relpath_sha, tuple) else None
+                    if isinstance(relpath, int):
+                        if 0 <= relpath < len(self.expected_files_list):
+                            relpath = self.expected_files_list[relpath]
+                        else:
+                            continue
+                    if relpath:
+                        all_data_files[relpath] = sha
+
+            _phase_times['collect_filenames'] = _t.monotonic() - _t0
+            _t1 = _t.monotonic()
+            # Compute checksums for all unique Python files (~1000 files, ~1-2s)
+            python_checksums = {}
+            for fname in all_python_files:
+                try:
+                    checksum, fsha, _mtime = self.file_cache.get_file_info(fname)
+                    python_checksums[fname] = (checksum, fsha)
+                except Exception:
+                    python_checksums[fname] = (None, None)
+
+            _phase_times['compute_checksums'] = _t.monotonic() - _t1
+            _t1 = _t.monotonic()
+            # Resolve all filenames → file_ids
+            file_id_map = {}
+            for fname in all_python_files:
+                cached = self._file_id_cache.get(fname)
+                if cached is not None:
+                    file_id_map[fname] = cached
+                    continue
+                checksum, fsha = python_checksums.get(fname, (None, None))
+                file_id = self.db.get_or_create_file_id(
+                    fname, checksum=checksum, fsha=fsha, file_type='python'
                 )
                 if file_id is not None:
-                    file_ids.add(file_id)
+                    file_id_map[fname] = file_id
+                    self._file_id_cache[fname] = file_id
 
-            # Process non-Python file dependencies
-            for file_dep in deps_n_outcomes.get("file_deps", []):
-                filename = file_dep["filename"]
-                sha = file_dep.get("sha")
-
+            for fname, sha in all_data_files.items():
+                cached = self._file_id_cache.get(fname)
+                if cached is not None:
+                    file_id_map[fname] = cached
+                    continue
                 checksum = file_sha_to_checksum(sha) if sha else None
-                encoded = self.path_encoder.encode(filename)
-                file_id = self.path_encoder.get_file_id(
-                    encoded, checksum=checksum, fsha=sha, file_type='data'
+                file_id = self.db.get_or_create_file_id(
+                    fname, checksum=checksum, fsha=sha, file_type='data'
                 )
                 if file_id is not None:
-                    file_ids.add(file_id)
+                    file_id_map[fname] = file_id
+                    self._file_id_cache[fname] = file_id
 
-            # Process external package dependencies
-            for pkg_name in deps_n_outcomes.get("external_deps", []):
-                external_packages.add(pkg_name)
+            _phase_times['resolve_file_ids'] = _t.monotonic() - _t1
+            _t1 = _t.monotonic()
+            # Phase 1: build pending list
+            pending = []
+            for test_name, deps_payload in nodes_files_lines.items():
+                file_ids = set()
 
-            # Get or create test ID
-            test_file = test_name.split("::")[0] if "::" in test_name else test_name
-            test_id = self.db.get_or_create_test_id(
-                self.exec_id,
-                test_name,
-                duration=deps_n_outcomes.get("duration"),
-                failed=deps_n_outcomes.get("failed", False),
-                test_file=test_file,
-            )
+                # Python deps
+                for relpath in deps_payload.get("deps", set()):
+                    if isinstance(relpath, int):
+                        if 0 <= relpath < len(self.expected_files_list):
+                            relpath = self.expected_files_list[relpath]
+                        else:
+                            continue
+                    fid = file_id_map.get(relpath)
+                    if fid is not None:
+                        file_ids.add(fid)
 
-            # Create and save bitmap-based dependencies
-            deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
-            if hasattr(self.db, "save_test_deps"):
-                self.db.save_test_deps(test_id, deps)
+                # Non-Python file deps
+                for relpath_sha in deps_payload.get("file_deps", set()):
+                    relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
+                    if isinstance(relpath, int):
+                        if 0 <= relpath < len(self.expected_files_list):
+                            relpath = self.expected_files_list[relpath]
+                        else:
+                            continue
+                    fid = file_id_map.get(relpath)
+                    if fid is not None:
+                        file_ids.add(fid)
+
+                # External packages — decode int codes
+                external_packages = set()
+                for pkg in deps_payload.get("external_deps", set()):
+                    if isinstance(pkg, int):
+                        if 0 <= pkg < len(self.expected_packages_list):
+                            pkg = self.expected_packages_list[pkg]
+                        else:
+                            continue
+                    elif isinstance(pkg, str) and self.package_code_map_rev:
+                        pkg = self.package_code_map_rev.get(pkg, pkg)
+                    external_packages.add(pkg)
+
+                # Outcome
+                outcome = outcomes.get(test_name, {"failed": False, "duration": 0.0})
+                forced = test_name in self.stable_test_names and (
+                    test_name not in self.failing_tests
+                )
+
+                test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                test_id = self.db.get_or_create_test_id(
+                    self.exec_id,
+                    test_name,
+                    duration=outcome.get("duration"),
+                    failed=outcome.get("failed", False),
+                    test_file=test_file,
+                )
+
+                deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
+                blob = deps.serialize()
+                packages_str = deps.serialize_external_packages()
+                pending.append((test_id, blob, packages_str))
+
+            _phase_times['build_pending'] = _t.monotonic() - _t1
+            _t1 = _t.monotonic()
+            # Phase 2: skip unchanged
+            if pending and hasattr(self.db, "get_test_deps_batch"):
+                test_ids = [t[0] for t in pending]
+                existing = self.db.get_test_deps_batch(test_ids)
+                if existing:
+                    pending = [
+                        (tid, blob, pkgs)
+                        for tid, blob, pkgs in pending
+                        if existing.get(tid) != blob
+                    ]
+
+            _phase_times['skip_unchanged'] = _t.monotonic() - _t1
+            _t1 = _t.monotonic()
+            # Phase 3: batch write
+            if pending and hasattr(self.db, "save_test_deps_batch"):
+                self.db.save_test_deps_batch(pending)
+            elif pending and hasattr(self.db, "save_test_deps"):
+                for test_id, blob, packages_str in pending:
+                    deps_obj = TestDeps.deserialize(test_id, blob, packages_str)
+                    self.db.save_test_deps(test_id, deps_obj)
+
+            _phase_times['batch_write'] = _t.monotonic() - _t1
+            _phase_times['total'] = _t.monotonic() - _t0
+            _core_timing_log("save_test_deps_raw_phases",
+                             n_tests=len(nodes_files_lines),
+                             n_python=len(all_python_files),
+                             n_data=len(all_data_files),
+                             n_pending=len(pending),
+                             **{f'phase_{k}': round(v, 3) for k, v in _phase_times.items()})
 
     def fetch_saving_stats(self, select):
         return self.db.fetch_saving_stats(self.exec_id, select)
@@ -936,8 +1093,6 @@ class TestmonCollector:
 
         # Dependency tracker for file and import tracking
         self.dependency_tracker = dependency_tracker or DependencyTracker(rootdir)
-        # Use singleton encoder for cache efficiency
-        self.path_encoder = get_encoder(rootdir)
         self.dependency_tracker.set_expected(
             expected_imports=expected_imports,
             expected_reads=expected_reads,

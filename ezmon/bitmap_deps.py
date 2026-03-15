@@ -82,6 +82,10 @@ except ImportError:
 # Compression level for zstd (1-22, higher = better compression, slower)
 ZSTD_COMPRESSION_LEVEL = 3
 
+# Module-level singletons to avoid per-call allocations (230K+ calls)
+_zstd_compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL) if HAVE_ZSTD else None
+_zstd_decompressor = zstd.ZstdDecompressor() if HAVE_ZSTD else None
+
 
 @dataclass
 class FileRecord:
@@ -157,9 +161,8 @@ class TestDeps:
             Compressed bytes suitable for database BLOB storage.
         """
         raw_bytes = self.file_ids.serialize()
-        if HAVE_ZSTD:
-            compressor = zstd.ZstdCompressor(level=ZSTD_COMPRESSION_LEVEL)
-            return compressor.compress(raw_bytes)
+        if _zstd_compressor is not None:
+            return _zstd_compressor.compress(raw_bytes)
         else:
             return gzip.compress(raw_bytes)
 
@@ -177,10 +180,9 @@ class TestDeps:
             TestDeps instance with populated bitmap and packages
         """
         # Try zstd first, fall back to gzip
-        if HAVE_ZSTD:
+        if _zstd_decompressor is not None:
             try:
-                decompressor = zstd.ZstdDecompressor()
-                raw_bytes = decompressor.decompress(blob)
+                raw_bytes = _zstd_decompressor.decompress(blob)
             except Exception:
                 # Might be gzip compressed
                 raw_bytes = gzip.decompress(blob)

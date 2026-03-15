@@ -299,6 +299,20 @@ class FileInfoCache:
 
         return results
 
+    def get_file_info(self, path: str) -> Tuple[Optional[int], Optional[str], Optional[float]]:
+        """Return (checksum, fsha, mtime) for a relative path, cached."""
+        norm = self._normalize_path(path)
+        cached = self._content_cache.get(norm)
+        if cached and cached.checksum is not None:
+            return cached.checksum, cached.fsha, cached.mtime
+        content = self._read_file(norm)
+        if content is None:
+            return None, None, None
+        ext = norm.rsplit(".", 1)[-1] if "." in norm else ""
+        content.checksum = compute_file_checksum(content.source, ext)
+        self._content_cache[norm] = content
+        return content.checksum, content.fsha, content.mtime
+
     def batch_get_checksums(
         self,
         paths: Iterable[str],

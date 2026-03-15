@@ -300,14 +300,20 @@ def git_current_head(path=None):
     path = git_path(path)
     if not path:
         return None
-    current_branch = git_current_branch(path)
-    if not current_branch:
+    git_head_file = os.path.join(path, "HEAD")
+    try:
+        with open(git_head_file, "r", encoding="utf8") as head_file:
+            head_content = head_file.read().strip()
+    except FileNotFoundError:
         return None
-    git_branch_file = os.path.join(path, "refs", "heads", current_branch)
+    # Detached HEAD: raw SHA
+    if not head_content.startswith("ref:"):
+        return head_content if len(head_content) == 40 else None
+    # Branch ref: resolve to SHA
+    branch = head_content.split("/")[-1]
+    git_branch_file = os.path.join(path, "refs", "heads", branch)
     try:
         with open(git_branch_file, "r", encoding="utf8") as branch_file:
-            head_sha = branch_file.read().strip()
-        return head_sha
+            return branch_file.read().strip()
     except FileNotFoundError:
-        pass
-    return None
+        return None

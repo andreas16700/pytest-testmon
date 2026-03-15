@@ -327,6 +327,16 @@ def init_testmon_data(config: Config):
         readonly=False,  # Controller/single always writes
     )
     testmon_data.determine_stable()
+
+    # Pre-warm fingerprint cache for all tracked files so that the hot path
+    # (get_file_info during test dep saving) is always a cache hit.
+    if testmon_data.files_of_interest:
+        _timing_log(config, "prewarm_fingerprint_start")
+        testmon_data.file_cache.batch_get_checksums(
+            testmon_data.files_of_interest, parallel=True
+        )
+        _timing_log(config, "prewarm_fingerprint_end")
+
     config.testmon_data = testmon_data
     _timing_log(config, "controller_init_end")
 
@@ -605,7 +615,6 @@ class TestmonCollect:
         self._worker_batch_size = 5
         self._file_index = {}
         self._package_index = {}
-        self._path_encoder = testmon_data.path_encoder
         # Aggregate hook timings (per worker/single)
         self._timing_totals = defaultdict(float)
         self._timing_counts = defaultdict(int)
@@ -619,7 +628,7 @@ class TestmonCollect:
         self._active_collection_file = None
 
         # Start collection-time tracking to capture import-time dependencies
-        if not getattr(self.testmon.dependency_tracker, "_collection_mode", False):
+        if self.testmon.dependency_tracker._scope == "idle":
             self.testmon.dependency_tracker.start_collection_tracking()
 
         # Worker-specific tuning.
@@ -644,6 +653,11 @@ class TestmonCollect:
             return
         self._write_queue.append(("deps", test_executions_fingerprints, failed_tests))
 
+    def _enqueue_write_raw(self, nodes_files_lines, outcomes, failed_tests):
+        if self._running_as != "controller":
+            return
+        self._write_queue.append(("deps_raw", (nodes_files_lines, outcomes), failed_tests))
+
     def _enqueue_sync(self, retain):
         if self._running_as != "controller":
             return
@@ -654,33 +668,67 @@ class TestmonCollect:
             return
         if self._config is not None:
             _timing_log(self._config, "controller_drain_queue_start", size=len(self._write_queue))
+
+        # Merge all queued items into batches to minimize DB transactions
+        merged_deps = {}
+        merged_raw_nodes = {}
+        merged_raw_outcomes = {}
+        all_failed = []
+        sync_retains = []
         while self._write_queue:
-            kind, payload, failed_tests = self._write_queue[0]
-            try:
-                if kind == "deps":
-                    if payload:
-                        if self._config is not None:
-                            _timing_log(self._config, "controller_save_bitmap_start")
-                        self.testmon_data.save_test_deps_bitmap(payload)
-                        if self._config is not None:
-                            _timing_log(self._config, "controller_save_bitmap_end")
-                    for test_name in failed_tests or []:
-                        test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                        self.testmon_data.db.get_or_create_test_id(
-                            self.testmon_data.exec_id,
-                            test_name,
-                            duration=self._outcomes.get(test_name, {}).get("duration", 0.0),
-                            failed=True,
-                            test_file=test_file,
-                        )
-                elif kind == "sync":
-                    self.testmon_data.sync_db_fs_tests(retain=set(payload))
-            except sqlite3.OperationalError as exc:
-                if "database is locked" in str(exc):
-                    time.sleep(0.05)
-                    continue
+            kind, payload, failed_tests = self._write_queue.popleft()
+            if kind == "deps":
+                if payload:
+                    merged_deps.update(payload)
+                if failed_tests:
+                    all_failed.extend(failed_tests)
+            elif kind == "deps_raw":
+                nodes_files_lines, outcomes = payload
+                if nodes_files_lines:
+                    merged_raw_nodes.update(nodes_files_lines)
+                if outcomes:
+                    merged_raw_outcomes.update(outcomes)
+                if failed_tests:
+                    all_failed.extend(failed_tests)
+            elif kind == "sync":
+                sync_retains.append(payload)
+
+        try:
+            if merged_deps:
+                if self._config is not None:
+                    _timing_log(self._config, "controller_save_bitmap_start")
+                self.testmon_data.save_test_deps_bitmap(merged_deps)
+                if self._config is not None:
+                    _timing_log(self._config, "controller_save_bitmap_end")
+            if merged_raw_nodes:
+                if self._config is not None:
+                    _timing_log(self._config, "controller_save_raw_start")
+                self.testmon_data.save_test_deps_raw(merged_raw_nodes, merged_raw_outcomes)
+                if self._config is not None:
+                    _timing_log(self._config, "controller_save_raw_end")
+            for test_name in all_failed:
+                test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                self.testmon_data.db.get_or_create_test_id(
+                    self.testmon_data.exec_id,
+                    test_name,
+                    duration=self._outcomes.get(test_name, {}).get("duration", 0.0),
+                    failed=True,
+                    test_file=test_file,
+                )
+            for retain in sync_retains:
+                self.testmon_data.sync_db_fs_tests(retain=set(retain))
+        except sqlite3.OperationalError as exc:
+            if "database is locked" in str(exc):
+                # Re-enqueue everything and retry later
+                if merged_deps:
+                    self._write_queue.appendleft(("deps", merged_deps, all_failed))
+                if merged_raw_nodes:
+                    self._write_queue.appendleft(("deps_raw", (merged_raw_nodes, merged_raw_outcomes), []))
+                for retain in sync_retains:
+                    self._write_queue.appendleft(("sync", retain, None))
+            else:
                 raise
-            self._write_queue.popleft()
+
         if self._config is not None:
             _timing_log(self._config, "controller_drain_queue_end")
 
@@ -874,6 +922,7 @@ class TestmonCollect:
         has_global_deps = bool(global_base_deps) or bool(global_file_deps)
         has_global_external = bool(global_external_deps)
 
+
         if not (
             has_file_deps
             or has_local_imports
@@ -1024,34 +1073,6 @@ class TestmonCollect:
             unique[test_name] = unique_deps
         return common, unique
 
-    def _encode_worker_deps(self, deps):
-        if self._running_as != "worker":
-            return deps
-
-        def _encode_path(path: str) -> str:
-            # Avoid double-encoding: if path doesn't exist under root, assume encoded.
-            try:
-                root = Path(self.testmon_data.rootdir)
-                candidate = Path(path)
-                if not candidate.is_absolute():
-                    candidate = root / candidate
-                if not candidate.exists():
-                    return path
-            except Exception:
-                return path
-            return self._path_encoder.encode(path)
-
-        encoded = {"deps": set(), "file_deps": set(), "external_deps": set()}
-        for path in deps.get("deps", set()):
-            encoded["deps"].add(_encode_path(path))
-
-        for path, sha in deps.get("file_deps", set()):
-            encoded["file_deps"].add((_encode_path(path), sha))
-
-        for pkg in deps.get("external_deps", set()):
-            encoded["external_deps"].add(self._package_index.get(pkg, pkg))
-        return encoded
-
     def _finalize_worker_test_file(self, test_file: str) -> None:
         if self._config is not None:
             _timing_log(self._config, "worker_finalize_file_start", test_file=test_file)
@@ -1073,9 +1094,16 @@ class TestmonCollect:
         if not succeeded:
             return
 
-        common, unique = self._compute_common_unique(succeeded)
-        encoded_common = self._encode_worker_deps(common)
-        encoded_test_file = self._path_encoder.encode(test_file)
+        # Workers must merge collection-time deps before sending, because in
+        # xdist the controller doesn't import test modules and has no
+        # collection deps to add back.
+        merged_succeeded = {
+            name: {k: set(v) for k, v in deps.items()}
+            for name, deps in succeeded.items()
+        }
+        merged_succeeded = self._merge_collection_deps(merged_succeeded)
+
+        common, unique = self._compute_common_unique(merged_succeeded)
 
         def _deps_to_payload(deps):
             payload = {}
@@ -1122,7 +1150,7 @@ class TestmonCollect:
         name_to_index = {name: idx for idx, name in enumerate(t_names)}
 
         file_payload = {}
-        common_payload = _deps_to_payload(encoded_common)
+        common_payload = _deps_to_payload(common)
         if common_payload:
             file_payload["com"] = common_payload
 
@@ -1130,8 +1158,7 @@ class TestmonCollect:
         dur = [0.0] * len(t_names)
         fail = []
         for (test_name, deps), suffix in zip(unique.items(), suffixes):
-            encoded_deps = self._encode_worker_deps(deps)
-            test_payload = _deps_to_payload(encoded_deps)
+            test_payload = _deps_to_payload(deps)
             encoded_name = _encode_name(suffix)
             idx = name_to_index.get(encoded_name)
             if idx is None:
@@ -1155,7 +1182,7 @@ class TestmonCollect:
         if prefixes:
             file_payload["pm"] = prefixes
 
-        self._worker_aggregate_files[encoded_test_file] = file_payload
+        self._worker_aggregate_files[test_file] = file_payload
         if len(self._worker_aggregate_files) >= self._worker_batch_size:
             self._worker_batches.append({"files": dict(self._worker_aggregate_files)})
             self._worker_aggregate_files.clear()
@@ -1289,7 +1316,6 @@ class TestmonCollect:
             _timing_log_for_actor("controller", "controller_receive_end", worker_id=worker_id, batch_count=0)
             return
         batches = nodes_files_lines.get("batches") or []
-        path_encoder = self.testmon_data.path_encoder
         for batch_index, batch in enumerate(batches):
             _timing_log_for_actor(
                 "controller",
@@ -1299,10 +1325,7 @@ class TestmonCollect:
                 file_count=len(batch.get("files") or {}),
             )
             files_payload = batch.get("files") or {}
-            for encoded_file, payload in files_payload.items():
-                test_file = str(path_encoder.decode(encoded_file))
-                if test_file.startswith(str(self.testmon_data.rootdir)):
-                    test_file = cached_relpath(test_file, str(self.testmon_data.rootdir))
+            for test_file, payload in files_payload.items():
                 prefix_map = payload.get("pm", []) or []
                 t_names = payload.get("t_names") or []
                 durations = payload.get("dur") or []
@@ -1400,16 +1423,10 @@ class TestmonCollect:
             )
         _timing_log_for_actor("controller", "controller_receive_end", worker_id=worker_id, batch_count=len(batches))
         nodes_files_lines = expanded
-        test_executions_fingerprints = None
         if nodes_files_lines:
             _timing_log_for_actor("controller", "controller_merge_collection_start", worker_id=worker_id)
             nodes_files_lines = self._merge_collection_deps(nodes_files_lines)
             _timing_log_for_actor("controller", "controller_merge_collection_end", worker_id=worker_id)
-            _timing_log_for_actor("controller", "controller_fingerprint_start", worker_id=worker_id)
-            test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
-                nodes_files_lines, self._outcomes
-            )
-            _timing_log_for_actor("controller", "controller_fingerprint_end", worker_id=worker_id)
 
         failed_tests = [
             name
@@ -1417,10 +1434,17 @@ class TestmonCollect:
             if outcome.get("failed")
         ]
         if self._running_as == "controller":
-            self._enqueue_write(test_executions_fingerprints, failed_tests)
-            self._drain_write_queue()
+            # Skip fingerprinting — pass raw deps directly to save_test_deps_raw.
+            # determine_stable() already maintains checksums in the DB.
+            self._enqueue_write_raw(nodes_files_lines, dict(self._outcomes), failed_tests)
         else:
-            if test_executions_fingerprints:
+            # Single-process fallback: fingerprint then save
+            if nodes_files_lines:
+                _timing_log_for_actor("controller", "controller_fingerprint_start", worker_id=worker_id)
+                test_executions_fingerprints = self.testmon_data.get_tests_fingerprints(
+                    nodes_files_lines, self._outcomes
+                )
+                _timing_log_for_actor("controller", "controller_fingerprint_end", worker_id=worker_id)
                 self.testmon_data.save_test_deps_bitmap(test_executions_fingerprints)
             for test_name in failed_tests:
                 test_file = test_name.split("::")[0] if "::" in test_name else test_name
@@ -1493,29 +1517,22 @@ class TestmonXdistSync:
             # Pass unstable_test_names (tests to RUN) instead of stable_test_names
             # This is ~750x smaller (255 tests vs 230k) for large test suites
             node.workerinput["testmon_exec_id"] = testmon_data.exec_id
-            node.workerinput["testmon_unstable_test_names"] = list(
-                testmon_data.unstable_test_names or set()
+            node.workerinput["testmon_unstable_test_names"] = (
+                list(testmon_data.unstable_test_names)
+                if testmon_data.unstable_test_names is not None
+                else None
             )
             node.workerinput["testmon_files_of_interest"] = list(
-                testmon_data.path_encoder.encode(path)
-                for path in (testmon_data.files_of_interest or [])
+                testmon_data.files_of_interest or []
             )
             node.workerinput["testmon_changed_packages"] = list(
                 getattr(testmon_data, "changed_packages", set()) or set()
             )
             node.workerinput["testmon_explicitly_nocollect_files"] = list(
-                testmon_data.path_encoder.encode(path)
-                for path in (
-                    getattr(testmon_data, "explicitly_nocollect_files", set())
-                    or set()
-                )
+                getattr(testmon_data, "explicitly_nocollect_files", set()) or set()
             )
             node.workerinput["testmon_min_collected_files"] = list(
-                testmon_data.path_encoder.encode(path)
-                for path in (
-                    getattr(testmon_data, "min_collected_files", set())
-                    or set()
-                )
+                getattr(testmon_data, "min_collected_files", set()) or set()
             )
             node.workerinput["testmon_expected_imports"] = list(
                 getattr(testmon_data, "expected_imports", set()) or set()
@@ -1614,8 +1631,6 @@ class TestmonSelect:
         self.explicitly_nocollect_files = set(
             getattr(testmon_data, "explicitly_nocollect_files", set()) or set()
         )
-        self._file_code_map = {}
-        self._path_encoder = testmon_data.path_encoder
 
         self._interrupted = False
 
@@ -1635,16 +1650,12 @@ class TestmonSelect:
         except AttributeError:
             is_dir = collection_path.isdir()
 
-        encoded_path = self._path_encoder.encode(strpath)
-        if not is_dir and encoded_path in self.explicitly_nocollect_files:
+        if not is_dir and strpath in self.explicitly_nocollect_files:
             return True
         return None
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
-        # Workers receive items from controller - skip selection/sorting logic
-        if self._running_as == "worker":
-            return
         _timing_log(config, "selection_start", item_count=len(items))
         always_run_files = getattr(config, "always_run_files", [])
         prioritized_files = getattr(config, "prioritized_files", [])
@@ -1699,9 +1710,9 @@ class TestmonSelect:
             # Neither forced nor prioritized
             # selected_tests=None means all tests run (fresh DB)
             if self.selected_tests is not None and item.nodeid not in self.selected_tests:
-                # Only deselect if the test was KNOWN at start (before sync_db_fs_tests)
-                # New tests (not in _known_tests_at_start) should always run
-                if item.nodeid in self._known_tests_at_start:
+                # Workers trust the controller's selected_tests unconditionally.
+                # Controller checks _known_tests_at_start so new tests always run.
+                if self._running_as == "worker" or item.nodeid in self._known_tests_at_start:
                     deselected.append(item)
                 else:
                     # New test - run it
@@ -1722,8 +1733,8 @@ class TestmonSelect:
             prioritized.extend(prioritized_by_file[f])
 
         # 3) Normal selected: duration priority (your existing testmon behavior)
-        # Skip reordering if --ezmon-no-reorder is set
-        no_reorder = config.getoption("ezmon_no_reorder", False)
+        # Skip reordering for workers (no avg_durations) or if --ezmon-no-reorder is set
+        no_reorder = self._running_as == "worker" or config.getoption("ezmon_no_reorder", False)
         if not no_reorder:
             sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
 
