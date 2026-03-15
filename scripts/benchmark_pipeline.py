@@ -213,9 +213,9 @@ def parse_timing_telemetry(timing_dir):
                     mono = ev.get("mono") or ev.get("ts")
                     if mono is None:
                         continue
-                    if event_name in ("controller_save_bitmap_start", "controller_save_raw_start"):
+                    if event_name in ("controller_save_bitmap_start", "controller_save_raw_start", "save_raw_collect_filenames_start"):
                         save_start = mono
-                    elif event_name in ("controller_save_bitmap_end", "controller_save_raw_end") and save_start is not None:
+                    elif event_name in ("controller_save_bitmap_end", "controller_save_raw_end", "save_raw_end") and save_start is not None:
                         elapsed_write = mono - save_start
                         if telemetry["db_write_secs"] is None:
                             telemetry["db_write_secs"] = elapsed_write

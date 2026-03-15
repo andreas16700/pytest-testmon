@@ -99,28 +99,50 @@ The high dep count is inherent to pandas: `pandas/__init__.py` eagerly imports m
 
 The overhead difference is entirely driven by dep count × test count: pandas has 22× more tests and 18× more deps per test, yielding ~400× more bitmap write work.
 
-## DB Write Optimization & Wire Format Fix (2026-03-15)
+## DB Write Optimization: Process Each Batch As It Arrives (2026-03-15)
 
-Two optimizations to the xdist controller DB write path, plus a wire format regression fix:
+### Problem
 
-### Optimizations kept
+The original controller accumulated ALL worker batch data into a write queue, then drained everything at session end in one massive `save_test_deps_raw` call. For pandas (230K tests):
 
-1. **Pre-warmed file metadata** — As worker batches arrive in `_handle_worker_output`, the controller calls `_prewarm_file_metadata()` to pre-compute `(checksum, fsha, file_id)` for each new file path. The accumulated `_precomputed_file_ids` map is passed to `save_test_deps_raw`, skipping Phases 0/0b/0c (file checksum computation + file ID resolution). Saves ~22s on pandas.
+- **23.5s** building the pending list (230K tests × ~1000 deps = ~230M dict lookups + bitmap serializations)
+- The "prewarming" optimization (pre-computing file IDs as batches arrived) saved ~22s on file ID resolution, but the pending-list-build bottleneck remained since everything was still processed in one giant call at the end
+- The write queue also caused double-processing when stale timing data was present
 
-2. **Batched test ID resolution** — Failed tests use `get_or_create_test_ids_batch()` instead of individual `get_or_create_test_id()` calls. Reduces per-test DB round-trips.
+### Solution
 
-### Wire format regression (fixed)
+Simplified to process each batch immediately when it arrives from workers. The controller is single-threaded — no concurrency concerns.
 
-Commit 83cac38 changed the worker→controller wire format from `file_common_unique_v2` to `plain_v1`, removing the common/unique dependency compression. This caused a **+125s regression** on pandas (187s → 313s):
+In `_handle_worker_output`, instead of `_enqueue_write_raw()` + `_prewarm_file_metadata()`, the controller now calls `save_test_deps_raw()` directly with just that batch's tests and outcomes. Each batch is ~246 tests (pandas avg per file).
 
-- `file_common_unique_v2` sends common deps once per file, unique deps per test — at pandas scale (~230K tests, ~1000 shared deps), the common set is nearly 100%.
-- `plain_v1` sent the full dep set for every test, inflating payloads ~97x.
+`save_test_deps_raw` already has lazy caching via `_file_id_cache` and `file_cache._content_cache` — both persist on the `TestmonData` instance across calls. First batch resolves ~1000 unique file paths; subsequent batches hit cache (~0.1s each).
 
-**Fix**: Reverted wire format to `file_common_unique_v2` while keeping all DB write optimizations. The `file_common_unique_v2` format drops shas from `file_deps` (sends paths only as `(path, None)`), which is compatible with the prewarm method — it falls back to `file_cache.get_tracked_sha(fname)` when sha is None.
+### What was removed (~90 lines deleted, ~10 added)
 
-Also reverted the batch flush threshold from `>= 1` (flush every file) back to `>= self._worker_batch_size` (batch multiple files per payload).
+- `_precomputed_file_ids` dict and all accumulation logic
+- `_enqueue_write()` and `_enqueue_write_raw()` methods
+- `_prewarm_file_metadata()` method (60 lines) — redundant with `save_test_deps_raw`'s own lazy caching
+- `precomputed_file_ids` parameter from `save_test_deps_raw` and Branch A that consumed it
+- `"deps_raw"` case from `_drain_write_queue` merge loop and re-enqueue logic
+- Separate `failed_tests` list construction for the controller path (Phase 1 of `save_test_deps_raw` handles failure marking via `get_or_create_test_ids_batch`)
 
-**Expected net result**: ~187s pre-prewarm baseline → ~165s target (keeping the ~22s prewarm savings).
+### What was kept
+
+- `_drain_write_queue` still handles `"deps"` (bitmap) and `"sync"` items as a session-end safety net
+- `save_test_deps_raw` internals unchanged — Phases 0-3 (collect filenames → checksums → file IDs → test IDs → skip unchanged → batch write) all stay
+- Single-process fallback path (`else` branch in `_handle_worker_output`) unchanged
+
+### Wire format regression (fixed earlier)
+
+Commit 83cac38 changed the worker→controller wire format from `file_common_unique_v2` to `plain_v1`, removing the common/unique dependency compression. This caused a **+125s regression** on pandas (187s → 313s). Fixed by reverting to `file_common_unique_v2`.
+
+### Expected performance
+
+- Each batch: ~246 tests, ~0.1s after file IDs are cached
+- First batch: ~1-2s (one-time file ID resolution for ~1000 unique paths)
+- DB writes spread across the run, overlapping with worker test execution
+- No end-of-session burst — queue is empty by session finish
+- Target: <100s total plugin time on pandas commit f39609216d (baseline 83.5s)
 
 ## Import Tracking Refactor (2026-03-14 → 2026-03-15)
 

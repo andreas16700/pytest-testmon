@@ -32,7 +32,7 @@ from ezmon.testmon_core import (
     get_test_execution_module_name,
     cached_relpath,
 )
-from ezmon.dependency_tracker import DependencyTracker, file_sha_to_checksum
+from ezmon.dependency_tracker import DependencyTracker
 from ezmon import configure
 from ezmon.common import get_logger, get_system_packages
 
@@ -619,7 +619,6 @@ class TestmonCollect:
         self._timing_totals = defaultdict(float)
         self._timing_counts = defaultdict(int)
         self._write_queue = deque()
-        self._precomputed_file_ids = {}  # {filepath: file_id} — accumulated during batch pre-warming
 
         # Collection-time dependency tracking
         # Maps test files to dependencies captured during import
@@ -649,81 +648,10 @@ class TestmonCollect:
             # Workers still execute collection hooks; global and per-file
             # baselines are captured directly by the dependency tracker.
 
-    def _enqueue_write(self, test_executions_fingerprints, failed_tests):
-        if self._running_as != "controller":
-            return
-        self._write_queue.append(("deps", test_executions_fingerprints, failed_tests))
-
-    def _enqueue_write_raw(self, nodes_files_lines, outcomes, failed_tests):
-        if self._running_as != "controller":
-            return
-        self._write_queue.append(("deps_raw", (nodes_files_lines, outcomes), failed_tests))
-
     def _enqueue_sync(self, retain):
         if self._running_as != "controller":
             return
         self._write_queue.append(("sync", retain, None))
-
-    def _prewarm_file_metadata(self, expanded):
-        """Pre-compute file metadata for deps in a batch. Called incrementally."""
-        if self._running_as != "controller":
-            return
-        t0 = time.monotonic()
-        file_cache = self.testmon_data.file_cache
-        db = self.testmon_data.db
-        efl = self.testmon_data.expected_files_list
-
-        python_files = set()
-        data_files = {}  # fname -> sha
-        for deps_payload in expanded.values():
-            for relpath in deps_payload.get("deps", set()):
-                if isinstance(relpath, int):
-                    if 0 <= relpath < len(efl):
-                        relpath = efl[relpath]
-                    else:
-                        continue
-                if relpath and relpath not in self._precomputed_file_ids:
-                    python_files.add(relpath)
-            for relpath_sha in deps_payload.get("file_deps", set()):
-                relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
-                sha = relpath_sha[1] if isinstance(relpath_sha, tuple) else None
-                if isinstance(relpath, int):
-                    if 0 <= relpath < len(efl):
-                        relpath = efl[relpath]
-                    else:
-                        continue
-                if relpath and relpath not in self._precomputed_file_ids:
-                    data_files[relpath] = sha
-
-        new_count = 0
-        for fname in python_files:
-            try:
-                checksum, fsha, _ = file_cache.get_file_info(fname)
-            except Exception:
-                checksum, fsha = None, None
-            fid = self.testmon_data._file_id_cache.get(fname)
-            if fid is None:
-                fid = db.get_or_create_file_id(fname, checksum=checksum, fsha=fsha, file_type='python')
-            if fid is not None:
-                self._precomputed_file_ids[fname] = fid
-                self.testmon_data._file_id_cache[fname] = fid
-                new_count += 1
-
-        for fname, sha in data_files.items():
-            if sha is None:
-                sha = file_cache.get_tracked_sha(fname)
-            checksum = file_sha_to_checksum(sha) if sha else None
-            fid = self.testmon_data._file_id_cache.get(fname)
-            if fid is None:
-                fid = db.get_or_create_file_id(fname, checksum=checksum, fsha=sha, file_type='data')
-            if fid is not None:
-                self._precomputed_file_ids[fname] = fid
-                self.testmon_data._file_id_cache[fname] = fid
-                new_count += 1
-
-        if new_count > 0:
-            self._timing_totals["prewarm_file_metadata"] += time.monotonic() - t0
-            self._timing_counts["prewarm_file_metadata"] += 1
 
     def _drain_write_queue(self):
         if self._running_as != "controller":
@@ -733,8 +661,6 @@ class TestmonCollect:
 
         # Merge all queued items into batches to minimize DB transactions
         merged_deps = {}
-        merged_raw_nodes = {}
-        merged_raw_outcomes = {}
         all_failed = []
         sync_retains = []
         while self._write_queue:
@@ -742,14 +668,6 @@ class TestmonCollect:
             if kind == "deps":
                 if payload:
                     merged_deps.update(payload)
-                if failed_tests:
-                    all_failed.extend(failed_tests)
-            elif kind == "deps_raw":
-                nodes_files_lines, outcomes = payload
-                if nodes_files_lines:
-                    merged_raw_nodes.update(nodes_files_lines)
-                if outcomes:
-                    merged_raw_outcomes.update(outcomes)
                 if failed_tests:
                     all_failed.extend(failed_tests)
             elif kind == "sync":
@@ -762,15 +680,6 @@ class TestmonCollect:
                 self.testmon_data.save_test_deps_bitmap(merged_deps)
                 if self._config is not None:
                     _timing_log(self._config, "controller_save_bitmap_end")
-            if merged_raw_nodes:
-                if self._config is not None:
-                    _timing_log(self._config, "controller_save_raw_start")
-                self.testmon_data.save_test_deps_raw(
-                    merged_raw_nodes, merged_raw_outcomes,
-                    precomputed_file_ids=self._precomputed_file_ids or None,
-                )
-                if self._config is not None:
-                    _timing_log(self._config, "controller_save_raw_end")
             if all_failed:
                 failed_tests_for_db = [
                     (name,
@@ -789,8 +698,6 @@ class TestmonCollect:
                 # Re-enqueue everything and retry later
                 if merged_deps:
                     self._write_queue.appendleft(("deps", merged_deps, all_failed))
-                if merged_raw_nodes:
-                    self._write_queue.appendleft(("deps_raw", (merged_raw_nodes, merged_raw_outcomes), []))
                 for retain in sync_retains:
                     self._write_queue.appendleft(("sync", retain, None))
             else:
@@ -1491,16 +1398,15 @@ class TestmonCollect:
         _timing_log_for_actor("controller", "controller_receive_end", worker_id=worker_id, batch_count=len(batches))
         nodes_files_lines = expanded
 
-        failed_tests = [
-            name
-            for name, outcome in self._outcomes.items()
-            if outcome.get("failed")
-        ]
         if self._running_as == "controller":
-            # Skip fingerprinting — pass raw deps directly to save_test_deps_raw.
-            # determine_stable() already maintains checksums in the DB.
-            self._enqueue_write_raw(nodes_files_lines, dict(self._outcomes), failed_tests)
-            self._prewarm_file_metadata(nodes_files_lines)
+            # Save raw deps directly as each batch arrives — no queuing.
+            # save_test_deps_raw Phase 1 handles test ID creation + failure marking.
+            if nodes_files_lines:
+                batch_outcomes = {
+                    name: self._outcomes.get(name, {"failed": False, "duration": 0.0})
+                    for name in nodes_files_lines
+                }
+                self.testmon_data.save_test_deps_raw(nodes_files_lines, batch_outcomes)
         else:
             # Single-process fallback: fingerprint then save
             if nodes_files_lines:
@@ -1510,6 +1416,11 @@ class TestmonCollect:
                 )
                 _timing_log_for_actor("controller", "controller_fingerprint_end", worker_id=worker_id)
                 self.testmon_data.save_test_deps_bitmap(test_executions_fingerprints)
+            failed_tests = [
+                name
+                for name, outcome in self._outcomes.items()
+                if outcome.get("failed")
+            ]
             if failed_tests:
                 failed_tests_for_db = [
                     (name,

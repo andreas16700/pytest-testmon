@@ -864,7 +864,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     deps = TestDeps.deserialize(test_id, blob, packages_str)
                     self.db.save_test_deps(test_id, deps)
 
-    def save_test_deps_raw(self, nodes_files_lines, outcomes, precomputed_file_ids=None):
+    def save_test_deps_raw(self, nodes_files_lines, outcomes):
         """Save test deps directly from raw worker data, skipping per-test fingerprint iteration.
 
         This is the fast path for xdist controller. Instead of iterating
@@ -872,8 +872,8 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         ~1000 unique filenames, compute checksums once per file, and resolve
         file_ids in one pass.
 
-        If precomputed_file_ids is provided, Phases 0/0b/0c are skipped entirely
-        (file metadata was pre-warmed incrementally as worker batches arrived).
+        File IDs are lazily cached via _file_id_cache and file_cache._content_cache,
+        both of which persist across calls on the TestmonData instance.
         """
         import time as _t
         _t0 = _t.monotonic()
@@ -895,74 +895,70 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     pass
 
         with self.db.con:
-            if precomputed_file_ids:
-                _tlog("save_raw_using_precomputed", n_precomputed=len(precomputed_file_ids))
-                file_id_map = dict(precomputed_file_ids)
-            else:
-                _tlog("save_raw_collect_filenames_start", n_tests=len(nodes_files_lines))
+            _tlog("save_raw_collect_filenames_start", n_tests=len(nodes_files_lines))
 
-                # Phase 0: collect all unique filenames
-                all_python_files = set()
-                all_data_files = {}  # filename -> sha (from file_deps tuples)
-                for deps_payload in nodes_files_lines.values():
-                    for relpath in deps_payload.get("deps", set()):
-                        if isinstance(relpath, int):
-                            if 0 <= relpath < len(self.expected_files_list):
-                                all_python_files.add(self.expected_files_list[relpath])
-                        elif relpath:
-                            all_python_files.add(relpath)
-                    for relpath_sha in deps_payload.get("file_deps", set()):
-                        relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
-                        sha = relpath_sha[1] if isinstance(relpath_sha, tuple) else None
-                        if isinstance(relpath, int):
-                            if 0 <= relpath < len(self.expected_files_list):
-                                relpath = self.expected_files_list[relpath]
-                            else:
-                                continue
-                        if relpath:
-                            all_data_files[relpath] = sha
+            # Phase 0: collect all unique filenames
+            all_python_files = set()
+            all_data_files = {}  # filename -> sha (from file_deps tuples)
+            for deps_payload in nodes_files_lines.values():
+                for relpath in deps_payload.get("deps", set()):
+                    if isinstance(relpath, int):
+                        if 0 <= relpath < len(self.expected_files_list):
+                            all_python_files.add(self.expected_files_list[relpath])
+                    elif relpath:
+                        all_python_files.add(relpath)
+                for relpath_sha in deps_payload.get("file_deps", set()):
+                    relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
+                    sha = relpath_sha[1] if isinstance(relpath_sha, tuple) else None
+                    if isinstance(relpath, int):
+                        if 0 <= relpath < len(self.expected_files_list):
+                            relpath = self.expected_files_list[relpath]
+                        else:
+                            continue
+                    if relpath:
+                        all_data_files[relpath] = sha
 
-                _tlog("save_raw_compute_checksums_start",
-                      n_python=len(all_python_files), n_data=len(all_data_files))
+            _tlog("save_raw_compute_checksums_start",
+                  n_python=len(all_python_files), n_data=len(all_data_files))
 
-                # Compute checksums for all unique Python files (~1000 files, ~1-2s)
-                python_checksums = {}
-                for fname in all_python_files:
-                    try:
-                        checksum, fsha, _mtime = self.file_cache.get_file_info(fname)
-                        python_checksums[fname] = (checksum, fsha)
-                    except Exception:
-                        python_checksums[fname] = (None, None)
+            # Compute checksums for all unique Python files (~1000 files, ~1-2s)
+            python_checksums = {}
+            for fname in all_python_files:
+                try:
+                    checksum, fsha, _mtime = self.file_cache.get_file_info(fname)
+                    python_checksums[fname] = (checksum, fsha)
+                except Exception:
+                    python_checksums[fname] = (None, None)
 
-                _tlog("save_raw_resolve_file_ids_start")
+            _tlog("save_raw_resolve_file_ids_start")
 
-                # Resolve all filenames → file_ids
-                file_id_map = {}
-                for fname in all_python_files:
-                    cached = self._file_id_cache.get(fname)
-                    if cached is not None:
-                        file_id_map[fname] = cached
-                        continue
-                    checksum, fsha = python_checksums.get(fname, (None, None))
-                    file_id = self.db.get_or_create_file_id(
-                        fname, checksum=checksum, fsha=fsha, file_type='python'
-                    )
-                    if file_id is not None:
-                        file_id_map[fname] = file_id
-                        self._file_id_cache[fname] = file_id
+            # Resolve all filenames → file_ids
+            file_id_map = {}
+            for fname in all_python_files:
+                cached = self._file_id_cache.get(fname)
+                if cached is not None:
+                    file_id_map[fname] = cached
+                    continue
+                checksum, fsha = python_checksums.get(fname, (None, None))
+                file_id = self.db.get_or_create_file_id(
+                    fname, checksum=checksum, fsha=fsha, file_type='python'
+                )
+                if file_id is not None:
+                    file_id_map[fname] = file_id
+                    self._file_id_cache[fname] = file_id
 
-                for fname, sha in all_data_files.items():
-                    cached = self._file_id_cache.get(fname)
-                    if cached is not None:
-                        file_id_map[fname] = cached
-                        continue
-                    checksum = file_sha_to_checksum(sha) if sha else None
-                    file_id = self.db.get_or_create_file_id(
-                        fname, checksum=checksum, fsha=sha, file_type='data'
-                    )
-                    if file_id is not None:
-                        file_id_map[fname] = file_id
-                        self._file_id_cache[fname] = file_id
+            for fname, sha in all_data_files.items():
+                cached = self._file_id_cache.get(fname)
+                if cached is not None:
+                    file_id_map[fname] = cached
+                    continue
+                checksum = file_sha_to_checksum(sha) if sha else None
+                file_id = self.db.get_or_create_file_id(
+                    fname, checksum=checksum, fsha=sha, file_type='data'
+                )
+                if file_id is not None:
+                    file_id_map[fname] = file_id
+                    self._file_id_cache[fname] = file_id
 
             _tlog("save_raw_build_pending_start",
                   n_file_ids=len(file_id_map))
