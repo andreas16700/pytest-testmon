@@ -868,8 +868,26 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         file_ids in one pass.
         """
         import time as _t
-        _phase_times = {}
         _t0 = _t.monotonic()
+
+        def _tlog(event, **fields):
+            _core_timing_log(event, **fields)
+            # Also emit to the xdist timing log (always active during benchmarks)
+            timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
+            if timing_dir:
+                import json as _json
+                payload = {"event": event, "actor": "controller",
+                           "ts": _t.time(), "mono": _t.monotonic()}
+                payload.update(fields)
+                try:
+                    path = os.path.join(timing_dir, "controller.jsonl")
+                    with open(path, "a") as f:
+                        f.write(_json.dumps(payload) + "\n")
+                except Exception:
+                    pass
+
+        _tlog("save_raw_collect_filenames_start", n_tests=len(nodes_files_lines))
+
         with self.db.con:
             # Phase 0: collect all unique filenames
             all_python_files = set()
@@ -892,8 +910,9 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     if relpath:
                         all_data_files[relpath] = sha
 
-            _phase_times['collect_filenames'] = _t.monotonic() - _t0
-            _t1 = _t.monotonic()
+            _tlog("save_raw_compute_checksums_start",
+                  n_python=len(all_python_files), n_data=len(all_data_files))
+
             # Compute checksums for all unique Python files (~1000 files, ~1-2s)
             python_checksums = {}
             for fname in all_python_files:
@@ -903,8 +922,8 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 except Exception:
                     python_checksums[fname] = (None, None)
 
-            _phase_times['compute_checksums'] = _t.monotonic() - _t1
-            _t1 = _t.monotonic()
+            _tlog("save_raw_resolve_file_ids_start")
+
             # Resolve all filenames → file_ids
             file_id_map = {}
             for fname in all_python_files:
@@ -933,8 +952,9 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     file_id_map[fname] = file_id
                     self._file_id_cache[fname] = file_id
 
-            _phase_times['resolve_file_ids'] = _t.monotonic() - _t1
-            _t1 = _t.monotonic()
+            _tlog("save_raw_build_pending_start",
+                  n_file_ids=len(file_id_map))
+
             # Phase 1: build pending list
             pending = []
             for test_name, deps_payload in nodes_files_lines.items():
@@ -995,21 +1015,25 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 packages_str = deps.serialize_external_packages()
                 pending.append((test_id, blob, packages_str))
 
-            _phase_times['build_pending'] = _t.monotonic() - _t1
-            _t1 = _t.monotonic()
+            _tlog("save_raw_skip_unchanged_start", n_pending=len(pending))
+
             # Phase 2: skip unchanged
             if pending and hasattr(self.db, "get_test_deps_batch"):
                 test_ids = [t[0] for t in pending]
                 existing = self.db.get_test_deps_batch(test_ids)
                 if existing:
+                    n_before = len(pending)
                     pending = [
                         (tid, blob, pkgs)
                         for tid, blob, pkgs in pending
                         if existing.get(tid) != blob
                     ]
+                    _tlog("save_raw_skip_unchanged_done",
+                          n_before=n_before, n_after=len(pending),
+                          n_skipped=n_before - len(pending))
 
-            _phase_times['skip_unchanged'] = _t.monotonic() - _t1
-            _t1 = _t.monotonic()
+            _tlog("save_raw_batch_write_start", n_to_write=len(pending))
+
             # Phase 3: batch write
             if pending and hasattr(self.db, "save_test_deps_batch"):
                 self.db.save_test_deps_batch(pending)
@@ -1018,14 +1042,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     deps_obj = TestDeps.deserialize(test_id, blob, packages_str)
                     self.db.save_test_deps(test_id, deps_obj)
 
-            _phase_times['batch_write'] = _t.monotonic() - _t1
-            _phase_times['total'] = _t.monotonic() - _t0
-            _core_timing_log("save_test_deps_raw_phases",
-                             n_tests=len(nodes_files_lines),
-                             n_python=len(all_python_files),
-                             n_data=len(all_data_files),
-                             n_pending=len(pending),
-                             **{f'phase_{k}': round(v, 3) for k, v in _phase_times.items()})
+            _tlog("save_raw_end",
+                  n_tests=len(nodes_files_lines),
+                  n_python=len(all_python_files),
+                  n_data=len(all_data_files),
+                  n_written=len(pending),
+                  total_secs=round(_t.monotonic() - _t0, 3))
 
     def fetch_saving_stats(self, select):
         return self.db.fetch_saving_stats(self.exec_id, select)
