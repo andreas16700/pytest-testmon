@@ -13,14 +13,13 @@ class TestBitmapSchema:
         """Create a temporary database for testing."""
         with tempfile.NamedTemporaryFile(suffix='.testmondata', delete=False) as f:
             db_path = f.name
-        db = DB(db_path)
-        yield db
-        db.con.close()
+        database = DB(db_path)
+        yield database
+        database.con.close()
         os.unlink(db_path)
 
     def test_all_filenames_returns_tracked_files(self, temp_db):
         """all_filenames() should return files from the files table."""
-        # Add files to the new schema
         temp_db.get_or_create_file_id("src/foo.py", checksum=123)
         temp_db.get_or_create_file_id("tests/test_foo.py", checksum=456)
 
@@ -43,16 +42,14 @@ class TestBitmapSchema:
         """filenames() should return files from the files table."""
         temp_db.get_or_create_file_id("src/bar.py", checksum=789)
 
-        filenames = temp_db.filenames(exec_id=1)
+        filenames = temp_db.filenames()
 
         assert "src/bar.py" in filenames
 
     def test_get_changed_file_ids_detects_checksum_change(self, temp_db):
         """get_changed_file_ids() should detect when checksums differ."""
-        # Create file with original checksum
         file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
 
-        # Query with different checksum
         changed = temp_db.get_changed_file_ids({"src/foo.py": 200})
 
         assert file_id in changed
@@ -67,74 +64,58 @@ class TestBitmapSchema:
 
     def test_get_changed_file_ids_new_file(self, temp_db):
         """get_changed_file_ids() should flag new files as changed."""
-        # Don't create the file in DB first
-
         changed = temp_db.get_changed_file_ids({"src/new_file.py": 100})
 
-        # New file should be created and flagged as changed
         assert len(changed) == 1
-        # Verify the file was created
         filenames = temp_db.all_filenames()
         assert "src/new_file.py" in filenames
 
     def test_determine_tests_bitmap_finds_affected_tests(self, temp_db):
         """determine_tests_bitmap() should find tests affected by file changes."""
-        # Setup: Create environment first
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
-        # Create file and test with dependency
-        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
-        test_id = temp_db.get_or_create_test_id(exec_id=exec_id, test_name="test_foo")
+        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
+        test_id = temp_db.get_or_create_test_id(test_name="test_foo", run_id=run_id)
 
         from ezmon.bitmap_deps import TestDeps
         deps = TestDeps.from_file_ids(test_id, {file_id}, set())
         temp_db.save_test_deps(test_id, deps)
 
-        # Change the file
         result = temp_db.determine_tests_bitmap(
-            exec_id=exec_id,
-            files_checksums={"src/foo.py": 200},  # Different checksum
+            files_checksums={"src/foo.py": 200},
         )
 
         assert "test_foo" in result["affected"]
 
     def test_determine_tests_bitmap_no_change_no_affected(self, temp_db):
         """determine_tests_bitmap() should not flag tests when no changes."""
-        # Setup: Create environment first
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
-        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
-        test_id = temp_db.get_or_create_test_id(exec_id=exec_id, test_name="test_foo")
+        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
+        test_id = temp_db.get_or_create_test_id(test_name="test_foo", run_id=run_id)
 
         from ezmon.bitmap_deps import TestDeps
         deps = TestDeps.from_file_ids(test_id, {file_id}, set())
         temp_db.save_test_deps(test_id, deps)
 
         result = temp_db.determine_tests_bitmap(
-            exec_id=exec_id,
-            files_checksums={"src/foo.py": 100},  # Same checksum
+            files_checksums={"src/foo.py": 100},
         )
 
         assert "test_foo" not in result["affected"]
 
     def test_all_test_executions_returns_from_tests_table(self, temp_db):
         """all_test_executions() should query the tests table."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
         temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_one", duration=1.5, failed=False
+            test_name="test_one", duration=1.5, failed=False, run_id=run_id
         )
         temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_two", duration=2.0, failed=True
+            test_name="test_two", duration=2.0, failed=True, run_id=run_id
         )
 
-        tests = temp_db.all_test_executions(exec_id=exec_id)
+        tests = temp_db.all_test_executions()
 
         assert "test_one" in tests
         assert "test_two" in tests
@@ -143,85 +124,72 @@ class TestBitmapSchema:
 
     def test_fetch_current_run_stats_returns_from_tests_table(self, temp_db):
         """fetch_current_run_stats() should query the tests table."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
         temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_one", duration=1.5, failed=False
+            test_name="test_one", duration=1.5, failed=False, run_id=run_id
         )
         temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_two", duration=2.5, failed=False
+            test_name="test_two", duration=2.5, failed=False, run_id=run_id
         )
 
         run_saved_time, run_all_time, run_saved_tests, run_all_tests = \
-            temp_db.fetch_current_run_stats(exec_id)
+            temp_db.fetch_current_run_stats()
 
         assert run_saved_tests == 2
         assert run_all_tests == 2
-        assert run_saved_time == 4.0  # 1.5 + 2.5
+        assert run_saved_time == 4.0
         assert run_all_time == 4.0
 
     def test_get_failing_tests_bitmap(self, temp_db):
         """get_failing_tests_bitmap() should return failed tests."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
         temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_pass", duration=1.0, failed=False
+            test_name="test_pass", duration=1.0, failed=False, run_id=run_id
         )
         temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_fail", duration=1.0, failed=True
+            test_name="test_fail", duration=1.0, failed=True, run_id=run_id
         )
 
-        failing = temp_db.get_failing_tests_bitmap(exec_id)
+        failing = temp_db.get_failing_tests_bitmap()
 
         assert "test_fail" in failing
         assert "test_pass" not in failing
 
     def test_delete_test(self, temp_db):
         """delete_test() should remove test and its dependencies."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
-        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
+        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
         test_id = temp_db.get_or_create_test_id(
-            exec_id=exec_id, test_name="test_to_delete"
+            test_name="test_to_delete", run_id=run_id
         )
 
         from ezmon.bitmap_deps import TestDeps
         deps = TestDeps.from_file_ids(test_id, {file_id}, set())
         temp_db.save_test_deps(test_id, deps)
 
-        # Verify test exists
-        tests = temp_db.all_test_executions(exec_id)
+        tests = temp_db.all_test_executions()
         assert "test_to_delete" in tests
 
-        # Delete the test
-        temp_db.delete_test(exec_id, "test_to_delete")
+        temp_db.delete_test("test_to_delete")
 
-        # Verify test is gone
-        tests = temp_db.all_test_executions(exec_id)
+        tests = temp_db.all_test_executions()
         assert "test_to_delete" not in tests
 
-        # Verify deps are gone too
         deps = temp_db.get_test_deps(test_id)
         assert deps is None
 
     def test_get_or_create_file_id_updates_checksum(self, temp_db):
         """get_or_create_file_id() should update checksum on subsequent calls."""
-        # First call creates file
         file_id1 = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
 
-        # Second call with different checksum should return same ID
-        temp_db.get_or_create_file_id.cache_clear()  # Clear cache to force DB lookup
+        temp_db.get_or_create_file_id.cache_clear()
         file_id2 = temp_db.get_or_create_file_id("src/foo.py", checksum=200)
 
         assert file_id1 == file_id2
 
-        # Verify checksum was updated
         checksums = temp_db.get_file_checksums()
         assert checksums["src/foo.py"] == 200
 
@@ -245,52 +213,70 @@ class TestBitmapSchema:
         assert id_map["src/bar.py"] == id2
 
 
-class TestFetchUnknownFiles:
-    """Test the _fetch_unknown_files_from_one_v method."""
+class TestRunManagement:
+    """Test the new runs table management."""
 
     @pytest.fixture
     def temp_db(self):
-        """Create a temporary database for testing."""
         with tempfile.NamedTemporaryFile(suffix='.testmondata', delete=False) as f:
             db_path = f.name
-        db = DB(db_path)
-        yield db
-        db.con.close()
+        database = DB(db_path)
+        yield database
+        database.con.close()
         os.unlink(db_path)
 
-    def test_fetch_unknown_files_detects_changed_fsha(self, temp_db):
-        """_fetch_unknown_files_from_one_v() should find files with changed fsha."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+    def test_create_run_returns_id(self, temp_db):
+        run_id = temp_db.create_run("abc123", "numpy 1.0, pandas 2.0", "3.11.0")
+        assert run_id is not None
+        assert isinstance(run_id, int)
 
-        # Create a file with a known fsha
-        temp_db.get_or_create_file_id("src/foo.py", checksum=100, fsha="abc123")
+    def test_get_latest_run_commit_id(self, temp_db):
+        temp_db.create_run("first_commit", "packages", "3.11.0")
+        temp_db.create_run("second_commit", "packages", "3.11.0")
+        assert temp_db.get_latest_run_commit_id() == "second_commit"
 
-        # Call fetch_unknown_files with a different fsha
-        unknown = temp_db.fetch_unknown_files(
-            {"src/foo.py": "different_fsha"},
-            exec_id
-        )
+    def test_get_latest_run_commit_id_empty(self, temp_db):
+        assert temp_db.get_latest_run_commit_id() is None
 
-        assert "src/foo.py" in unknown
+    def test_get_previous_run_info(self, temp_db):
+        temp_db.create_run("abc123", "numpy 1.0", "3.11.0")
+        info = temp_db.get_previous_run_info()
+        assert info["commit_id"] == "abc123"
+        assert info["packages"] == "numpy 1.0"
+        assert info["python_version"] == "3.11.0"
 
-    def test_fetch_unknown_files_no_change_when_fsha_matches(self, temp_db):
-        """_fetch_unknown_files_from_one_v() should not flag unchanged files."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+    def test_get_previous_run_info_empty(self, temp_db):
+        assert temp_db.get_previous_run_info() is None
 
-        # Create a file with a known fsha
-        temp_db.get_or_create_file_id("src/foo.py", checksum=100, fsha="abc123")
+    def test_finish_run(self, temp_db):
+        run_id = temp_db.create_run("abc123", "packages", "3.11.0")
+        temp_db.finish_run(run_id, duration=10.5, tests_selected=50,
+                          tests_deselected=100, tests_all=150,
+                          time_saved=30.0, time_all=45.0)
+        row = temp_db.con.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert row["duration"] == 10.5
+        assert row["tests_selected"] == 50
+        assert row["tests_all"] == 150
 
-        # Call fetch_unknown_files with the same fsha
-        unknown = temp_db.fetch_unknown_files(
-            {"src/foo.py": "abc123"},
-            exec_id
-        )
+    def test_run_id_on_files(self, temp_db):
+        """Files should track which run last wrote them."""
+        run_id = temp_db.create_run("abc123", "packages", "3.11.0")
+        temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
+        row = temp_db.con.execute(
+            "SELECT run_id FROM files WHERE path = 'src/foo.py'"
+        ).fetchone()
+        assert row["run_id"] == run_id
 
-        assert "src/foo.py" not in unknown
+    def test_run_id_on_tests(self, temp_db):
+        """Tests should track which run last wrote them."""
+        run_id = temp_db.create_run("abc123", "packages", "3.11.0")
+        temp_db.get_or_create_test_id("test_foo", run_id=run_id)
+        row = temp_db.con.execute(
+            "SELECT run_id FROM tests WHERE name = 'test_foo'"
+        ).fetchone()
+        assert row["run_id"] == run_id
 
 
 class TestDataFileDependencies:
@@ -298,22 +284,19 @@ class TestDataFileDependencies:
 
     @pytest.fixture
     def temp_db(self):
-        """Create a temporary database for testing."""
         with tempfile.NamedTemporaryFile(suffix='.testmondata', delete=False) as f:
             db_path = f.name
-        db = DB(db_path)
-        yield db
-        db.con.close()
+        database = DB(db_path)
+        yield database
+        database.con.close()
         os.unlink(db_path)
 
     def test_get_changed_data_file_ids_detects_fsha_change(self, temp_db):
         """get_changed_data_file_ids() should detect when fsha differs."""
-        # Create data file with original fsha
         file_id = temp_db.get_or_create_file_id(
             "config.json", checksum=None, fsha="original_hash", file_type='data'
         )
 
-        # Query with different fsha
         changed = temp_db.get_changed_data_file_ids({"config.json": "new_hash"})
 
         assert file_id in changed
@@ -330,28 +313,22 @@ class TestDataFileDependencies:
 
     def test_determine_tests_bitmap_with_data_files(self, temp_db):
         """determine_tests_bitmap() should detect data file changes."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
-        # Create python file and data file
-        py_file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
+        py_file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
         data_file_id = temp_db.get_or_create_file_id(
-            "config.json", checksum=None, fsha="original", file_type='data'
+            "config.json", checksum=None, fsha="original", file_type='data', run_id=run_id
         )
 
-        # Create test that depends on both files
-        test_id = temp_db.get_or_create_test_id(exec_id=exec_id, test_name="test_config")
+        test_id = temp_db.get_or_create_test_id(test_name="test_config", run_id=run_id)
 
         from ezmon.bitmap_deps import TestDeps
         deps = TestDeps.from_file_ids(test_id, {py_file_id, data_file_id}, set())
         temp_db.save_test_deps(test_id, deps)
 
-        # Change the data file
         result = temp_db.determine_tests_bitmap(
-            exec_id=exec_id,
-            files_checksums={"src/foo.py": 100},  # Python file unchanged
-            file_deps_shas={"config.json": "changed"},  # Data file changed
+            files_checksums={"src/foo.py": 100},
+            file_deps_shas={"config.json": "changed"},
         )
 
         assert "test_config" in result["affected"]
@@ -362,55 +339,77 @@ class TestExternalPackageDependencies:
 
     @pytest.fixture
     def temp_db(self):
-        """Create a temporary database for testing."""
         with tempfile.NamedTemporaryFile(suffix='.testmondata', delete=False) as f:
             db_path = f.name
-        db = DB(db_path)
-        yield db
-        db.con.close()
+        database = DB(db_path)
+        yield database
+        database.con.close()
         os.unlink(db_path)
 
     def test_find_affected_tests_with_package_change(self, temp_db):
         """find_affected_tests_bitmap() should detect package changes."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
-        # Create file and test with package dependency
-        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
-        test_id = temp_db.get_or_create_test_id(exec_id=exec_id, test_name="test_numpy")
+        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
+        test_id = temp_db.get_or_create_test_id(test_name="test_numpy", run_id=run_id)
 
         from ezmon.bitmap_deps import TestDeps
         deps = TestDeps.from_file_ids(test_id, {file_id}, {"numpy"})
         temp_db.save_test_deps(test_id, deps)
 
-        # Simulate package change
         affected = temp_db.find_affected_tests_bitmap(
-            exec_id=exec_id,
-            changed_file_ids=set(),  # No file changes
-            changed_packages={"numpy"},  # Package changed
+            changed_file_ids=set(),
+            changed_packages={"numpy"},
         )
 
         assert "test_numpy" in affected
 
     def test_find_affected_tests_unrelated_package_change(self, temp_db):
         """find_affected_tests_bitmap() should not flag unrelated package changes."""
-        exec_id, _, _, _ = temp_db.fetch_or_create_environment(
-            "test_env", "packages", "3.9"
-        )
+        run_id = temp_db.create_run("abc123", "packages", "3.9")
 
-        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
-        test_id = temp_db.get_or_create_test_id(exec_id=exec_id, test_name="test_numpy")
+        file_id = temp_db.get_or_create_file_id("src/foo.py", checksum=100, run_id=run_id)
+        test_id = temp_db.get_or_create_test_id(test_name="test_numpy", run_id=run_id)
 
         from ezmon.bitmap_deps import TestDeps
         deps = TestDeps.from_file_ids(test_id, {file_id}, {"numpy"})
         temp_db.save_test_deps(test_id, deps)
 
-        # Simulate unrelated package change
         affected = temp_db.find_affected_tests_bitmap(
-            exec_id=exec_id,
             changed_file_ids=set(),
-            changed_packages={"pandas"},  # Different package changed
+            changed_packages={"pandas"},
         )
 
         assert "test_numpy" not in affected
+
+
+class TestSchemaIntegrity:
+    """Test the new 5-table schema."""
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.NamedTemporaryFile(suffix='.testmondata', delete=False) as f:
+            db_path = f.name
+        database = DB(db_path)
+        yield database
+        database.con.close()
+        os.unlink(db_path)
+
+    def test_only_five_tables_created(self, temp_db):
+        """Schema should only have 5 user tables: metadata, runs, files, tests, test_deps."""
+        tables = temp_db.con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        table_names = sorted([row[0] for row in tables])
+        assert table_names == ["files", "metadata", "runs", "test_deps", "tests"]
+
+    def test_metadata_uses_key_value(self, temp_db):
+        """Metadata table should use key/value columns."""
+        temp_db.write_attribute("test_key", "test_value")
+        result = temp_db.fetch_attribute("test_key")
+        assert result == "test_value"
+
+    def test_data_version_is_19(self, temp_db):
+        """Data version should be 19."""
+        version = temp_db.con.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 19

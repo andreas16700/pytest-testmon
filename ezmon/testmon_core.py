@@ -24,6 +24,7 @@ from ezmon.common import (
     drop_patch_version,
     git_current_head,
     compute_package_diff,
+    compute_changed_packages,
 )
 
 from ezmon.process_code import (
@@ -197,50 +198,69 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.file_cache = FileInfoCache(self.rootdir)
         self.source_tree = SourceTree(rootdir=self.rootdir, file_cache=self.file_cache)
         if system_packages is None:
-            # Pass rootdir to auto-detect and exclude local packages
             system_packages = get_system_packages(rootdir=self.rootdir)
         system_packages = drop_patch_version(system_packages)
         if not python_version:
             python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
         if database:
-            self.db = database  # pylint: disable=invalid-name
+            self.db = database
         else:
-            self.db = create_database(self.rootdir, readonly=readonly)  # pylint: disable=invalid-name
+            self.db = create_database(self.rootdir, readonly=readonly)
 
-        try:
-            result = self.db.initiate_execution(
-                self.environment,
-                system_packages,
-                python_version,
-                {
-                    "tm_client_version": TM_CLIENT_VERSION,
-                    "git_head_sha": git_current_head(),
-                    "ci": os.environ.get("CI"),
-                },
-            )
-        except (ConnectionRefusedError, Fault, ProtocolError, gaierror) as exc:
-            logger.error(
-                (
-                    "%s error when communication with ezmon.net. (falling back to"
-                    " .testmondata locally)"
-                ),
-                exc,
-            )
-            self.db = db.DB(
-                os.path.join(self.rootdir, get_data_file_path())
-            )  # pylint: disable=invalid-name
-            result = self.db.initiate_execution(
-                self.environment, system_packages, python_version, {}
-            )
-        self.exec_id = result["exec_id"]
         self.commit_id = git_current_head(rootdir)
+        self.current_packages = system_packages
+        self.previous_packages = ""
+        self.changed_packages = set()
+        self.system_packages_change = False
 
-        self.system_packages_change = result["packages_changed"]
-        self.changed_packages = result.get("changed_packages", set())  # Granular package tracking
-        self.previous_packages = result.get("previous_packages", "")
-        self.current_packages = result.get("current_packages", "")
-        self.files_of_interest = result["filenames"]
+        # NetDB path: use old initiate_execution interface
+        if isinstance(self.db, NetDB):
+            try:
+                result = self.db.initiate_execution(
+                    self.environment,
+                    system_packages,
+                    python_version,
+                    {
+                        "tm_client_version": TM_CLIENT_VERSION,
+                        "git_head_sha": git_current_head(),
+                        "ci": os.environ.get("CI"),
+                    },
+                )
+            except (ConnectionRefusedError, Fault, ProtocolError, gaierror) as exc:
+                logger.error(
+                    "%s error when communication with ezmon.net. (falling back to .testmondata locally)",
+                    exc,
+                )
+                self.db = db.DB(os.path.join(self.rootdir, get_data_file_path()))
+                # Fall through to local DB path below
+
+        # Local DB path: use new runs-based interface
+        if not isinstance(self.db, NetDB):
+            prev = self.db.get_previous_run_info()
+            self.previous_commit_id = None
+            if prev:
+                self.previous_commit_id = prev.get("commit_id")
+                self.previous_packages = prev.get("packages", "") or ""
+                prev_python = prev.get("python_version", "") or ""
+                if prev_python != python_version:
+                    self.changed_packages = {"__python_version_changed__"}
+                elif self.previous_packages != system_packages:
+                    self.changed_packages = compute_changed_packages(
+                        self.previous_packages, system_packages
+                    )
+            self.system_packages_change = bool(self.changed_packages)
+            self.run_id = self.db.create_run(self.commit_id, system_packages, python_version)
+            self.files_of_interest = self.db.all_filenames()
+        else:
+            # NetDB result handling
+            self.run_id = result["exec_id"]
+            self.system_packages_change = result["packages_changed"]
+            self.changed_packages = result.get("changed_packages", set())
+            self.previous_packages = result.get("previous_packages", "")
+            self.current_packages = result.get("current_packages", "")
+            self.files_of_interest = result["filenames"]
+
         self.expected_files_list = []
         self.expected_packages_list = []
         self.file_code_map = {}
@@ -259,7 +279,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     def for_worker(
         cls,
         rootdir,
-        exec_id,
+        run_id,
         unstable_test_names,
         files_of_interest,
         changed_packages,
@@ -276,16 +296,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         Workers receive stability data from the controller via workerinput to avoid
         race conditions where workers independently compute different stable_test_names
         by reading the database at different times.
-
-        Args:
-            rootdir: Project root directory
-            exec_id: Execution ID from the controller
-            unstable_test_names: Set/list of test names that need to run (affected by changes)
-            files_of_interest: List of files being tracked
-            changed_packages: Set/list of packages that changed
-
-        Returns:
-            TestmonData instance configured for worker use
         """
         instance = object.__new__(cls)
         instance.rootdir = rootdir
@@ -297,7 +307,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         instance.db = None
 
         # Use pre-computed data from controller
-        instance.exec_id = exec_id
+        instance.run_id = run_id
         instance.commit_id = git_current_head(rootdir)
         instance.files_of_interest = list(files_of_interest) if files_of_interest else []
         instance.changed_packages = set(changed_packages) if changed_packages else set()
@@ -366,7 +376,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
     @property
     def all_tests(self):
-        return self.db.all_test_executions(self.exec_id)
+        return self.db.all_test_executions()
 
     def get_tests_fingerprints(self, nodes_files_lines, outcomes) -> TestExecutions:
         """Create fingerprints for tests based on file dependencies.
@@ -504,7 +514,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
         to_delete = list(set(self.all_tests) - collected)
         with self.db as database:
-            database.delete_test_executions(to_delete, self.exec_id)
+            database.delete_test_executions(to_delete)
 
     def determine_stable(self):
         """Determine which tests are stable (unchanged) vs unstable (need to run).
@@ -524,7 +534,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.git_affected_files = set()
         self.min_collected_files = set()
 
-        last_commit = self.db.get_latest_run_commit_id()
+        last_commit = getattr(self, "previous_commit_id", None) or self.db.get_latest_run_commit_id()
         has_existing_data = bool(last_commit) and not self.new_db and bool(self.all_tests)
 
         # Compute package deltas
@@ -620,26 +630,22 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
         # Find affected tests via bitmap
         affected_tests = set(
-            self.db.find_affected_tests_bitmap(
-                self.exec_id, changed_file_ids, pack_affecting
-            )
+            self.db.find_affected_tests_bitmap(changed_file_ids, pack_affecting)
         )
-        self.failing_tests = set(self.db.get_failing_tests_bitmap(self.exec_id))
+        self.failing_tests = set(self.db.get_failing_tests_bitmap())
         min_selected_tests = affected_tests | self.failing_tests
 
         self.unstable_test_names = set(min_selected_tests)
         self.stable_test_names = set(self.all_tests) - self.unstable_test_names
 
         # Collect only test files that contain min_selected_tests
-        min_collected_files = self.db.get_test_files_for_tests(
-            self.exec_id, min_selected_tests
-        )
-        known_test_files = self.db.get_all_test_files(self.exec_id)
+        min_collected_files = self.db.get_test_files_for_tests(min_selected_tests)
+        known_test_files = self.db.get_all_test_files()
         self.explicitly_nocollect_files = set(known_test_files) - set(min_collected_files)
         self.min_collected_files = set(min_collected_files)
 
         self.unstable_files = set(self.git_affected_files)
-        self.stable_files = set(self.db.filenames(self.exec_id)) - self.unstable_files
+        self.stable_files = set(self.db.filenames()) - self.unstable_files
 
         self.expected_packages = set(
             encode_packages(self.expected_packages, self.package_code_map)
@@ -730,7 +736,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         file_deps_shas = {}
 
         # Get list of file dependencies from database
-        file_dep_filenames = self.db.get_file_dependency_filenames(self.exec_id)
+        file_dep_filenames = self.db.get_file_dependency_filenames()
 
         if not file_dep_filenames:
             return file_deps_shas
@@ -791,7 +797,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     deps_n_outcomes.get("duration"),
                     deps_n_outcomes.get("failed", False),
                 ))
-            test_id_map = self.db.get_or_create_test_ids_batch(self.exec_id, tests_for_db)
+            test_id_map = self.db.get_or_create_test_ids_batch(self.run_id, tests_for_db)
 
             # Resolve file IDs and serialize deps
             pending = []  # list of (test_id, blob, packages_str)
@@ -971,7 +977,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False)))
 
             _tlog("save_raw_bulk_test_ids_start", n_tests=len(tests_for_db))
-            test_id_map = self.db.get_or_create_test_ids_batch(self.exec_id, tests_for_db)
+            test_id_map = self.db.get_or_create_test_ids_batch(self.run_id, tests_for_db)
             _tlog("save_raw_bulk_test_ids_end", n_resolved=len(test_id_map))
 
             pending = []
@@ -1056,7 +1062,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                   total_secs=round(_t.monotonic() - _t0, 3))
 
     def fetch_saving_stats(self, select):
-        return self.db.fetch_saving_stats(self.exec_id, select)
+        return self.db.fetch_saving_stats(select)
 
 
 def get_new_mtimes(filesystem, hits):

@@ -10,7 +10,7 @@ from ezmon.common import get_logger
 from ezmon.bitmap_deps import TestDeps, find_affected_tests
 
 
-DATA_VERSION = 18  # Bumped for Roaring bitmap dependency storage
+DATA_VERSION = 19  # Radical schema simplification: 5 tables, no environment partitioning
 
 
 class TestmonDbException(Exception):
@@ -75,14 +75,6 @@ class DB:  # pylint: disable=too-many-public-methods
             self.file_created = True
         else:
             self.file_created = False
-        self.con.executescript(self._local_temp_tables_statement())
-        # Ensure run_infos table exists for older DB files without recreating the DB file.
-        # Using IF NOT EXISTS makes this safe to run against an existing DB.
-        self.con.executescript(self._create_run_infos_statement())
-        self._ensure_run_infos_schema()
-        self._ensure_run_infos_unique_index()
-        self._ensure_tests_schema()
-        # Dependency graph is no longer stored; keep schema lean.
 
     def version_compatibility(self):
         return DATA_VERSION
@@ -109,22 +101,8 @@ class DB:  # pylint: disable=too-many-public-methods
                 self.con = None
                 self._closed = True
 
-    def _test_execution_fk_column(self) -> str:
-        return "environment_id"
-
-    def _test_execution_fk_table(self) -> str:
-        return "environment"
-
-    def update_mtimes(self, new_mtimes):
-        with self.con as con:
-            con.executemany(
-                "UPDATE file_fp SET mtime=?, fsha=? WHERE id = ?", new_mtimes
-            )
-
-    def finish_execution(
-        self, exec_id, duration=None, select=True, commit_id: Optional[str] = None
-    ):  # pylint: disable=unused-argument
-        self.update_saving_stats(exec_id, select, commit_id=commit_id)
+    def finish_execution(self, duration=None, select=True, commit_id: Optional[str] = None):
+        """Legacy finish_execution — delegates to finish_run if a run exists."""
         self.get_or_create_file_id.cache_clear()
         with self.con as con:
             self.vacuum_files(con)
@@ -140,20 +118,15 @@ class DB:  # pylint: disable=too-many-public-methods
             """DELETE FROM tests WHERE id NOT IN (SELECT test_id FROM test_deps)"""
         )
 
-    def fetch_current_run_stats(self, exec_id):
-        """Fetch run statistics from the tests table (bitmap schema)."""
+    def fetch_current_run_stats(self):
+        """Fetch run statistics from the tests table."""
         with self.con as con:
             cursor = con.cursor()
-            # Count all tests for this environment
             run_saved_tests, run_saved_time = cursor.execute(
-                """SELECT count(*), sum(duration) FROM tests
-                   WHERE environment_id = ?""",
-                (exec_id,),
+                "SELECT count(*), sum(duration) FROM tests"
             ).fetchone()
             run_all_tests, run_all_time = cursor.execute(
-                """SELECT count(*), sum(duration) FROM tests
-                   WHERE environment_id = ?""",
-                (exec_id,),
+                "SELECT count(*), sum(duration) FROM tests"
             ).fetchone()
 
         return (
@@ -163,74 +136,25 @@ class DB:  # pylint: disable=too-many-public-methods
             run_all_tests,
         )
 
-    def update_saving_stats(self, exec_id, select, commit_id: Optional[str] = None):
+    def fetch_saving_stats(self, select):
         (
             run_saved_time,
             run_all_time,
             run_saved_tests,
             run_all_tests,
-        ) = self.fetch_current_run_stats(exec_id)
-
-        attribute_prefix = "" if select else "potential_"
-        self.write_attribute(
-        f"{attribute_prefix}run_time_saved",
-        run_saved_time,
-        exec_id=exec_id
-        )
-
-        self.write_increment_run_id_attribute()
-        with self.con as con:
-            cursor = con.cursor()
-            cursor.execute(
-                """SELECT MAX(id) FROM run_uid"""
-            )
-            row = cursor.fetchone()
-            run_uid = row[0] if row and row[0] is not None else None
-        self.write_run_info_attribute(
-            exec_id=exec_id,
-            run_saved_time=run_saved_time,
-            run_all_time=run_all_time,
-            run_saved_tests=run_saved_tests,
-            run_all_tests=run_all_tests,
-            run_uid=run_uid,
-            commit_id=commit_id,
-        )
-
-        self.write_test_info_attribute(run_uid)
-        
-        self.write_file_fp_infos(run_uid)
-        
-        self.write_test_exec_file_fp_infos(run_uid)
-
-        self.increment_attributes(
-            {
-                f"{attribute_prefix}time_saved": run_saved_time,
-                f"{attribute_prefix}time_all": run_all_time,
-                f"{attribute_prefix}tests_saved": run_saved_tests,
-                f"{attribute_prefix}tests_all": run_all_tests,
-            },
-            exec_id=None,
-        )
-
-    def fetch_saving_stats(self, exec_id, select):
-        (
-            run_saved_time,
-            run_all_time,
-            run_saved_tests,
-            run_all_tests,
-        ) = self.fetch_current_run_stats(exec_id)
+        ) = self.fetch_current_run_stats()
         attribute_prefix = "" if select else "potential_"
         total_saved_time = self.fetch_attribute(
-            attribute=f"{attribute_prefix}time_saved", default=0, exec_id=None
+            attribute=f"{attribute_prefix}time_saved", default=0
         )
         total_all_time = self.fetch_attribute(
-            attribute=f"{attribute_prefix}time_all", default=0, exec_id=None
+            attribute=f"{attribute_prefix}time_all", default=0
         )
         total_saved_tests = self.fetch_attribute(
-            attribute=f"{attribute_prefix}tests_saved", default=0, exec_id=None
+            attribute=f"{attribute_prefix}tests_saved", default=0
         )
         total_all_tests = self.fetch_attribute(
-            attribute=f"{attribute_prefix}tests_all", default=0, exec_id=None
+            attribute=f"{attribute_prefix}tests_all", default=0
         )
 
         return (
@@ -244,115 +168,73 @@ class DB:  # pylint: disable=too-many-public-methods
             total_all_tests,
         )
 
+    # ====== Run management ======
+
+    def create_run(self, commit_id, packages, python_version):
+        """Create a new run record. Called at session start."""
+        cursor = self.con.execute(
+            "INSERT INTO runs (commit_id, packages, python_version) VALUES (?, ?, ?)",
+            (commit_id, packages, python_version),
+        )
+        return cursor.lastrowid
+
+    def finish_run(self, run_id, duration, tests_selected, tests_deselected,
+                   tests_all, time_saved, time_all):
+        """Update a run with final stats. Called at session end."""
+        self.con.execute(
+            """UPDATE runs SET duration=?, tests_selected=?, tests_deselected=?,
+               tests_all=?, time_saved=?, time_all=? WHERE id=?""",
+            (duration, tests_selected, tests_deselected, tests_all,
+             time_saved, time_all, run_id),
+        )
 
     def get_latest_run_commit_id(self) -> Optional[str]:
-        """Return the commit_id for the latest run_uid."""
-        row = self.con.execute("SELECT MAX(run_uid) FROM run_infos").fetchone()
-        if not row or row[0] is None:
-            return None
-        commit_row = self.con.execute(
-            "SELECT commit_id FROM run_infos WHERE run_uid = ?",
-            (row[0],),
+        """Return the commit_id for the latest run."""
+        row = self.con.execute(
+            "SELECT commit_id FROM runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        if not commit_row:
-            return None
-        return commit_row[0]
+        return row["commit_id"] if row else None
 
-    def write_attribute(self, attribute, data, exec_id=None):
-        dataid = f"{exec_id}:{attribute}"
+    def get_previous_run_info(self):
+        """Get packages and python_version from the most recent run."""
+        row = self.con.execute(
+            "SELECT commit_id, packages, python_version FROM runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    # ====== Metadata ======
+
+    def write_attribute(self, attribute, data):
+        dataid = attribute
         with self.con as con:
             con.execute(
                 "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
                 [dataid, json.dumps(data)],
             )
-    def write_run_info_attribute(
-        self,
-        exec_id,
-        run_saved_time,
-        run_all_time,
-        run_saved_tests,
-        run_all_tests,
-        run_uid,
-        commit_id: Optional[str] = None,
-    ):
-        with self.con as con:
-            con.execute(
-                """INSERT OR REPLACE INTO run_infos 
-                ( run_time_saved, run_time_all, tests_saved, tests_all, run_uid, commit_id)
-                VALUES ( ?, ?, ?, ?, ?, ?)""",
-                (run_saved_time, run_all_time, run_saved_tests, run_all_tests, run_uid, commit_id),
-            )
-            
-    # Historical Data Insert
 
-    def write_test_info_attribute(self, run_uid):
-        """Copy test info to historical table from the tests table (bitmap schema)."""
-        with self.con as con:
-            con.execute(
-                """
-                INSERT INTO test_infos (test_execution_id, test_name, duration, failed, forced, run_uid)
-                SELECT id, name, duration, failed, NULL, ?
-                FROM tests
-                """,
-                (run_uid,)
-            )
-    def write_increment_run_id_attribute(self):
-        with self.con as con:
-            con.execute(
-                """
-                INSERT INTO run_uid DEFAULT VALUES;
-                """
-            )
-    
-    def write_test_exec_file_fp_infos(self, run_uid):
-        """Copy test-file dependency info to historical table from bitmap schema.
-
-        With the new bitmap schema, test dependencies are stored as compressed
-        bitmaps in test_deps, not as individual rows. This method now extracts
-        the file dependencies from the bitmap and stores them in the historical
-        table for reporting purposes.
-        """
-        # The new bitmap schema stores dependencies differently, so we need
-        # to extract them. For now, we skip this if there's no data in the old table.
-        # The historical data will be populated from the new tables if needed.
-        pass
-    def write_file_fp_infos(self, run_uid):
-        """Copy file info to historical table from the files table (bitmap schema)."""
-        with self.con as con:
-            con.execute(
-                """
-                INSERT INTO file_fp_infos (fingerprint_id, filename, file_checksum, mtime, fsha, run_uid)
-                SELECT id, path, checksum, NULL, fsha, ?
-                FROM files
-                """,
-                (run_uid,)
-            )
-      
-    
-    def fetch_attribute(self, attribute, default=None, exec_id=None):
+    def fetch_attribute(self, attribute, default=None):
         cursor = self.con.execute(
-            "SELECT data FROM metadata WHERE dataid=?",
-            [f"{exec_id}:{attribute}"],
+            "SELECT value FROM metadata WHERE key=?",
+            [attribute],
         )
         result = cursor.fetchone()
         if result:
-            return json.loads(result[0])  # zlib.decompress(result[0]).decode('utf-8)'))
+            return json.loads(result[0])
         return default
 
-    def increment_attributes(self, attributes_to_increment, exec_id=None):
+    def increment_attributes(self, attributes_to_increment):
         def sum_with_none(*to_sum):
             return sum(filter(None, to_sum))
 
         for attribute_name in attributes_to_increment:
-            dataid = f"{exec_id}:{attribute_name}"
             old_value = self.fetch_attribute(
-                attribute=attribute_name, default=0, exec_id=exec_id
+                attribute=attribute_name, default=0
             )
             with self.con as con:
                 con.execute(
                     "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
                     [
-                        dataid,
+                        attribute_name,
                         sum_with_none(
                             old_value, attributes_to_increment[attribute_name]
                         ),
@@ -360,194 +242,35 @@ class DB:  # pylint: disable=too-many-public-methods
                 )
 
     def _create_metadata_statement(self) -> str:
-        return """CREATE TABLE metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
+        return """CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);"""
 
-    def create_run_uid_statement(self) ->str:
-           return """CREATE TABLE IF NOT EXISTS run_uid (
+    def _create_runs_statement(self) -> str:
+        return """CREATE TABLE runs (
             id INTEGER PRIMARY KEY,
-            repo_run_id INTEGER NULL,
-            create_date TEXT DEFAULT (datetime('now'))
-        );"""
-    
-    def _create_run_infos_statement(self) -> str:
-        return """CREATE TABLE IF NOT EXISTS run_infos (
-            run_time_saved REAL,
-            run_time_all REAL,
-            tests_saved INTEGER,
-            tests_all INTEGER ,
-            run_uid INTEGER,
             commit_id TEXT,
-            FOREIGN KEY(run_uid) REFERENCES run_uid(id)
-            
+            packages TEXT,
+            python_version TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            duration REAL,
+            tests_selected INTEGER DEFAULT 0,
+            tests_deselected INTEGER DEFAULT 0,
+            tests_all INTEGER DEFAULT 0,
+            time_saved REAL DEFAULT 0,
+            time_all REAL DEFAULT 0
         );"""
-        
-        
-    
-    def _create_test_infos_statement(self) ->str:
-          return f"""
-                CREATE TABLE IF NOT EXISTS test_infos (
-                id INTEGER PRIMARY KEY ASC,
-                test_execution_id INTEGER,
-                test_name TEXT,
-                duration FLOAT,
-                failed BIT,
-                forced BIT,
-                run_uid INTEGER NULL,
-                FOREIGN KEY(run_uid) REFERENCES run_uid(id));
-                
-            """    
             
-            
-    def _create__file_fp_infos_statement(self) -> str:
-        return """
-            CREATE TABLE IF NOT EXISTS file_fp_infos (
-                id INTEGER PRIMARY KEY,
-                fingerprint_id INTEGER,
-                filename TEXT,
-                file_checksum INTEGER,
-                mtime FLOAT,
-                fsha TEXT,
-                run_uid INTEGER NULL,
-                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
-            );
-        """
-          
-    def _create_test_execution_file_fp_infos_statement(self) -> str:
-        return """
-            CREATE TABLE IF NOT EXISTS test_execution_file_fp_infos (
-                id INTEGER PRIMARY KEY,
-                test_execution_id INTEGER,
-                fingerprint_id INTEGER,
-                run_uid INTEGER NULL,
-                FOREIGN KEY(run_uid) REFERENCES run_uid(id)
-            );
-        """
-
-  
-            
-         
-    def _create_environment_statement(self) -> str:
-        return """
-                CREATE TABLE environment (
-                id INTEGER PRIMARY KEY ASC,
-                environment_name TEXT,
-                system_packages TEXT,
-                python_version TEXT,
-                UNIQUE (environment_name, system_packages, python_version)
-            );"""
-
-    def _create_test_execution_statement(self) -> str:  # pylint: disable=invalid-name
-        return f"""
-                CREATE TABLE test_execution (
-                id INTEGER PRIMARY KEY ASC,
-                {self._test_execution_fk_column()} INTEGER,
-                test_name TEXT,
-                duration FLOAT,
-                failed BIT,
-                forced BIT,
-                FOREIGN KEY({self._test_execution_fk_column()}) REFERENCES {self._test_execution_fk_table()}(id) ON DELETE CASCADE);
-                CREATE INDEX test_execution_fk_name ON test_execution ({self._test_execution_fk_column()}, test_name);
-            """
-
-    def _create_temp_tables_statement(self) -> str:
-        return ""
-
-    def _local_temp_tables_statement(self) -> str:
-        return """
-                CREATE TEMPORARY TABLE changed_files_fshas (exec_id INTEGER, filename TEXT, fsha TEXT);
-                CREATE INDEX changed_files_fshas_mcall ON changed_files_fshas (exec_id, filename, fsha);
-
-                CREATE TEMPORARY TABLE changed_files_checksums (exec_id INTEGER, filename TEXT, file_checksum INTEGER);
-                CREATE INDEX changed_files_checksums_eid ON changed_files_checksums (exec_id);
-        """
-
-    def _create_file_fp_statement(self) -> str:
-        return """
-            CREATE TABLE file_fp
-            (
-                id INTEGER PRIMARY KEY,
-                filename TEXT,
-                file_checksum INTEGER,
-                mtime FLOAT,
-                fsha TEXT,
-                UNIQUE (filename, fsha, file_checksum)
-            );"""
-
-    def _create_test_execution_ffp_statement(  # pylint: disable=invalid-name
-        self,
-    ) -> str:
-        return """
-            CREATE TABLE test_execution_file_fp (
-                test_execution_id INTEGER,
-                fingerprint_id INTEGER,
-                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
-                FOREIGN KEY(fingerprint_id) REFERENCES file_fp(id)
-            );
-            CREATE INDEX test_execution_file_fp_both ON test_execution_file_fp (test_execution_id, fingerprint_id);
-            -- the following table stores the same data coarsely, but is used for faster queries
-            CREATE TABLE suite_execution_file_fsha (
-                suite_execution_id INTEGER,
-                filename TEXT,
-                fsha text,
-                FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id) ON DELETE CASCADE
-                );
-                CREATE UNIQUE INDEX sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
-            """
-            
-    def _create_file_dependency_statement(self) -> str:
-        """Table for tracking non-Python file dependencies (JSON, YAML, etc.)."""
-        return """
-            CREATE TABLE IF NOT EXISTS file_dependency (
-                id INTEGER PRIMARY KEY,
-                filename TEXT NOT NULL,
-                sha TEXT NOT NULL,
-                UNIQUE (filename, sha)
-            );
-            CREATE TABLE IF NOT EXISTS test_execution_file_dependency (
-                test_execution_id INTEGER,
-                file_dependency_id INTEGER,
-                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
-                FOREIGN KEY(file_dependency_id) REFERENCES file_dependency(id)
-            );
-            CREATE INDEX IF NOT EXISTS tefd_both ON test_execution_file_dependency (test_execution_id, file_dependency_id);
-        """
-
-    def _create_external_dependency_statement(self) -> str:
-        """Table for tracking external package dependencies per test.
-
-        Stores which external packages each test uses, enabling granular
-        invalidation when specific packages change (instead of re-running
-        all tests when any package changes).
-        """
-        return """
-            CREATE TABLE IF NOT EXISTS test_external_dependency (
-                id INTEGER PRIMARY KEY,
-                test_execution_id INTEGER,
-                package_name TEXT NOT NULL,
-                package_version TEXT,
-                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS ted_te_id ON test_external_dependency (test_execution_id);
-            CREATE INDEX IF NOT EXISTS ted_pkg_name ON test_external_dependency (package_name);
-        """
-
-
     def _create_files_table_statement(self) -> str:
-        """Table for unified file registry with stable integer IDs.
-
-        This is the new simplified schema where all tracked files (Python and non-Python)
-        get a stable integer ID for efficient Roaring bitmap operations.
-        """
+        """Table for unified file registry with stable integer IDs."""
         return """
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER REFERENCES runs(id),
                 path TEXT NOT NULL UNIQUE,
+                file_type TEXT DEFAULT 'python' CHECK (file_type IN ('python', 'data')),
                 checksum INTEGER,
-                fsha TEXT,
-                file_type TEXT DEFAULT 'python' CHECK (file_type IN ('python', 'data'))
+                fsha TEXT
             );
             CREATE INDEX IF NOT EXISTS files_path ON files (path);
-            CREATE INDEX IF NOT EXISTS files_checksum ON files (checksum);
         """
 
     def _create_tests_table_statement(self) -> str:
@@ -555,15 +278,13 @@ class DB:  # pylint: disable=too-many-public-methods
         return """
             CREATE TABLE IF NOT EXISTS tests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                environment_id INTEGER,
-                name TEXT NOT NULL,
+                run_id INTEGER REFERENCES runs(id),
+                name TEXT NOT NULL UNIQUE,
                 test_file TEXT,
                 duration REAL,
-                failed INTEGER DEFAULT 0,
-                UNIQUE (environment_id, name),
-                FOREIGN KEY(environment_id) REFERENCES environment(id)
+                failed INTEGER DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS tests_env_name ON tests (environment_id, name);
+            CREATE INDEX IF NOT EXISTS tests_name ON tests (name);
         """
 
     def _create_test_deps_table_statement(self) -> str:
@@ -587,19 +308,7 @@ class DB:  # pylint: disable=too-many-public-methods
 
         connection.executescript(
             self._create_metadata_statement()
-            + self._create_environment_statement()
-            + self._create_test_execution_statement()
-            + self._create_temp_tables_statement()
-            + self._create_file_fp_statement()
-            + self._create_test_execution_ffp_statement()
-            + self.create_run_uid_statement()
-            + self._create_run_infos_statement()
-            + self._create_test_infos_statement()
-            + self._create__file_fp_infos_statement()
-            + self._create_test_execution_file_fp_infos_statement()
-            + self._create_file_dependency_statement()
-            + self._create_external_dependency_statement()
-            # New simplified schema tables
+            + self._create_runs_statement()
             + self._create_files_table_statement()
             + self._create_tests_table_statement()
             + self._create_test_deps_table_statement()
@@ -607,79 +316,7 @@ class DB:  # pylint: disable=too-many-public-methods
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
 
-    def _ensure_run_infos_schema(self) -> None:
-        """Ensure run_infos has commit_id column for existing DBs."""
-        cursor = self.con.execute("PRAGMA table_info(run_infos)")
-        columns = {row["name"] for row in cursor.fetchall()}
-        if "commit_id" not in columns:
-            self.con.execute("ALTER TABLE run_infos ADD COLUMN commit_id TEXT")
-
-    def _ensure_run_infos_unique_index(self) -> None:
-        """Ensure run_infos has a unique index on run_uid."""
-        try:
-            self.con.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS run_infos_run_uid_unique ON run_infos(run_uid)"
-            )
-        except sqlite3.IntegrityError as exc:
-            self._logger.warning(
-                "Could not create unique index on run_infos(run_uid): %s", exc
-            )
-
-    def _ensure_tests_schema(self) -> None:
-        """Ensure tests table has test_file column for existing DBs."""
-        cursor = self.con.execute("PRAGMA table_info(tests)")
-        columns = {row["name"] for row in cursor.fetchall()}
-        if "test_file" not in columns:
-            self.con.execute("ALTER TABLE tests ADD COLUMN test_file TEXT")
-
-    def fetch_unknown_files(
-        self, files_fshas, exec_id, restrict_to_known: bool = False
-    ) -> []:  # exec_id is environment_id in this module
-        with self.con as con:
-            con.execute("DELETE FROM changed_files_fshas WHERE exec_id = ?", (exec_id,))
-            con.executemany(
-                "INSERT INTO changed_files_fshas VALUES (?, ?, ?)",
-                [(exec_id, file, fsha) for file, fsha in files_fshas.items()],
-            )
-            return self._fetch_unknown_files_from_one_v(
-                con, exec_id, exec_id, restrict_to_known=restrict_to_known
-            )
-
-    def _fetch_unknown_files_from_one_v(self, con, exec_id, files_shas_id, restrict_to_known: bool = False):
-        """Find files whose fsha is not in the current files_fshas.
-
-        Uses the new files table (bitmap schema).
-        """
-        result = []
-        if restrict_to_known:
-            query = """
-                SELECT DISTINCT f.path
-                FROM files f
-                LEFT OUTER JOIN changed_files_fshas chff
-                ON f.path = chff.filename AND f.fsha = chff.fsha AND chff.exec_id = :files_shas_id
-                WHERE f.file_type = 'python'
-                  AND f.path IN (SELECT filename FROM changed_files_fshas WHERE exec_id = :files_shas_id)
-                  AND (f.fsha IS NULL OR chff.fsha IS NULL)
-            """
-        else:
-            query = """
-                SELECT DISTINCT f.path
-                FROM files f
-                LEFT OUTER JOIN changed_files_fshas chff
-                ON f.path = chff.filename AND f.fsha = chff.fsha AND chff.exec_id = :files_shas_id
-                WHERE f.file_type = 'python' AND (f.fsha IS NULL OR chff.fsha IS NULL)
-            """
-        for row in con.execute(
-            query,
-            {"files_shas_id": files_shas_id, "exec_id": exec_id},
-        ):
-            result.append(row["path"])
-        return result
-
-    def delete_filenames(self, con):
-        con.execute("DELETE FROM changed_files_checksums")
-
-    def get_file_dependency_filenames(self, exec_id):
+    def get_file_dependency_filenames(self):
         """Get all data file dependency filenames for an environment.
 
         Uses the new files table to find data files referenced by tests.
@@ -693,42 +330,24 @@ class DB:  # pylint: disable=too-many-public-methods
         )
         return [row["path"] for row in cursor]
 
-    def delete_test_executions(self, test_names, exec_id):
-        """Delete tests from the bitmap schema.
-
-        Removes tests and their dependencies from the new tests/test_deps tables.
-        """
+    def delete_test_executions(self, test_names):
+        """Delete tests and their dependencies."""
         for test_name in test_names:
-            self.delete_test(exec_id, test_name)
+            self.delete_test(test_name)
 
-    def all_test_executions(self, exec_id):
-        """Get all tests for an environment with their metadata.
-
-        Uses the new tests table (bitmap schema).
-        """
+    def all_test_executions(self):
+        """Get all tests with their metadata."""
         return {
             row["name"]: {"duration": row["duration"], "failed": bool(row["failed"]), "forced": None}
             for row in self.con.execute(
-                """
-                SELECT name, duration, failed
-                FROM tests
-                WHERE environment_id = ?
-                """,
-                (exec_id,),
+                "SELECT name, duration, failed FROM tests"
             )
         }
 
-    def filenames(self, exec_id):
-        """Get all Python filenames tracked for an environment.
-
-        Uses the new files table (bitmap schema).
-        """
+    def filenames(self):
+        """Get all Python filenames tracked."""
         cursor = self.con.execute(
-            """
-            SELECT DISTINCT path
-            FROM files
-            WHERE file_type = 'python'
-            """,
+            "SELECT DISTINCT path FROM files WHERE file_type = 'python'"
         )
         return [row[0] for row in cursor]
 
@@ -740,132 +359,21 @@ class DB:  # pylint: disable=too-many-public-methods
         )
         return [row[0] for row in cursor]
 
-    def fetch_or_create_environment(
-        self, environment_name, system_packages, python_version
-    ):
-        """
-        Fetch or create an environment, with granular package change tracking.
-
-        Instead of deleting all test data when packages change (old behavior),
-        we now:
-        1. Track which specific packages changed
-        2. Update the environment record in-place
-        3. Return the set of changed packages for selective invalidation
-
-        Returns:
-            (environment_id, changed_packages, old_packages, old_python)
-            where changed_packages is a set of package names that changed.
-        """
-        from ezmon.common import compute_changed_packages
-
-        with self.con as con:
-            con.execute("BEGIN IMMEDIATE TRANSACTION")
-            cursor = con.cursor()
-            environment = cursor.execute(
-                """
-                SELECT
-                id, environment_name, system_packages, python_version
-                FROM environment
-                WHERE environment_name = ?
-                ORDER BY id DESC
-                """,
-                (environment_name,),
-            ).fetchone()
-
-            changed_packages = set()
-
-            old_packages = ""
-            old_python = ""
-            if not environment:
-                # New environment - no packages changed (first run)
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO environment (environment_name, system_packages, python_version)
-                        VALUES (?, ?, ?)
-                        """,
-                        (environment_name, system_packages, python_version),
-                    )
-                    environment_id = cursor.lastrowid
-                except sqlite3.IntegrityError:
-                    environment = con.execute(
-                        """
-                        SELECT
-                        id as id, environment_name as name, system_packages as packages
-                        FROM environment
-                        WHERE environment_name = ?
-                        """,
-                        (environment_name,),
-                    ).fetchone()
-                    environment_id = environment["id"]
-            else:
-                environment_id = environment["id"]
-                old_packages = environment["system_packages"] or ""
-                old_python = environment["python_version"] or ""
-
-                # Python version change still requires full re-run
-                if old_python != python_version:
-                    # Return special marker indicating all tests affected
-                    changed_packages = {"__python_version_changed__"}
-                elif old_packages != system_packages:
-                    # Compute which specific packages changed
-                    changed_packages = compute_changed_packages(old_packages, system_packages)
-
-                # Update the environment record (don't delete and recreate)
-                if old_packages != system_packages or old_python != python_version:
-                    cursor.execute(
-                        """
-                        UPDATE environment
-                        SET system_packages = ?, python_version = ?
-                        WHERE id = ?
-                        """,
-                        (system_packages, python_version, environment_id),
-                    )
-
-            return environment_id, changed_packages, old_packages, old_python
-
-    def initiate_execution(  # pylint: disable= R0913 W0613
-        self,
-        environment_name: str,
-        system_packages: str,
-        python_version: str,
-        execution_metadata: dict,  # pylint: disable=unused-argument
-    ) -> [int, list]:  # exec_id  # changed_file_data  # future_string2
-        exec_id, changed_packages, old_packages, old_python = self.fetch_or_create_environment(
-            environment_name, system_packages, python_version
-        )
-        return {
-            "exec_id": exec_id,
-            "filenames": self.all_filenames(),
-            "changed_packages": changed_packages,  # Set of changed package names
-            "previous_packages": old_packages,
-            "previous_python": old_python,
-            "current_packages": system_packages,
-            "current_python": python_version,
-            # Legacy: packages_changed is True if any packages changed
-            "packages_changed": bool(changed_packages),
-        }
-
+    # ==========================================================================
+    # New Roaring Bitmap-based methods for simplified dependency storage
+    # ==========================================================================
     # ==========================================================================
     # New Roaring Bitmap-based methods for simplified dependency storage
     # ==========================================================================
 
     @lru_cache(maxsize=10000)
     def get_or_create_file_id(self, path: str, checksum: int = None,
-                              fsha: str = None, file_type: str = 'python') -> int:
+                              fsha: str = None, file_type: str = 'python',
+                              run_id: int = None) -> int:
         """Get or create a stable file ID for a given path.
 
-        This is the core method for the new simplified schema. Each file gets
-        a unique integer ID that can be stored in Roaring bitmaps.
-
-        Args:
-            path: Relative file path
-            checksum: AST checksum (Python) or content hash (data files)
-            fsha: Git blob SHA for fast change detection
-            file_type: 'python' or 'data'
-
-        Returns:
-            Integer file ID
+        Each file gets a unique integer ID that can be stored in Roaring bitmaps.
+        The run_id records which run last wrote this file's metadata.
         """
         cursor = self.con.cursor()
 
@@ -876,32 +384,36 @@ class DB:  # pylint: disable=too-many-public-methods
 
         if row:
             file_id = row[0]
-            # Update checksum/fsha if provided
-            if checksum is not None or fsha is not None:
+            # Update checksum/fsha/run_id if provided
+            updates = []
+            params = []
+            if checksum is not None:
+                updates.append("checksum = ?")
+                params.append(checksum)
+            if fsha is not None:
+                updates.append("fsha = ?")
+                params.append(fsha)
+            if run_id is not None:
+                updates.append("run_id = ?")
+                params.append(run_id)
+            if updates:
+                params.append(file_id)
                 cursor.execute(
-                    """UPDATE files SET checksum = COALESCE(?, checksum),
-                       fsha = COALESCE(?, fsha) WHERE id = ?""",
-                    (checksum, fsha, file_id)
+                    f"UPDATE files SET {', '.join(updates)} WHERE id = ?",
+                    params,
                 )
             return file_id
 
         # Create new file record
         cursor.execute(
-            """INSERT INTO files (path, checksum, fsha, file_type)
-               VALUES (?, ?, ?, ?)""",
-            (path, checksum, fsha, file_type)
+            """INSERT INTO files (path, checksum, fsha, file_type, run_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (path, checksum, fsha, file_type, run_id)
         )
         return cursor.lastrowid
 
-    def get_file_id_map(self, exec_id: int = None) -> Dict[str, int]:
-        """Get a mapping of file paths to their IDs.
-
-        Args:
-            exec_id: Optional environment ID to filter files (not used yet)
-
-        Returns:
-            Dict mapping file path to integer ID
-        """
+    def get_file_id_map(self) -> Dict[str, int]:
+        """Get a mapping of file paths to their IDs."""
         cursor = self.con.execute("SELECT path, id FROM files")
         return {row["path"]: row["id"] for row in cursor}
 
@@ -943,58 +455,57 @@ class DB:  # pylint: disable=too-many-public-methods
 
     def get_or_create_test_id(
         self,
-        exec_id: int,
         test_name: str,
         duration: float = None,
         failed: bool = False,
         test_file: Optional[str] = None,
+        run_id: int = None,
     ) -> int:
         """Get or create a test ID for a given test name.
 
         Args:
-            exec_id: Environment ID
             test_name: Full test node ID
             duration: Test duration in seconds
             failed: Whether the test failed
-
-        Returns:
-            Integer test ID
+            test_file: Test file path
+            run_id: Run ID for provenance tracking
         """
         cursor = self.con.cursor()
 
-        # Try to get existing test ID
         row = cursor.execute(
-            "SELECT id FROM tests WHERE environment_id = ? AND name = ?",
-            (exec_id, test_name)
+            "SELECT id FROM tests WHERE name = ?", (test_name,)
         ).fetchone()
 
         if row:
             test_id = row[0]
-            # Update duration/failed if provided
+            updates = ["duration = COALESCE(?, duration)", "failed = ?",
+                        "test_file = COALESCE(?, test_file)"]
+            params = [duration, 1 if failed else 0, test_file]
+            if run_id is not None:
+                updates.append("run_id = ?")
+                params.append(run_id)
+            params.append(test_id)
             cursor.execute(
-                """UPDATE tests SET duration = COALESCE(?, duration),
-                   failed = ?, test_file = COALESCE(?, test_file) WHERE id = ?""",
-                (duration, 1 if failed else 0, test_file, test_id)
+                f"UPDATE tests SET {', '.join(updates)} WHERE id = ?", params
             )
             return test_id
 
-        # Create new test record
         cursor.execute(
-            """INSERT INTO tests (environment_id, name, test_file, duration, failed)
+            """INSERT INTO tests (name, test_file, duration, failed, run_id)
                VALUES (?, ?, ?, ?, ?)""",
-            (exec_id, test_name, test_file, duration, 1 if failed else 0)
+            (test_name, test_file, duration, 1 if failed else 0, run_id)
         )
         return cursor.lastrowid
 
     def get_or_create_test_ids_batch(
         self,
-        exec_id: int,
+        run_id: int,
         tests: list,
     ) -> Dict[str, int]:
         """Bulk get-or-create test IDs.
 
         Args:
-            exec_id: Environment ID
+            run_id: Run ID for provenance tracking
             tests: List of (test_name, test_file, duration, failed) tuples
 
         Returns:
@@ -1008,9 +519,9 @@ class DB:  # pylint: disable=too-many-public-methods
 
         # 1. Bulk INSERT OR IGNORE — creates rows for new tests
         cursor.executemany(
-            """INSERT OR IGNORE INTO tests (environment_id, name, test_file, duration, failed)
+            """INSERT OR IGNORE INTO tests (name, test_file, duration, failed, run_id)
                VALUES (?, ?, ?, ?, ?)""",
-            [(exec_id, name, tf, dur, 1 if fail else 0) for name, tf, dur, fail in tests],
+            [(name, tf, dur, 1 if fail else 0, run_id) for name, tf, dur, fail in tests],
         )
 
         # 2. Bulk SELECT to get all IDs
@@ -1020,18 +531,19 @@ class DB:  # pylint: disable=too-many-public-methods
             chunk = all_names[i:i + chunk_size]
             placeholders = ",".join("?" * len(chunk))
             rows = cursor.execute(
-                f"SELECT id, name FROM tests WHERE environment_id = ? AND name IN ({placeholders})",
-                [exec_id] + chunk,
+                f"SELECT id, name FROM tests WHERE name IN ({placeholders})",
+                chunk,
             ).fetchall()
             for row in rows:
                 result[row[1]] = row[0]
 
-        # 3. Bulk UPDATE duration/failed for all tests
+        # 3. Bulk UPDATE duration/failed/run_id for all tests
         cursor.executemany(
             """UPDATE tests SET duration = COALESCE(?, duration),
-               failed = ?, test_file = COALESCE(?, test_file)
-               WHERE environment_id = ? AND name = ?""",
-            [(dur, 1 if fail else 0, tf, exec_id, name) for name, tf, dur, fail in tests],
+               failed = ?, test_file = COALESCE(?, test_file),
+               run_id = COALESCE(?, run_id)
+               WHERE name = ?""",
+            [(dur, 1 if fail else 0, tf, run_id, name) for name, tf, dur, fail in tests],
         )
 
         return result
@@ -1112,11 +624,8 @@ class DB:  # pylint: disable=too-many-public-methods
 
         return TestDeps.deserialize(test_id, row["file_bitmap"], row["external_packages"])
 
-    def get_all_test_deps(self, exec_id: int) -> List[TestDeps]:
-        """Get all test dependencies for an environment.
-
-        Args:
-            exec_id: Environment ID
+    def get_all_test_deps(self) -> List[TestDeps]:
+        """Get all test dependencies.
 
         Returns:
             List of TestDeps objects
@@ -1124,9 +633,7 @@ class DB:  # pylint: disable=too-many-public-methods
         cursor = self.con.execute(
             """SELECT t.id, td.file_bitmap, td.external_packages
                FROM tests t
-               JOIN test_deps td ON t.id = td.test_id
-               WHERE t.environment_id = ?""",
-            (exec_id,)
+               JOIN test_deps td ON t.id = td.test_id"""
         )
 
         deps_list = []
@@ -1140,23 +647,19 @@ class DB:  # pylint: disable=too-many-public-methods
 
     def find_affected_tests_bitmap(
         self,
-        exec_id: int,
         changed_file_ids: Set[int],
         changed_packages: Optional[Set[str]] = None
     ) -> List[str]:
         """Find tests affected by file or package changes using bitmap intersection.
 
-        This is the new fast path for determining affected tests.
-
         Args:
-            exec_id: Environment ID
             changed_file_ids: Set of file IDs that changed
             changed_packages: Set of package names that changed
 
         Returns:
             List of affected test names
         """
-        all_deps = self.get_all_test_deps(exec_id)
+        all_deps = self.get_all_test_deps()
         affected_test_ids = find_affected_tests(all_deps, changed_file_ids, changed_packages)
 
         # Get test names for the affected IDs
@@ -1201,61 +704,43 @@ class DB:  # pylint: disable=too-many-public-methods
 
         return changed_ids
 
-    def get_tests_for_env(self, exec_id: int) -> Dict[str, Dict]:
-        """Get all tests for an environment with their metadata.
-
-        Args:
-            exec_id: Environment ID
-
-        Returns:
-            Dict mapping test name to {duration, failed} dict
-        """
+    def get_tests_for_env(self) -> Dict[str, Dict]:
+        """Get all tests with their metadata."""
         cursor = self.con.execute(
-            """SELECT name, duration, failed FROM tests WHERE environment_id = ?""",
-            (exec_id,)
+            "SELECT name, duration, failed FROM tests"
         )
         return {
             row["name"]: {"duration": row["duration"], "failed": bool(row["failed"])}
             for row in cursor
         }
 
-    def get_test_files_for_tests(self, exec_id: int, test_names: Set[str]) -> Set[str]:
+    def get_test_files_for_tests(self, test_names: Set[str]) -> Set[str]:
         """Get test files for a set of test names."""
         if not test_names:
             return set()
         placeholders = ",".join("?" * len(test_names))
         cursor = self.con.execute(
-            f"""SELECT DISTINCT test_file FROM tests
-                WHERE environment_id = ? AND name IN ({placeholders})""",
-            (exec_id, *sorted(test_names)),
+            f"SELECT DISTINCT test_file FROM tests WHERE name IN ({placeholders})",
+            tuple(sorted(test_names)),
         )
         return {row["test_file"] for row in cursor if row["test_file"]}
 
-    def get_all_test_files(self, exec_id: int) -> Set[str]:
-        """Get all known test files for an environment."""
+    def get_all_test_files(self) -> Set[str]:
+        """Get all known test files."""
         cursor = self.con.execute(
-            """SELECT DISTINCT test_file FROM tests WHERE environment_id = ?""",
-            (exec_id,),
+            "SELECT DISTINCT test_file FROM tests"
         )
         return {row["test_file"] for row in cursor if row["test_file"]}
 
-    def delete_test(self, exec_id: int, test_name: str) -> None:
-        """Delete a test and its dependencies.
-
-        Args:
-            exec_id: Environment ID
-            test_name: Test name to delete
-        """
-        # Get test ID
+    def delete_test(self, test_name: str) -> None:
+        """Delete a test and its dependencies."""
         row = self.con.execute(
-            "SELECT id FROM tests WHERE environment_id = ? AND name = ?",
-            (exec_id, test_name)
+            "SELECT id FROM tests WHERE name = ?", (test_name,)
         ).fetchone()
 
         if row:
             test_id = row[0]
             with self.con as con:
-                # Delete deps first (foreign key)
                 con.execute("DELETE FROM test_deps WHERE test_id = ?", (test_id,))
                 con.execute("DELETE FROM tests WHERE id = ?", (test_id,))
 
@@ -1290,34 +775,22 @@ class DB:  # pylint: disable=too-many-public-methods
 
         return changed_ids
 
-    def get_failing_tests_bitmap(self, exec_id: int) -> List[str]:
-        """Get names of tests that failed in their last run.
-
-        Args:
-            exec_id: Environment ID
-
-        Returns:
-            List of failing test names
-        """
+    def get_failing_tests_bitmap(self) -> List[str]:
+        """Get names of tests that failed in their last run."""
         cursor = self.con.execute(
-            "SELECT name FROM tests WHERE environment_id = ? AND failed = 1",
-            (exec_id,)
+            "SELECT name FROM tests WHERE failed = 1"
         )
         return [row["name"] for row in cursor]
 
     def determine_tests_bitmap(
         self,
-        exec_id: int,
         files_checksums: Dict[str, int],
         file_deps_shas: Dict[str, str] = None,
         changed_packages: Optional[Set[str]] = None
     ) -> Dict[str, List[str]]:
         """Determine affected and failing tests using bitmap schema.
 
-        This replaces determine_tests() with bitmap-based queries.
-
         Args:
-            exec_id: Environment ID
             files_checksums: Dict of {path: checksum} for Python files
             file_deps_shas: Dict of {path: fsha} for data files
             changed_packages: Set of changed external package names
@@ -1328,18 +801,10 @@ class DB:  # pylint: disable=too-many-public-methods
         if file_deps_shas is None:
             file_deps_shas = {}
 
-        # Get changed Python file IDs
         changed_ids = self.get_changed_file_ids(files_checksums)
-
-        # Get changed data file IDs
         changed_ids |= self.get_changed_data_file_ids(file_deps_shas)
 
-        # Find affected tests using bitmap intersection
-        affected = self.find_affected_tests_bitmap(
-            exec_id, changed_ids, changed_packages
-        )
-
-        # Get failing tests
-        failing = self.get_failing_tests_bitmap(exec_id)
+        affected = self.find_affected_tests_bitmap(changed_ids, changed_packages)
+        failing = self.get_failing_tests_bitmap()
 
         return {"affected": affected, "failing": failing}

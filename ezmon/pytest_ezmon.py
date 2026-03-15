@@ -281,13 +281,13 @@ def init_testmon_data(config: Config):
                     json.dump(_jsonable(workerinput), f)
             except Exception as exc:
                 logger.warning(f"Failed to write workerinput for {worker_id}: {exc}")
-        if "testmon_exec_id" in workerinput:
+        if "testmon_run_id" in workerinput:
             # Create TestmonData for worker using controller's pre-computed data
             # Workers receive unstable_test_names (tests to RUN) - much smaller than stable
             _timing_log(config, "worker_apply_input_start")
             testmon_data = TestmonData.for_worker(
                 rootdir=config.rootdir.strpath,
-                exec_id=workerinput["testmon_exec_id"],
+                run_id=workerinput["testmon_run_id"],
                 unstable_test_names=workerinput.get("testmon_unstable_test_names", set()),
                 files_of_interest=workerinput.get("testmon_files_of_interest", []),
                 changed_packages=workerinput.get("testmon_changed_packages", set()),
@@ -689,7 +689,7 @@ class TestmonCollect:
                     for name in all_failed
                 ]
                 self.testmon_data.db.get_or_create_test_ids_batch(
-                    self.testmon_data.exec_id, failed_tests_for_db
+                    self.testmon_data.run_id, failed_tests_for_db
                 )
             for retain in sync_retains:
                 self.testmon_data.sync_db_fs_tests(retain=set(retain))
@@ -975,11 +975,11 @@ class TestmonCollect:
             if outcome.get("failed"):
                 # Mark failed tests but do not update deps
                 self.testmon_data.db.get_or_create_test_id(
-                    self.testmon_data.exec_id,
                     test_name,
                     duration=outcome.get("duration"),
                     failed=True,
                     test_file=test_file,
+                    run_id=self.testmon_data.run_id,
                 )
             else:
                 succeeded[test_name] = deps
@@ -1221,11 +1221,21 @@ class TestmonCollect:
             if self._running_as == "controller":
                 self._drain_write_queue()
             _timing_log(session.config, "controller_save_deps_start")
+            duration = time.time() - self._sessionstarttime
+            run_stats = self.testmon_data.db.fetch_current_run_stats()
+            run_saved_time, run_all_time, run_saved_tests, run_all_tests = run_stats
+            self.testmon_data.db.finish_run(
+                self.testmon_data.run_id,
+                duration=duration,
+                tests_selected=run_saved_tests or 0,
+                tests_deselected=(run_all_tests or 0) - (run_saved_tests or 0),
+                tests_all=run_all_tests or 0,
+                time_saved=run_saved_time or 0,
+                time_all=run_all_time or 0,
+            )
             self.testmon_data.db.finish_execution(
-                self.testmon_data.exec_id,
-                time.time() - self._sessionstarttime,
-                session.config.testmon_config.select,
-                commit_id=self.testmon_data.commit_id,
+                duration=duration,
+                select=session.config.testmon_config.select,
             )
             _timing_log(session.config, "controller_save_deps_end")
             _timing_log(
@@ -1430,7 +1440,7 @@ class TestmonCollect:
                     for name in failed_tests
                 ]
                 self.testmon_data.db.get_or_create_test_ids_batch(
-                    self.testmon_data.exec_id, failed_tests_for_db
+                    self.testmon_data.run_id, failed_tests_for_db
                 )
 
     @pytest.hookimpl(optionalhook=True)
@@ -1474,7 +1484,7 @@ class TestmonXdistSync:
         """Pass stability data from controller to workers during xdist initialization.
 
         Called by the controller for each worker node before it starts.
-        We pass the pre-computed exec_id, stable_test_names, and other data
+        We pass the pre-computed run_id, stable_test_names, and other data
         so workers all use the same deselection criteria.
         """
         running_as = get_running_as(node.config)
@@ -1493,7 +1503,7 @@ class TestmonXdistSync:
             # Pass all data workers need to avoid recomputing stability
             # Pass unstable_test_names (tests to RUN) instead of stable_test_names
             # This is ~750x smaller (255 tests vs 230k) for large test suites
-            node.workerinput["testmon_exec_id"] = testmon_data.exec_id
+            node.workerinput["testmon_run_id"] = testmon_data.run_id
             node.workerinput["testmon_unstable_test_names"] = (
                 list(testmon_data.unstable_test_names)
                 if testmon_data.unstable_test_names is not None
