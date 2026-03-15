@@ -1,25 +1,23 @@
-For each test file, workers send a simplified, batched payload with:
+For each test file, workers send a compressed payload with:
 - common deps shared by all tests in that file
-- unique deps for tests that have them
-- a compact test-name encoding
+- unique deps only for tests that differ from the common set
+- a compact test-name encoding via prefix map
 
-Example (JSON-ish). Assume:
-- test file "pandas/tests/api/test_api.py" is encoded as 2314
-- deps are encoded deterministically (files + packages)
+Example (JSON-ish):
 
 {
   "__format__": "file_common_unique_v2",
   "batches": [
     {
       "files": {
-        "2314": {
-          "com": {"f": [123, 2, 54], "p": [12, 3], "e": [1, 2, 4]},
+        "pandas/tests/api/test_api.py": {
+          "com": {"f": ["pandas/core/api.py", "pandas/__init__.py", "pandas/io/formats/format.py"], "p": ["pandas.core.api", "pandas.io"], "e": ["numpy", "pytz"]},
           "pm": ["TestPDApi"],
           "t_names": ["1|test_api", "1|someother_test", "1|test_with_no_unique_deps", "1|another_test_with_no_unique_deps"],
           "dur": [0.12, 0.03, 0.01, 0.01],
           "fail": [1],
-          "0": {"f": [1], "p": [124], "e": [5]},
-          "1": {"f": [4]},
+          "0": {"f": ["pandas/core/strings/accessor.py"], "p": ["pandas.core.strings"], "e": ["re"]},
+          "1": {"f": ["pandas/core/reshape/merge.py"]},
           "etc": [2, 3]
         }
       }
@@ -36,9 +34,9 @@ Key points:
 - "pm" is the per-file prefix map for test names.
 
 Dependency shorthands:
-- "f": file dependencies (tracked reads)
-- "p": python imports
-- "e": external dependencies
+- "f": file dependencies (plain relative paths — shas are omitted, resolved on controller via file cache)
+- "p": python module imports
+- "e": external (non-tracked) dependencies
 
 Omit empty kinds (no empty "f"/"p"/"e" lists).
 

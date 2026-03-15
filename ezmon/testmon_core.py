@@ -782,9 +782,24 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             test_executions_fingerprints: Dict mapping test name to DepsNOutcomes
         """
         with self.db.con:
-            # Phase 1: resolve file/test IDs and serialize deps
+            # Bulk-resolve test IDs
+            tests_for_db = []
+            for test_name, deps_n_outcomes in test_executions_fingerprints.items():
+                test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                tests_for_db.append((
+                    test_name, test_file,
+                    deps_n_outcomes.get("duration"),
+                    deps_n_outcomes.get("failed", False),
+                ))
+            test_id_map = self.db.get_or_create_test_ids_batch(self.exec_id, tests_for_db)
+
+            # Resolve file IDs and serialize deps
             pending = []  # list of (test_id, blob, packages_str)
             for test_name, deps_n_outcomes in test_executions_fingerprints.items():
+                test_id = test_id_map.get(test_name)
+                if test_id is None:
+                    continue
+
                 file_ids = set()
                 external_packages = set()
 
@@ -823,16 +838,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 # Process external package dependencies
                 for pkg_name in deps_n_outcomes.get("external_deps", []):
                     external_packages.add(pkg_name)
-
-                # Get or create test ID
-                test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                test_id = self.db.get_or_create_test_id(
-                    self.exec_id,
-                    test_name,
-                    duration=deps_n_outcomes.get("duration"),
-                    failed=deps_n_outcomes.get("failed", False),
-                    test_file=test_file,
-                )
 
                 # Serialize bitmap
                 deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
@@ -962,9 +967,23 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             _tlog("save_raw_build_pending_start",
                   n_file_ids=len(file_id_map))
 
-            # Phase 1: build pending list
+            # Phase 1: bulk-resolve test IDs, then build pending list
+            tests_for_db = []
+            for test_name in nodes_files_lines:
+                outcome = outcomes.get(test_name, {"failed": False, "duration": 0.0})
+                test_file = test_name.split("::")[0] if "::" in test_name else test_name
+                tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False)))
+
+            _tlog("save_raw_bulk_test_ids_start", n_tests=len(tests_for_db))
+            test_id_map = self.db.get_or_create_test_ids_batch(self.exec_id, tests_for_db)
+            _tlog("save_raw_bulk_test_ids_end", n_resolved=len(test_id_map))
+
             pending = []
             for test_name, deps_payload in nodes_files_lines.items():
+                test_id = test_id_map.get(test_name)
+                if test_id is None:
+                    continue
+
                 file_ids = set()
 
                 # Python deps
@@ -1001,21 +1020,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     elif isinstance(pkg, str) and self.package_code_map_rev:
                         pkg = self.package_code_map_rev.get(pkg, pkg)
                     external_packages.add(pkg)
-
-                # Outcome
-                outcome = outcomes.get(test_name, {"failed": False, "duration": 0.0})
-                forced = test_name in self.stable_test_names and (
-                    test_name not in self.failing_tests
-                )
-
-                test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                test_id = self.db.get_or_create_test_id(
-                    self.exec_id,
-                    test_name,
-                    duration=outcome.get("duration"),
-                    failed=outcome.get("failed", False),
-                    test_file=test_file,
-                )
 
                 deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
                 blob = deps.serialize()

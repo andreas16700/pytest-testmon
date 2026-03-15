@@ -986,6 +986,56 @@ class DB:  # pylint: disable=too-many-public-methods
         )
         return cursor.lastrowid
 
+    def get_or_create_test_ids_batch(
+        self,
+        exec_id: int,
+        tests: list,
+    ) -> Dict[str, int]:
+        """Bulk get-or-create test IDs.
+
+        Args:
+            exec_id: Environment ID
+            tests: List of (test_name, test_file, duration, failed) tuples
+
+        Returns:
+            Dict mapping test_name to test_id
+        """
+        if not tests:
+            return {}
+
+        cursor = self.con.cursor()
+        chunk_size = 500
+
+        # 1. Bulk INSERT OR IGNORE — creates rows for new tests
+        cursor.executemany(
+            """INSERT OR IGNORE INTO tests (environment_id, name, test_file, duration, failed)
+               VALUES (?, ?, ?, ?, ?)""",
+            [(exec_id, name, tf, dur, 1 if fail else 0) for name, tf, dur, fail in tests],
+        )
+
+        # 2. Bulk SELECT to get all IDs
+        all_names = [t[0] for t in tests]
+        result = {}
+        for i in range(0, len(all_names), chunk_size):
+            chunk = all_names[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = cursor.execute(
+                f"SELECT id, name FROM tests WHERE environment_id = ? AND name IN ({placeholders})",
+                [exec_id] + chunk,
+            ).fetchall()
+            for row in rows:
+                result[row[1]] = row[0]
+
+        # 3. Bulk UPDATE duration/failed for all tests
+        cursor.executemany(
+            """UPDATE tests SET duration = COALESCE(?, duration),
+               failed = ?, test_file = COALESCE(?, test_file)
+               WHERE environment_id = ? AND name = ?""",
+            [(dur, 1 if fail else 0, tf, exec_id, name) for name, tf, dur, fail in tests],
+        )
+
+        return result
+
     def save_test_deps(self, test_id: int, deps: TestDeps) -> None:
         """Save test dependencies as a compressed Roaring bitmap.
 

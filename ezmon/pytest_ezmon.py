@@ -771,14 +771,16 @@ class TestmonCollect:
                 )
                 if self._config is not None:
                     _timing_log(self._config, "controller_save_raw_end")
-            for test_name in all_failed:
-                test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                self.testmon_data.db.get_or_create_test_id(
-                    self.testmon_data.exec_id,
-                    test_name,
-                    duration=self._outcomes.get(test_name, {}).get("duration", 0.0),
-                    failed=True,
-                    test_file=test_file,
+            if all_failed:
+                failed_tests_for_db = [
+                    (name,
+                     name.split("::")[0] if "::" in name else name,
+                     self._outcomes.get(name, {}).get("duration", 0.0),
+                     True)
+                    for name in all_failed
+                ]
+                self.testmon_data.db.get_or_create_test_ids_batch(
+                    self.testmon_data.exec_id, failed_tests_for_db
                 )
             for retain in sync_retains:
                 self.testmon_data.sync_db_fs_tests(retain=set(retain))
@@ -966,7 +968,7 @@ class TestmonCollect:
                 self._handle_worker_output(
                     {
                         "testmon_nodes_files_lines": {
-                            "__format__": "plain_v1",
+                            "__format__": "file_common_unique_v2",
                             "batches": [value],
                         }
                     },
@@ -1168,19 +1170,84 @@ class TestmonCollect:
         }
         merged_succeeded = self._merge_collection_deps(merged_succeeded)
 
-        # Plain format: {test_nodeid: deps_dict} with outcomes
-        file_payload = {
-            "tests": {},
-            "outcomes": {},
-        }
-        for test_name, deps in merged_succeeded.items():
-            file_payload["tests"][test_name] = {
-                "deps": list(deps.get("deps", set())),
-                "file_deps": [(p, s) for p, s in deps.get("file_deps", set())],
-                "external_deps": list(deps.get("external_deps", set())),
-            }
+        common, unique = self._compute_common_unique(merged_succeeded)
+
+        def _deps_to_payload(deps):
+            payload = {}
+            files = deps.get("file_deps", set())
+            if files:
+                payload["f"] = [path for path, _sha in files]
+            py_deps = deps.get("deps", set())
+            if py_deps:
+                payload["p"] = list(py_deps)
+            ext = deps.get("external_deps", set())
+            if ext:
+                payload["e"] = list(ext)
+            return payload
+
+        def _suffix_for(name):
+            if name.startswith(test_file + "::"):
+                return name[len(test_file) + 2 :]
+            if name == test_file:
+                return ""
+            return name
+
+        suffixes = [_suffix_for(name) for name in unique.keys()]
+
+        prefixes = []
+        prefix_index = {}
+        for suffix in suffixes:
+            if "::" in suffix:
+                prefix = "::".join(suffix.split("::")[:-1])
+                if prefix not in prefix_index:
+                    prefix_index[prefix] = len(prefixes) + 1
+                    prefixes.append(prefix)
+
+        def _encode_name(suffix):
+            if "::" not in suffix:
+                return "0|" + suffix
+            parts = suffix.split("::")
+            prefix = "::".join(parts[:-1])
+            last = parts[-1]
+            return f"{prefix_index[prefix]}|{last}"
+
+        t_names = []
+        for suffix in suffixes:
+            t_names.append(_encode_name(suffix))
+        name_to_index = {name: idx for idx, name in enumerate(t_names)}
+
+        file_payload = {}
+        common_payload = _deps_to_payload(common)
+        if common_payload:
+            file_payload["com"] = common_payload
+
+        etc = []
+        dur = [0.0] * len(t_names)
+        fail = []
+        for (test_name, deps), suffix in zip(unique.items(), suffixes):
+            test_payload = _deps_to_payload(deps)
+            encoded_name = _encode_name(suffix)
+            idx = name_to_index.get(encoded_name)
+            if idx is None:
+                continue
             outcome = self._outcomes.get(test_name, {"failed": False, "duration": 0.0})
-            file_payload["outcomes"][test_name] = outcome
+            dur[idx] = outcome.get("duration", 0.0) or 0.0
+            if outcome.get("failed"):
+                fail.append(idx)
+            if test_payload:
+                file_payload[str(idx)] = test_payload
+            else:
+                etc.append(idx)
+
+        file_payload["t_names"] = t_names
+        if etc:
+            file_payload["etc"] = etc
+        if fail:
+            file_payload["fail"] = fail
+        file_payload["dur"] = dur
+
+        if prefixes:
+            file_payload["pm"] = prefixes
 
         self._worker_aggregate_files[test_file] = file_payload
         if len(self._worker_aggregate_files) >= self._worker_batch_size:
@@ -1227,7 +1294,7 @@ class TestmonCollect:
                     )
                 _timing_log(session.config, "worker_batch_build_end", batch_count=len(batches))
                 workeroutput["testmon_nodes_files_lines"] = {
-                    "__format__": "plain_v1",
+                    "__format__": "file_common_unique_v2",
                     "batches": batches,
                 }
                 _timing_log(
@@ -1311,7 +1378,7 @@ class TestmonCollect:
         expanded = {}
         if not (
             isinstance(nodes_files_lines, dict)
-            and nodes_files_lines.get("__format__") == "plain_v1"
+            and nodes_files_lines.get("__format__") == "file_common_unique_v2"
         ):
             _timing_log_for_actor("controller", "controller_receive_end", worker_id=worker_id, batch_count=0)
             return
@@ -1325,19 +1392,95 @@ class TestmonCollect:
                 file_count=len(batch.get("files") or {}),
             )
             files_payload = batch.get("files") or {}
-            for test_file, file_data in files_payload.items():
-                tests = file_data.get("tests", {})
-                outcomes = file_data.get("outcomes", {})
+            for test_file, payload in files_payload.items():
+                prefix_map = payload.get("pm", []) or []
+                t_names = payload.get("t_names") or []
+                durations = payload.get("dur") or []
+                failed_idx = set(payload.get("fail") or [])
+                common_payload = payload.get("com") or {}
+                common = {}
+                if "p" in common_payload:
+                    common["deps"] = set(common_payload["p"])
+                if "f" in common_payload:
+                    common["file_deps"] = set((path, None) for path in common_payload["f"])
+                if "e" in common_payload:
+                    common["external_deps"] = set(common_payload["e"])
 
-                for name, d in tests.items():
-                    expanded[name] = {
-                        "deps": set(d.get("deps", [])),
-                        "file_deps": set(tuple(x) for x in d.get("file_deps", [])),
-                        "external_deps": set(d.get("external_deps", [])),
+                def _merge_unique(unique_payload):
+                    merged = {
+                        "deps": set(common.get("deps", set())),
+                        "file_deps": set(common.get("file_deps", set())),
+                        "external_deps": set(common.get("external_deps", set())),
                     }
+                    if "p" in unique_payload:
+                        merged.setdefault("deps", set()).update(unique_payload["p"])
+                    if "f" in unique_payload:
+                        merged.setdefault("file_deps", set()).update(
+                            (path, None) for path in unique_payload["f"]
+                        )
+                    if "e" in unique_payload:
+                        merged.setdefault("external_deps", set()).update(unique_payload["e"])
+                    return merged
 
-                for name, outcome in outcomes.items():
-                    self._outcomes[name] = outcome
+                def _decode_name(encoded_name):
+                    if "|" not in encoded_name:
+                        return encoded_name
+                    prefix_id, last = encoded_name.split("|", 1)
+                    try:
+                        prefix_id = int(prefix_id)
+                    except ValueError:
+                        return encoded_name
+                    if prefix_id == 0:
+                        return last
+                    if 0 < prefix_id <= len(prefix_map):
+                        return f"{prefix_map[prefix_id - 1]}::{last}"
+                    return encoded_name
+
+                for suffix, deps_payload in payload.items():
+                    if suffix in ("com", "etc", "pm", "t_names", "dur", "fail"):
+                        continue
+                    try:
+                        idx = int(suffix)
+                    except ValueError:
+                        continue
+                    if idx < 0 or idx >= len(t_names):
+                        continue
+                    decoded = _decode_name(t_names[idx])
+                    if decoded and not decoded.startswith(test_file):
+                        test_name = f"{test_file}::{decoded}"
+                    else:
+                        test_name = decoded or test_file
+                    expanded[test_name] = _merge_unique(deps_payload or {})
+                    if idx < len(durations):
+                        outcome = self._outcomes.get(test_name)
+                        if outcome is None:
+                            outcome = {"failed": False, "duration": 0.0}
+                            self._outcomes[test_name] = outcome
+                        outcome["duration"] = durations[idx]
+                        if idx in failed_idx:
+                            outcome["failed"] = True
+
+                for idx in payload.get("etc", []) or []:
+                    if idx < 0 or idx >= len(t_names):
+                        continue
+                    decoded = _decode_name(t_names[idx])
+                    if decoded and not decoded.startswith(test_file):
+                        test_name = f"{test_file}::{decoded}"
+                    else:
+                        test_name = decoded or test_file
+                    expanded[test_name] = {
+                        "deps": set(common.get("deps", set())),
+                        "file_deps": set(common.get("file_deps", set())),
+                        "external_deps": set(common.get("external_deps", set())),
+                    }
+                    if idx < len(durations):
+                        outcome = self._outcomes.get(test_name)
+                        if outcome is None:
+                            outcome = {"failed": False, "duration": 0.0}
+                            self._outcomes[test_name] = outcome
+                        outcome["duration"] = durations[idx]
+                        if idx in failed_idx:
+                            outcome["failed"] = True
             _timing_log_for_actor(
                 "controller",
                 "controller_batch_end",
@@ -1367,14 +1510,16 @@ class TestmonCollect:
                 )
                 _timing_log_for_actor("controller", "controller_fingerprint_end", worker_id=worker_id)
                 self.testmon_data.save_test_deps_bitmap(test_executions_fingerprints)
-            for test_name in failed_tests:
-                test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                self.testmon_data.db.get_or_create_test_id(
-                    self.testmon_data.exec_id,
-                    test_name,
-                    duration=self._outcomes.get(test_name, {}).get("duration", 0.0),
-                    failed=True,
-                    test_file=test_file,
+            if failed_tests:
+                failed_tests_for_db = [
+                    (name,
+                     name.split("::")[0] if "::" in name else name,
+                     self._outcomes.get(name, {}).get("duration", 0.0),
+                     True)
+                    for name in failed_tests
+                ]
+                self.testmon_data.db.get_or_create_test_ids_batch(
+                    self.testmon_data.exec_id, failed_tests_for_db
                 )
 
     @pytest.hookimpl(optionalhook=True)

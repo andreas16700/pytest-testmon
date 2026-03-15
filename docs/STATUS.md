@@ -99,6 +99,29 @@ The high dep count is inherent to pandas: `pandas/__init__.py` eagerly imports m
 
 The overhead difference is entirely driven by dep count × test count: pandas has 22× more tests and 18× more deps per test, yielding ~400× more bitmap write work.
 
+## DB Write Optimization & Wire Format Fix (2026-03-15)
+
+Two optimizations to the xdist controller DB write path, plus a wire format regression fix:
+
+### Optimizations kept
+
+1. **Pre-warmed file metadata** — As worker batches arrive in `_handle_worker_output`, the controller calls `_prewarm_file_metadata()` to pre-compute `(checksum, fsha, file_id)` for each new file path. The accumulated `_precomputed_file_ids` map is passed to `save_test_deps_raw`, skipping Phases 0/0b/0c (file checksum computation + file ID resolution). Saves ~22s on pandas.
+
+2. **Batched test ID resolution** — Failed tests use `get_or_create_test_ids_batch()` instead of individual `get_or_create_test_id()` calls. Reduces per-test DB round-trips.
+
+### Wire format regression (fixed)
+
+Commit 83cac38 changed the worker→controller wire format from `file_common_unique_v2` to `plain_v1`, removing the common/unique dependency compression. This caused a **+125s regression** on pandas (187s → 313s):
+
+- `file_common_unique_v2` sends common deps once per file, unique deps per test — at pandas scale (~230K tests, ~1000 shared deps), the common set is nearly 100%.
+- `plain_v1` sent the full dep set for every test, inflating payloads ~97x.
+
+**Fix**: Reverted wire format to `file_common_unique_v2` while keeping all DB write optimizations. The `file_common_unique_v2` format drops shas from `file_deps` (sends paths only as `(path, None)`), which is compatible with the prewarm method — it falls back to `file_cache.get_tracked_sha(fname)` when sha is None.
+
+Also reverted the batch flush threshold from `>= 1` (flush every file) back to `>= self._worker_batch_size` (batch multiple files per payload).
+
+**Expected net result**: ~187s pre-prewarm baseline → ~165s target (keeping the ~22s prewarm savings).
+
 ## Import Tracking Refactor (2026-03-14 → 2026-03-15)
 
 The import tracking subsystem uses a pure import hook approach with deferred reconciliation. The hook records raw `(name, result.__name__, fromlist)` tuples with zero processing at import time; all path resolution and deduplication happens once per test at reconciliation.
