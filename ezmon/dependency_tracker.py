@@ -334,7 +334,7 @@ class DependencyTracker:
             if external:
                 external_imports.add(external)
 
-        for key, fromlists in recording.items():
+        for key, fromlists in list(recording.items()):
             if not key:
                 continue
 
@@ -351,7 +351,7 @@ class DependencyTracker:
             # imports.  Expand only when a fromlist item is NOT a direct
             # submodule (i.e. the package re-exports attributes).
             has_reexport = False
-            for fl in fromlists:
+            for fl in list(fromlists):
                 if fl is None:
                     continue
                 for item in fl:
@@ -372,7 +372,7 @@ class DependencyTracker:
                             _collect(child_key)
 
             # 3. Fromlist expansion
-            for fl in fromlists:
+            for fl in list(fromlists):
                 if fl is None:
                     continue
                 for item in fl:
