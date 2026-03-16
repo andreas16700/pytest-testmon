@@ -185,7 +185,6 @@ class TestBitmapSchema:
         """get_or_create_file_id() should update checksum on subsequent calls."""
         file_id1 = temp_db.get_or_create_file_id("src/foo.py", checksum=100)
 
-        temp_db.get_or_create_file_id.cache_clear()
         file_id2 = temp_db.get_or_create_file_id("src/foo.py", checksum=200)
 
         assert file_id1 == file_id2

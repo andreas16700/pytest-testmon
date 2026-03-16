@@ -251,9 +251,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     )
             self.system_packages_change = bool(self.changed_packages)
             self.run_id = self.db.create_run(self.commit_id, system_packages, python_version)
-            self.files_of_interest = self.db.all_filenames()
+            from ezmon.dep_store import DepStore
+            self.dep_store = DepStore(self.db)
+            self.files_of_interest = self.dep_store.all_filenames()
         else:
             # NetDB result handling
+            self.dep_store = None
             self.run_id = result["exec_id"]
             self.system_packages_change = result["packages_changed"]
             self.changed_packages = result.get("changed_packages", set())
@@ -305,6 +308,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
         # Workers do not access the database; controller provides all data.
         instance.db = None
+        instance.dep_store = None
 
         # Use pre-computed data from controller
         instance.run_id = run_id
@@ -376,6 +380,8 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
     @property
     def all_tests(self):
+        if self.dep_store is not None:
+            return self.dep_store.all_test_executions()
         return self.db.all_test_executions()
 
     def get_tests_fingerprints(self, nodes_files_lines, outcomes) -> TestExecutions:
@@ -592,14 +598,16 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.expected_files_list = []
         self.expected_packages_list = []
 
-        tracked_files = set(self.db.get_file_id_map().keys())
+        ds = self.dep_store
+        tracked_files = set(ds.get_file_id_map().keys()) if ds else set(self.db.get_file_id_map().keys())
         candidate_files = (git_mod | git_del) & tracked_files
         files_for_cache = (git_new | git_mod) - git_del
 
-        db_checksums = self.db.get_file_checksums()
+        db_checksums = ds.get_file_checksums() if ds else self.db.get_file_checksums()
         head_shas = self.file_cache.batch_get_head_shas(candidate_files)
 
         git_affected = set()
+        _update_checksum = ds.update_file_checksum if ds else self.db.update_file_checksum
         for path in sorted(candidate_files):
             is_deleted = path in git_del
             is_python = path.endswith(".py")
@@ -615,37 +623,43 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 checksum = compute_file_checksum(source, "py")
                 old_checksum = db_checksums.get(path)
                 fsha = head_shas.get(path)
-                # Always update checksum/fsha in DB when computed
-                self.db.update_file_checksum(path, checksum, fsha=fsha)
+                # Always update checksum/fsha when computed
+                _update_checksum(path, checksum, fsha=fsha)
                 if old_checksum != checksum:
                     git_affected.add(path)
             else:
                 # Non-Python tracked file: git_mod implies content changed
                 fsha = head_shas.get(path)
-                self.db.update_file_checksum(path, db_checksums.get(path), fsha=fsha)
+                _update_checksum(path, db_checksums.get(path), fsha=fsha)
                 git_affected.add(path)
 
         self.git_affected_files = git_affected
-        changed_file_ids = self.db.get_file_ids_for_paths(git_affected)
+        changed_file_ids = ds.get_file_ids_for_paths(git_affected) if ds else self.db.get_file_ids_for_paths(git_affected)
 
         # Find affected tests via bitmap
         affected_tests = set(
             self.db.find_affected_tests_bitmap(changed_file_ids, pack_affecting)
         )
-        self.failing_tests = set(self.db.get_failing_tests_bitmap())
+        self.failing_tests = set(
+            ds.get_failing_tests() if ds else self.db.get_failing_tests_bitmap()
+        )
         min_selected_tests = affected_tests | self.failing_tests
 
         self.unstable_test_names = set(min_selected_tests)
         self.stable_test_names = set(self.all_tests) - self.unstable_test_names
 
         # Collect only test files that contain min_selected_tests
-        min_collected_files = self.db.get_test_files_for_tests(min_selected_tests)
-        known_test_files = self.db.get_all_test_files()
+        if ds:
+            min_collected_files = ds.get_test_files_for_tests(min_selected_tests)
+            known_test_files = ds.get_all_test_files()
+        else:
+            min_collected_files = self.db.get_test_files_for_tests(min_selected_tests)
+            known_test_files = self.db.get_all_test_files()
         self.explicitly_nocollect_files = set(known_test_files) - set(min_collected_files)
         self.min_collected_files = set(min_collected_files)
 
         self.unstable_files = set(self.git_affected_files)
-        self.stable_files = set(self.db.filenames()) - self.unstable_files
+        self.stable_files = set(ds.all_filenames() if ds else self.db.filenames()) - self.unstable_files
 
         self.expected_packages = set(
             encode_packages(self.expected_packages, self.package_code_map)
@@ -781,12 +795,14 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     def save_test_deps_bitmap(self, test_executions_fingerprints: TestExecutions) -> None:
         """Save test dependencies using the new Roaring bitmap format.
 
-        All DB reads/writes are wrapped in a single transaction to avoid
-        per-test COMMIT overhead (230K commits -> 1 commit per call).
+        Uses DepStore when available (local DB) for O(1) lookups.
+        Falls back to direct DB access for NetDB.
 
         Args:
             test_executions_fingerprints: Dict mapping test name to DepsNOutcomes
         """
+        ds = self.dep_store
+
         with self.db.con:
             # Bulk-resolve test IDs
             tests_for_db = []
@@ -797,7 +813,11 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     deps_n_outcomes.get("duration"),
                     deps_n_outcomes.get("failed", False),
                 ))
-            test_id_map = self.db.get_or_create_test_ids_batch(self.run_id, tests_for_db)
+
+            if ds:
+                test_id_map = ds.ensure_tests_batch(self.run_id, tests_for_db)
+            else:
+                test_id_map = self.db.get_or_create_test_ids_batch(self.run_id, tests_for_db)
 
             # Resolve file IDs and serialize deps
             pending = []  # list of (test_id, blob, packages_str)
@@ -815,13 +835,18 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     checksum = dep.get("file_checksum")
                     fsha = dep.get("fsha")
 
-                    file_id = self._file_id_cache.get(filename)
-                    if file_id is None:
-                        file_id = self.db.get_or_create_file_id(
+                    if ds:
+                        file_id = ds.get_file_id(
                             filename, checksum=checksum, fsha=fsha, file_type='python'
                         )
-                        if file_id is not None:
-                            self._file_id_cache[filename] = file_id
+                    else:
+                        file_id = self._file_id_cache.get(filename)
+                        if file_id is None:
+                            file_id = self.db.get_or_create_file_id(
+                                filename, checksum=checksum, fsha=fsha, file_type='python'
+                            )
+                            if file_id is not None:
+                                self._file_id_cache[filename] = file_id
                     if file_id is not None:
                         file_ids.add(file_id)
 
@@ -829,15 +854,20 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 for file_dep in deps_n_outcomes.get("file_deps", []):
                     filename = file_dep["filename"]
                     sha = file_dep.get("sha")
-
                     checksum = file_sha_to_checksum(sha) if sha else None
-                    file_id = self._file_id_cache.get(filename)
-                    if file_id is None:
-                        file_id = self.db.get_or_create_file_id(
+
+                    if ds:
+                        file_id = ds.get_file_id(
                             filename, checksum=checksum, fsha=sha, file_type='data'
                         )
-                        if file_id is not None:
-                            self._file_id_cache[filename] = file_id
+                    else:
+                        file_id = self._file_id_cache.get(filename)
+                        if file_id is None:
+                            file_id = self.db.get_or_create_file_id(
+                                filename, checksum=checksum, fsha=sha, file_type='data'
+                            )
+                            if file_id is not None:
+                                self._file_id_cache[filename] = file_id
                     if file_id is not None:
                         file_ids.add(file_id)
 
@@ -851,42 +881,74 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 packages_str = deps.serialize_external_packages()
                 pending.append((test_id, blob, packages_str))
 
-            # Phase 2: skip unchanged deps (compare with existing blobs)
-            if pending and hasattr(self.db, "get_test_deps_batch"):
-                test_ids = [t[0] for t in pending]
-                existing = self.db.get_test_deps_batch(test_ids)
-                if existing:
-                    pending = [
-                        (tid, blob, pkgs)
-                        for tid, blob, pkgs in pending
-                        if existing.get(tid) != blob
-                    ]
+            # Skip unchanged deps
+            if ds:
+                pending = [
+                    (tid, blob, pkgs)
+                    for tid, blob, pkgs in pending
+                    if ds.get_existing_blob(tid) != blob
+                ]
+                ds.save_batch(pending)
+            else:
+                if pending and hasattr(self.db, "get_test_deps_batch"):
+                    test_ids = [t[0] for t in pending]
+                    existing = self.db.get_test_deps_batch(test_ids)
+                    if existing:
+                        pending = [
+                            (tid, blob, pkgs)
+                            for tid, blob, pkgs in pending
+                            if existing.get(tid) != blob
+                        ]
+                if pending and hasattr(self.db, "save_test_deps_batch"):
+                    self.db.save_test_deps_batch(pending)
+                elif pending and hasattr(self.db, "save_test_deps"):
+                    for test_id, blob, packages_str in pending:
+                        deps_obj = TestDeps.deserialize(test_id, blob, packages_str)
+                        self.db.save_test_deps(test_id, deps_obj)
 
-            # Phase 3: batch write all changed deps in one executemany
-            if pending and hasattr(self.db, "save_test_deps_batch"):
-                self.db.save_test_deps_batch(pending)
-            elif pending and hasattr(self.db, "save_test_deps"):
-                for test_id, blob, packages_str in pending:
-                    deps = TestDeps.deserialize(test_id, blob, packages_str)
-                    self.db.save_test_deps(test_id, deps)
+    def _resolve_relpath(self, relpath):
+        """Resolve an int-encoded or string relpath to a string path."""
+        if isinstance(relpath, int):
+            if 0 <= relpath < len(self.expected_files_list):
+                return self.expected_files_list[relpath]
+            return None
+        return relpath or None
+
+    def _resolve_file_dep(self, relpath_sha):
+        """Resolve a file_deps entry to (relpath, sha)."""
+        relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
+        sha = relpath_sha[1] if isinstance(relpath_sha, tuple) else None
+        if isinstance(relpath, int):
+            if 0 <= relpath < len(self.expected_files_list):
+                return self.expected_files_list[relpath], sha
+            return None, None
+        return (relpath, sha) if relpath else (None, None)
+
+    def _resolve_packages(self, external_deps):
+        """Resolve a set of int-encoded or string package names."""
+        result = set()
+        for pkg in external_deps:
+            if isinstance(pkg, int):
+                if 0 <= pkg < len(self.expected_packages_list):
+                    result.add(self.expected_packages_list[pkg])
+            elif isinstance(pkg, str) and self.package_code_map_rev:
+                result.add(self.package_code_map_rev.get(pkg, pkg))
+            else:
+                result.add(pkg)
+        return result
 
     def save_test_deps_raw(self, nodes_files_lines, outcomes):
-        """Save test deps directly from raw worker data, skipping per-test fingerprint iteration.
+        """Save test deps directly from raw worker data using DepStore.
 
-        This is the fast path for xdist controller. Instead of iterating
-        230K tests × 1000 deps = 230M fingerprint lookups, we collect the
-        ~1000 unique filenames, compute checksums once per file, and resolve
-        file_ids in one pass.
-
-        File IDs are lazily cached via _file_id_cache and file_cache._content_cache,
-        both of which persist across calls on the TestmonData instance.
+        This is the fast path for xdist controller. All file ID lookups are
+        O(1) dict hits from the pre-loaded DepStore cache. No checksum
+        computation, no serial DB queries for file IDs.
         """
         import time as _t
         _t0 = _t.monotonic()
 
         def _tlog(event, **fields):
             _core_timing_log(event, **fields)
-            # Also emit to the xdist timing log (always active during benchmarks)
             timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
             if timing_dir:
                 import json as _json
@@ -900,76 +962,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 except Exception:
                     pass
 
+        ds = self.dep_store
+
         with self.db.con:
-            _tlog("save_raw_collect_filenames_start", n_tests=len(nodes_files_lines))
+            _tlog("save_raw_start", n_tests=len(nodes_files_lines))
 
-            # Phase 0: collect all unique filenames
-            all_python_files = set()
-            all_data_files = {}  # filename -> sha (from file_deps tuples)
-            for deps_payload in nodes_files_lines.values():
-                for relpath in deps_payload.get("deps", set()):
-                    if isinstance(relpath, int):
-                        if 0 <= relpath < len(self.expected_files_list):
-                            all_python_files.add(self.expected_files_list[relpath])
-                    elif relpath:
-                        all_python_files.add(relpath)
-                for relpath_sha in deps_payload.get("file_deps", set()):
-                    relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
-                    sha = relpath_sha[1] if isinstance(relpath_sha, tuple) else None
-                    if isinstance(relpath, int):
-                        if 0 <= relpath < len(self.expected_files_list):
-                            relpath = self.expected_files_list[relpath]
-                        else:
-                            continue
-                    if relpath:
-                        all_data_files[relpath] = sha
-
-            _tlog("save_raw_compute_checksums_start",
-                  n_python=len(all_python_files), n_data=len(all_data_files))
-
-            # Compute checksums for all unique Python files (~1000 files, ~1-2s)
-            python_checksums = {}
-            for fname in all_python_files:
-                try:
-                    checksum, fsha, _mtime = self.file_cache.get_file_info(fname)
-                    python_checksums[fname] = (checksum, fsha)
-                except Exception:
-                    python_checksums[fname] = (None, None)
-
-            _tlog("save_raw_resolve_file_ids_start")
-
-            # Resolve all filenames → file_ids
-            file_id_map = {}
-            for fname in all_python_files:
-                cached = self._file_id_cache.get(fname)
-                if cached is not None:
-                    file_id_map[fname] = cached
-                    continue
-                checksum, fsha = python_checksums.get(fname, (None, None))
-                file_id = self.db.get_or_create_file_id(
-                    fname, checksum=checksum, fsha=fsha, file_type='python'
-                )
-                if file_id is not None:
-                    file_id_map[fname] = file_id
-                    self._file_id_cache[fname] = file_id
-
-            for fname, sha in all_data_files.items():
-                cached = self._file_id_cache.get(fname)
-                if cached is not None:
-                    file_id_map[fname] = cached
-                    continue
-                checksum = file_sha_to_checksum(sha) if sha else None
-                file_id = self.db.get_or_create_file_id(
-                    fname, checksum=checksum, fsha=sha, file_type='data'
-                )
-                if file_id is not None:
-                    file_id_map[fname] = file_id
-                    self._file_id_cache[fname] = file_id
-
-            _tlog("save_raw_build_pending_start",
-                  n_file_ids=len(file_id_map))
-
-            # Phase 1: bulk-resolve test IDs, then build pending list
+            # Bulk-resolve test IDs
             tests_for_db = []
             for test_name in nodes_files_lines:
                 outcome = outcomes.get(test_name, {"failed": False, "duration": 0.0})
@@ -977,10 +975,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False)))
 
             _tlog("save_raw_bulk_test_ids_start", n_tests=len(tests_for_db))
-            test_id_map = self.db.get_or_create_test_ids_batch(self.run_id, tests_for_db)
+            test_id_map = ds.ensure_tests_batch(self.run_id, tests_for_db)
             _tlog("save_raw_bulk_test_ids_end", n_resolved=len(test_id_map))
 
+            # Build pending list — all file ID lookups are cache hits
             pending = []
+            n_file_ids = 0
             for test_name, deps_payload in nodes_files_lines.items():
                 test_id = test_id_map.get(test_name)
                 if test_id is None:
@@ -988,76 +988,34 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
                 file_ids = set()
 
-                # Python deps
+                # Python deps — O(1) lookup per file
                 for relpath in deps_payload.get("deps", set()):
-                    if isinstance(relpath, int):
-                        if 0 <= relpath < len(self.expected_files_list):
-                            relpath = self.expected_files_list[relpath]
-                        else:
-                            continue
-                    fid = file_id_map.get(relpath)
-                    if fid is not None:
-                        file_ids.add(fid)
+                    relpath = self._resolve_relpath(relpath)
+                    if relpath:
+                        file_ids.add(ds.get_file_id(relpath))
 
                 # Non-Python file deps
                 for relpath_sha in deps_payload.get("file_deps", set()):
-                    relpath = relpath_sha[0] if isinstance(relpath_sha, tuple) else relpath_sha
-                    if isinstance(relpath, int):
-                        if 0 <= relpath < len(self.expected_files_list):
-                            relpath = self.expected_files_list[relpath]
-                        else:
-                            continue
-                    fid = file_id_map.get(relpath)
-                    if fid is not None:
-                        file_ids.add(fid)
+                    relpath, sha = self._resolve_file_dep(relpath_sha)
+                    if relpath:
+                        file_ids.add(ds.get_file_id(relpath, fsha=sha, file_type='data'))
 
-                # External packages — decode int codes
-                external_packages = set()
-                for pkg in deps_payload.get("external_deps", set()):
-                    if isinstance(pkg, int):
-                        if 0 <= pkg < len(self.expected_packages_list):
-                            pkg = self.expected_packages_list[pkg]
-                        else:
-                            continue
-                    elif isinstance(pkg, str) and self.package_code_map_rev:
-                        pkg = self.package_code_map_rev.get(pkg, pkg)
-                    external_packages.add(pkg)
+                # External packages
+                external_packages = self._resolve_packages(deps_payload.get("external_deps", set()))
 
+                n_file_ids += len(file_ids)
                 deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
                 blob = deps.serialize()
-                packages_str = deps.serialize_external_packages()
-                pending.append((test_id, blob, packages_str))
+                if blob != ds.get_existing_blob(test_id):
+                    pending.append((test_id, blob, deps.serialize_external_packages()))
 
-            _tlog("save_raw_skip_unchanged_start", n_pending=len(pending))
+            _tlog("save_raw_batch_write_start", n_pending=len(pending), n_file_ids=n_file_ids)
 
-            # Phase 2: skip unchanged
-            if pending and hasattr(self.db, "get_test_deps_batch"):
-                test_ids = [t[0] for t in pending]
-                existing = self.db.get_test_deps_batch(test_ids)
-                if existing:
-                    n_before = len(pending)
-                    pending = [
-                        (tid, blob, pkgs)
-                        for tid, blob, pkgs in pending
-                        if existing.get(tid) != blob
-                    ]
-                    _tlog("save_raw_skip_unchanged_done",
-                          n_before=n_before, n_after=len(pending),
-                          n_skipped=n_before - len(pending))
-
-            _tlog("save_raw_batch_write_start", n_to_write=len(pending))
-
-            # Phase 3: batch write
-            if pending and hasattr(self.db, "save_test_deps_batch"):
-                self.db.save_test_deps_batch(pending)
-            elif pending and hasattr(self.db, "save_test_deps"):
-                for test_id, blob, packages_str in pending:
-                    deps_obj = TestDeps.deserialize(test_id, blob, packages_str)
-                    self.db.save_test_deps(test_id, deps_obj)
+            ds.save_batch(pending)
 
             _tlog("save_raw_end",
                   n_tests=len(nodes_files_lines),
-                  n_file_ids=len(file_id_map),
+                  n_file_ids=n_file_ids,
                   n_written=len(pending),
                   total_secs=round(_t.monotonic() - _t0, 3))
 

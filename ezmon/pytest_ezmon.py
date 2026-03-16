@@ -328,15 +328,6 @@ def init_testmon_data(config: Config):
     )
     testmon_data.determine_stable()
 
-    # Pre-warm fingerprint cache for all tracked files so that the hot path
-    # (get_file_info during test dep saving) is always a cache hit.
-    if testmon_data.files_of_interest:
-        _timing_log(config, "prewarm_fingerprint_start")
-        testmon_data.file_cache.batch_get_checksums(
-            testmon_data.files_of_interest, parallel=True
-        )
-        _timing_log(config, "prewarm_fingerprint_end")
-
     config.testmon_data = testmon_data
     _timing_log(config, "controller_init_end")
 
@@ -688,9 +679,15 @@ class TestmonCollect:
                      True)
                     for name in all_failed
                 ]
-                self.testmon_data.db.get_or_create_test_ids_batch(
-                    self.testmon_data.run_id, failed_tests_for_db
-                )
+                ds = self.testmon_data.dep_store
+                if ds:
+                    ds.ensure_tests_batch(
+                        self.testmon_data.run_id, failed_tests_for_db
+                    )
+                else:
+                    self.testmon_data.db.get_or_create_test_ids_batch(
+                        self.testmon_data.run_id, failed_tests_for_db
+                    )
             for retain in sync_retains:
                 self.testmon_data.sync_db_fs_tests(retain=set(retain))
         except sqlite3.OperationalError as exc:
@@ -974,13 +971,20 @@ class TestmonCollect:
             outcome = self._outcomes.get(test_name, {"failed": False, "duration": 0.0})
             if outcome.get("failed"):
                 # Mark failed tests but do not update deps
-                self.testmon_data.db.get_or_create_test_id(
-                    test_name,
-                    duration=outcome.get("duration"),
-                    failed=True,
-                    test_file=test_file,
-                    run_id=self.testmon_data.run_id,
-                )
+                ds = self.testmon_data.dep_store
+                if ds:
+                    ds.ensure_tests_batch(
+                        self.testmon_data.run_id,
+                        [(test_name, test_file, outcome.get("duration"), True)],
+                    )
+                else:
+                    self.testmon_data.db.get_or_create_test_id(
+                        test_name,
+                        duration=outcome.get("duration"),
+                        failed=True,
+                        test_file=test_file,
+                        run_id=self.testmon_data.run_id,
+                    )
             else:
                 succeeded[test_name] = deps
 
@@ -1439,9 +1443,15 @@ class TestmonCollect:
                      True)
                     for name in failed_tests
                 ]
-                self.testmon_data.db.get_or_create_test_ids_batch(
-                    self.testmon_data.run_id, failed_tests_for_db
-                )
+                ds = self.testmon_data.dep_store
+                if ds:
+                    ds.ensure_tests_batch(
+                        self.testmon_data.run_id, failed_tests_for_db
+                    )
+                else:
+                    self.testmon_data.db.get_or_create_test_ids_batch(
+                        self.testmon_data.run_id, failed_tests_for_db
+                    )
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_down(self, node, error):  # pylint: disable=unused-argument

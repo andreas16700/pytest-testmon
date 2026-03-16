@@ -2,7 +2,6 @@ import json
 import os
 import sqlite3
 
-from functools import lru_cache
 from typing import Dict, List, Optional, Set
 
 from ezmon.common import TestExecutions
@@ -103,7 +102,6 @@ class DB:  # pylint: disable=too-many-public-methods
 
     def finish_execution(self, duration=None, select=True, commit_id: Optional[str] = None):
         """Legacy finish_execution — delegates to finish_run if a run exists."""
-        self.get_or_create_file_id.cache_clear()
         with self.con as con:
             self.vacuum_files(con)
 
@@ -366,7 +364,6 @@ class DB:  # pylint: disable=too-many-public-methods
     # New Roaring Bitmap-based methods for simplified dependency storage
     # ==========================================================================
 
-    @lru_cache(maxsize=10000)
     def get_or_create_file_id(self, path: str, checksum: int = None,
                               fsha: str = None, file_type: str = 'python',
                               run_id: int = None) -> int:
@@ -450,8 +447,6 @@ class DB:  # pylint: disable=too-many-public-methods
                WHERE path = ?""",
             (checksum, fsha, path)
         )
-        # Clear cache since file changed
-        self.get_or_create_file_id.cache_clear()
 
     def get_or_create_test_id(
         self,
