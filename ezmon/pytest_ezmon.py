@@ -648,15 +648,12 @@ class TestmonCollect:
 
         # Merge all queued items into batches to minimize DB transactions
         merged_deps = {}
-        all_failed = []
         sync_retains = []
         while self._write_queue:
-            kind, payload, failed_tests = self._write_queue.popleft()
+            kind, payload, _unused = self._write_queue.popleft()
             if kind == "deps":
                 if payload:
                     merged_deps.update(payload)
-                if failed_tests:
-                    all_failed.extend(failed_tests)
             elif kind == "sync":
                 sync_retains.append(payload)
 
@@ -667,30 +664,13 @@ class TestmonCollect:
                 self.testmon_data.save_test_deps_bitmap(merged_deps)
                 if self._config is not None:
                     _timing_log(self._config, "controller_save_bitmap_end")
-            if all_failed:
-                failed_tests_for_db = [
-                    (name,
-                     name.split("::")[0] if "::" in name else name,
-                     self._outcomes.get(name, {}).get("duration", 0.0),
-                     True)
-                    for name in all_failed
-                ]
-                ds = self.testmon_data.dep_store
-                if ds:
-                    ds.ensure_tests_batch(
-                        self.testmon_data.run_id, failed_tests_for_db
-                    )
-                else:
-                    self.testmon_data.db.get_or_create_test_ids_batch(
-                        self.testmon_data.run_id, failed_tests_for_db
-                    )
             for retain in sync_retains:
                 self.testmon_data.sync_db_fs_tests(retain=set(retain))
         except sqlite3.OperationalError as exc:
             if "database is locked" in str(exc):
                 # Re-enqueue everything and retry later
                 if merged_deps:
-                    self._write_queue.appendleft(("deps", merged_deps, all_failed))
+                    self._write_queue.appendleft(("deps", merged_deps, None))
                 for retain in sync_retains:
                     self._write_queue.appendleft(("sync", retain, None))
             else:
@@ -1130,7 +1110,6 @@ class TestmonCollect:
 
         etc = []
         dur = [0.0] * len(t_names)
-        fail = []
         for (test_name, deps), suffix in zip(unique.items(), suffixes):
             test_payload = _deps_to_payload(deps)
             encoded_name = _encode_name(suffix)
@@ -1139,8 +1118,6 @@ class TestmonCollect:
                 continue
             outcome = self._outcomes.get(test_name, {"failed": False, "duration": 0.0})
             dur[idx] = outcome.get("duration", 0.0) or 0.0
-            if outcome.get("failed"):
-                fail.append(idx)
             if test_payload:
                 file_payload[str(idx)] = test_payload
             else:
@@ -1149,8 +1126,6 @@ class TestmonCollect:
         file_payload["t_names"] = t_names
         if etc:
             file_payload["etc"] = etc
-        if fail:
-            file_payload["fail"] = fail
         file_payload["dur"] = dur
 
         if prefixes:
@@ -1236,6 +1211,8 @@ class TestmonCollect:
                     ds.ensure_tests_batch(
                         self.testmon_data.run_id, failed_tests_for_db
                     )
+                    with self.testmon_data.db.con:
+                        ds.save_batch([])  # flush dirty test metadata, no deps to write
                 else:
                     for name, test_file, dur, _failed in failed_tests_for_db:
                         self.testmon_data.db.get_or_create_test_id(
@@ -1336,7 +1313,6 @@ class TestmonCollect:
                 prefix_map = payload.get("pm", []) or []
                 t_names = payload.get("t_names") or []
                 durations = payload.get("dur") or []
-                failed_idx = set(payload.get("fail") or [])
                 common_payload = payload.get("com") or {}
                 common = {}
                 if "p" in common_payload:
@@ -1377,7 +1353,7 @@ class TestmonCollect:
                     return encoded_name
 
                 for suffix, deps_payload in payload.items():
-                    if suffix in ("com", "etc", "pm", "t_names", "dur", "fail"):
+                    if suffix in ("com", "etc", "pm", "t_names", "dur"):
                         continue
                     try:
                         idx = int(suffix)
@@ -1397,8 +1373,6 @@ class TestmonCollect:
                             outcome = {"failed": False, "duration": 0.0}
                             self._outcomes[test_name] = outcome
                         outcome["duration"] = durations[idx]
-                        if idx in failed_idx:
-                            outcome["failed"] = True
 
                 for idx in payload.get("etc", []) or []:
                     if idx < 0 or idx >= len(t_names):
@@ -1419,8 +1393,6 @@ class TestmonCollect:
                             outcome = {"failed": False, "duration": 0.0}
                             self._outcomes[test_name] = outcome
                         outcome["duration"] = durations[idx]
-                        if idx in failed_idx:
-                            outcome["failed"] = True
             _timing_log_for_actor(
                 "controller",
                 "controller_batch_end",
