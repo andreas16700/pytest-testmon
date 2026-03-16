@@ -1220,6 +1220,29 @@ class TestmonCollect:
         if self._running_as in ("single", "controller"):
             if self._running_as == "controller":
                 self._drain_write_queue()
+            # Flush failed tests to DB — workers don't send deps for failed
+            # tests, so the controller must mark them explicitly.
+            failed_tests_for_db = [
+                (name,
+                 name.split("::")[0] if "::" in name else name,
+                 outcome.get("duration", 0.0),
+                 True)
+                for name, outcome in self._outcomes.items()
+                if outcome.get("failed")
+            ]
+            if failed_tests_for_db:
+                ds = self.testmon_data.dep_store
+                if ds:
+                    ds.ensure_tests_batch(
+                        self.testmon_data.run_id, failed_tests_for_db
+                    )
+                else:
+                    for name, test_file, dur, _failed in failed_tests_for_db:
+                        self.testmon_data.db.get_or_create_test_id(
+                            name, duration=dur, failed=True,
+                            test_file=test_file,
+                            run_id=self.testmon_data.run_id,
+                        )
             _timing_log(session.config, "controller_save_deps_start")
             duration = time.time() - self._sessionstarttime
             run_stats = self.testmon_data.db.fetch_current_run_stats()
