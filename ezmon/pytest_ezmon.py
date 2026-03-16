@@ -15,7 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
-from ezmon.server_sync import download_testmon_data, upload_testmon_data, should_sync
+from ezmon.net_db import get_net_db_config, upload_db_to_server
 from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
@@ -379,16 +379,11 @@ def pytest_configure(config):
     config.always_run_files = []
     config.prioritized_files = []
 
-    if should_sync():
-        # 1. Fetch preferences (Always Run Tests and Prioritized Tests)
+    if get_net_db_config() is not None:
         prefs = get_test_preferences()
         config.always_run_files = list(prefs.get("always_run_tests", []))
         config.prioritized_files = list(prefs.get("prioritized_tests", []))
-        
-        # 2. Download testmon data
-        testmon_file = get_testmon_file(config)
-        downloaded = download_testmon_data(testmon_file)
-        
+
     coverage_stack = None
     try:
         from tmnet.testmon_core import (  # pylint: disable=import-outside-toplevel
@@ -559,21 +554,22 @@ def pytest_unconfigure(config):
     if running_as not in ("single", "controller"):
         return
 
-    # Upload if sync is enabled - AFTER database is committed and closed
-    if should_sync():
-        _timing_log(config, "controller_upload_start")
-        testmon_file = get_testmon_file(config)
-        logger.info(f"Testmon file path: {testmon_file}")
-        # Give file system time to flush
-        time.sleep(0.2)
-
-        if testmon_file.exists() and testmon_file.stat().st_size > 0:
-            logger.info(f"📦 Uploading: {testmon_file.stat().st_size:,} bytes")
-            repo_name = os.getenv("GITHUB_REPOSITORY") or os.getenv("REPO_ID") or "unknown"
-            upload_testmon_data(testmon_file, repo_name)
-        else:
-            logger.info("No testmon data to upload")
-        _timing_log(config, "controller_upload_end")
+    # Upload DB to server if NetDB mode is active
+    if hasattr(config, "testmon_data") and hasattr(config.testmon_data, "db"):
+        net_config = getattr(config.testmon_data.db, "_net_config", None)
+        if net_config is not None:
+            _timing_log(config, "controller_upload_start")
+            testmon_file = get_testmon_file(config)
+            if testmon_file.exists() and testmon_file.stat().st_size > 0:
+                upload_db_to_server(
+                    net_config["server_url"],
+                    net_config["repo_id"],
+                    net_config["job_id"],
+                    net_config.get("auth_token"),
+                    net_config.get("run_id"),
+                    str(testmon_file),
+                )
+            _timing_log(config, "controller_upload_end")
     timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
     if timing_dir:
         _timing_log(config, "controller_flush_timing_start")

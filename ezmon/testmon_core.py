@@ -9,14 +9,12 @@ import json
 from pathlib import Path
 from functools import lru_cache
 from collections import defaultdict
-from xmlrpc.client import Fault, ProtocolError
-from socket import gaierror
 from typing import Dict, List, Optional, Set
 
 import pytest
 
 from ezmon import db
-from ezmon.net_db import create_net_db_from_env, NetDB
+from ezmon.net_db import get_net_db_config, download_db_from_server
 from ezmon import TESTMON_VERSION as TM_CLIENT_VERSION
 from ezmon.common import (
     get_logger,
@@ -76,28 +74,37 @@ def _core_timing_log(event, **fields):
 
 def create_database(rootdir, readonly=False):
     """
-    Factory function to create the appropriate database backend.
+    Factory function to create a local SQLite database.
 
-    If TESTMON_NET_ENABLED=true and required env vars are set,
-    returns a NetDB instance for remote server communication.
-    Otherwise, returns a local SQLite DB instance.
+    If NetDB mode is enabled (TESTMON_NET_ENABLED=true), downloads the
+    per-job SQLite file from the server first. Then opens it with db.DB.
+    The net_config is stashed on the DB instance for upload at session end.
 
     Args:
         rootdir: Project root directory
         readonly: Whether to open in readonly mode
 
     Returns:
-        Either NetDB or db.DB instance
+        db.DB instance (with optional _net_config attribute for upload)
     """
-    net_db = create_net_db_from_env()
-    if net_db is not None:
-        logger.info("Using NetDB for remote server communication")
-        return net_db
-
-    # Fall back to local SQLite database
-    import os
+    net_config = get_net_db_config()
     datafile = os.path.join(rootdir, get_data_file_path())
-    return db.DB(datafile, readonly=readonly)
+
+    if net_config is not None:
+        download_db_from_server(
+            net_config["server_url"],
+            net_config["repo_id"],
+            net_config["job_id"],
+            net_config.get("auth_token"),
+            datafile,
+        )
+
+    database = db.DB(datafile, readonly=readonly)
+
+    if net_config is not None:
+        database._net_config = net_config
+
+    return database
 
 
 def get_data_file_path():
@@ -214,55 +221,23 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.changed_packages = set()
         self.system_packages_change = False
 
-        # NetDB path: use old initiate_execution interface
-        if isinstance(self.db, NetDB):
-            try:
-                result = self.db.initiate_execution(
-                    self.environment,
-                    system_packages,
-                    python_version,
-                    {
-                        "tm_client_version": TM_CLIENT_VERSION,
-                        "git_head_sha": git_current_head(),
-                        "ci": os.environ.get("CI"),
-                    },
+        prev = self.db.get_previous_run_info()
+        self.previous_commit_id = None
+        if prev:
+            self.previous_commit_id = prev.get("commit_id")
+            self.previous_packages = prev.get("packages", "") or ""
+            prev_python = prev.get("python_version", "") or ""
+            if prev_python != python_version:
+                self.changed_packages = {"__python_version_changed__"}
+            elif self.previous_packages != system_packages:
+                self.changed_packages = compute_changed_packages(
+                    self.previous_packages, system_packages
                 )
-            except (ConnectionRefusedError, Fault, ProtocolError, gaierror) as exc:
-                logger.error(
-                    "%s error when communication with ezmon.net. (falling back to .testmondata locally)",
-                    exc,
-                )
-                self.db = db.DB(os.path.join(self.rootdir, get_data_file_path()))
-                # Fall through to local DB path below
-
-        # Local DB path: use new runs-based interface
-        if not isinstance(self.db, NetDB):
-            prev = self.db.get_previous_run_info()
-            self.previous_commit_id = None
-            if prev:
-                self.previous_commit_id = prev.get("commit_id")
-                self.previous_packages = prev.get("packages", "") or ""
-                prev_python = prev.get("python_version", "") or ""
-                if prev_python != python_version:
-                    self.changed_packages = {"__python_version_changed__"}
-                elif self.previous_packages != system_packages:
-                    self.changed_packages = compute_changed_packages(
-                        self.previous_packages, system_packages
-                    )
-            self.system_packages_change = bool(self.changed_packages)
-            self.run_id = self.db.create_run(self.commit_id, system_packages, python_version)
-            from ezmon.dep_store import DepStore
-            self.dep_store = DepStore(self.db)
-            self.files_of_interest = self.dep_store.all_filenames()
-        else:
-            # NetDB result handling
-            self.dep_store = None
-            self.run_id = result["exec_id"]
-            self.system_packages_change = result["packages_changed"]
-            self.changed_packages = result.get("changed_packages", set())
-            self.previous_packages = result.get("previous_packages", "")
-            self.current_packages = result.get("current_packages", "")
-            self.files_of_interest = result["filenames"]
+        self.system_packages_change = bool(self.changed_packages)
+        self.run_id = self.db.create_run(self.commit_id, system_packages, python_version)
+        from ezmon.dep_store import DepStore
+        self.dep_store = DepStore(self.db)
+        self.files_of_interest = self.dep_store.all_filenames()
 
         self.expected_files_list = []
         self.expected_packages_list = []
@@ -793,10 +768,9 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         return durations
 
     def save_test_deps_bitmap(self, test_executions_fingerprints: TestExecutions) -> None:
-        """Save test dependencies using the new Roaring bitmap format.
+        """Save test dependencies using the Roaring bitmap format.
 
-        Uses DepStore when available (local DB) for O(1) lookups.
-        Falls back to direct DB access for NetDB.
+        Uses DepStore for O(1) lookups.
 
         Args:
             test_executions_fingerprints: Dict mapping test name to DepsNOutcomes
