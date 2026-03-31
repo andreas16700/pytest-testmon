@@ -17,7 +17,7 @@ function FilesTab({currentRepo, currentJob, currentRun, allFiles, search, setSea
     const filteredFiles = allFiles.map((runData) => ({
             ...runData,
             files: runData.files.filter((file) =>
-                file.filename.toLowerCase().includes(search.toLowerCase())
+                file.path.toLowerCase().includes(search.toLowerCase())
             ),
         })).filter((runData) => runData.files.length > 0);
 
@@ -67,10 +67,10 @@ function FilesTab({currentRepo, currentJob, currentRun, allFiles, search, setSea
                     runData.files.map((file) => (
                         <FileItem
                             currentRepo={currentRepo}
-                            key={`${runData.run_id}:${file.filename}`}
+                            key={`${runData.run_id}:${file.path}`}
                             runId={runData.run_id}
                             file={file}
-                            onClick={() => showFileDetails(file.filename, runData.run_id)}
+                            onClick={() => showFileDetails(file.path, runData.run_id)}
                         />
                     ))
                 )}

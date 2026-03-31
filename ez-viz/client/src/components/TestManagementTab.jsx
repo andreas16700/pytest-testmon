@@ -11,7 +11,7 @@ const reorder = (list, startIndex, endIndex) => {
     return result;
 };
 
-function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
+function TestManagementTab({repos, currentRepo, currentJob}) {
     const [searchTerm, setSearchTerm] = useState("");
     const [isOpen, setIsOpen] = useState(false);
     const [testFileList, setTestFileList] = useState([]);
@@ -20,7 +20,7 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
     const [prioritizedTests, setPrioritizedTests] = useState([]);
     const [loading, setLoading] = useState(false);
     const [failedAttemptId, setFailedAttemptId] = useState(null);
-
+    console.log(testFileList)
     const filteredTests = testFileList.filter((testFile) =>
         testFile.file_name.toLowerCase().includes(searchTerm.toLowerCase())
     );
@@ -98,27 +98,28 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
         }
     };
 
-    /*Send latest run id as parameter */
+    /* Send latest run id as parameter */
     useEffect(() => {
         if (!repos || repos.length === 0) return;
+
         const currentRepoLocal = repos.find((repo) => repo.id === currentRepo);
         if (!currentRepoLocal) {
             console.error("Repo not found:", currentRepo);
+            return;
         }
-        const currentJobLocal = currentRepoLocal.jobs.find(
-            (job) => job.name === currentJob
-        );
 
+        const currentJobLocal = currentRepoLocal.jobs.find((job) => job.name === currentJob);
         if (!currentJobLocal) {
             console.error("Job not found:", currentJob);
+            return;
         }
-        const latestRun = currentJobLocal.runs.at(-1);
 
+        const latestRun = currentJobLocal.runs.at(-1);
         if (latestRun) {
             loadTestFileList(latestRun.id);
             loadTestPreferences();
         }
-    }, [repos]);
+    }, [repos, currentRepo, currentJob]);
 
     const loadTestPreferences = async () => {
         try {

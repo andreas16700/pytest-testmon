@@ -137,7 +137,7 @@ CORS(
     methods=["GET", "POST", "OPTIONS"],
 )
 
-BASE_DATA_DIR = Path(os.getenv("TESTMON_DATA_DIR", "./testmon_data"))
+BASE_DATA_DIR = Path(os.getenv("TESTMON_DATA_DIR", "../testmon_data"))
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 METADATA_FILE = BASE_DATA_DIR / "metadata.json"
 
@@ -650,16 +650,15 @@ def get_run_infos(db_path):
         # Get run data with stats from run_infos table
         cursor.execute("""
             SELECT
-                ru.id,
-                ru.repo_run_id,
-                ru.create_date,
-                ri.tests_all,
-                ri.tests_saved,
-                ri.run_time_all,
-                ri.run_time_saved
-            FROM run_uid ru
-            LEFT JOIN run_infos ri ON ru.id = ri.run_uid
-            ORDER BY ru.create_date DESC
+                r.id,
+                r.created_at,
+                r.tests_all,
+                r.tests_selected,
+                r.tests_deselected,
+                r.time_all,
+                r.time_saved
+            FROM runs r
+            ORDER BY r.created_at DESC
         """)
         rows = cursor.fetchall()
 
@@ -668,11 +667,11 @@ def get_run_infos(db_path):
         runs = [
             {
                 "id": row[0],  # Always use internal id for uniqueness
-                "repo_run_id": row[1],  # External ID for reference (may be shared across matrix jobs)
-                "created": row[2],
-                "tests_total": row[3],  # Total tests in this run
-                "tests_skipped": row[4],  # Tests skipped (saved) by ezmon
-                "time_total": row[5],  # Total test time
+                "created_at": row[1],
+                "tests_all": row[2],  # Total tests in this run
+                "tests_selected": row[3],  # Tests skipped (saved) by ezmon
+                "tests_deselected": row[4],
+                "time_all": row[5],  # Total test time
                 "time_saved": row[6],  # Time saved by skipping
             }
             for row in rows
@@ -1147,6 +1146,7 @@ def get_file_content(owner, repo):
 def get_summary(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    print(f"Repo ID: {repo_id}, Job ID: {job_id}, Run ID: {run_id}, DB Path: {db_path}, Response: {resp}, Code: {code}")
     if resp:
         return resp, code
 
@@ -1154,58 +1154,28 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        env = cursor.execute(
-            """
-            SELECT environment_name, python_version, system_packages
-            FROM environment
-            LIMIT 1;
-        """
-        ).fetchone()
+        print("Database connection established successfully.")
 
-        test_count_row = cursor.execute("SELECT tests_all FROM run_infos Where run_uid = (Select id from run_uid Where repo_run_id=?)", (run_id,)).fetchone()
-        test_count = test_count_row[0] if test_count_row else 0
-        file_count = cursor.execute(
-            "SELECT COUNT(DISTINCT filename) FROM file_fp_infos WHERE run_uid = (Select id from run_uid Where repo_run_id=?) ",
-            (run_id,)
-        ).fetchone()[0]
-       
-        test_savings = cursor.execute(
-            "SELECT tests_saved FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
+        run_info_row = cursor.execute(
+            "SELECT tests_all, tests_deselected, time_saved, time_all, created_at FROM runs WHERE id = ?",
             (run_id,)
         ).fetchone()
-
-        time_savings = cursor.execute(
-            "SELECT run_time_saved FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
-            (run_id,)
-        ).fetchone()
-
-        time_all = cursor.execute(
-            "SELECT run_time_all FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
-            (run_id,)
-        ).fetchone()
-
-        row = cursor.execute(
-            "SELECT create_date FROM run_uid WHERE repo_run_id = ?",
-            (run_id,)
-        ).fetchone()
-
-        create_date = row[0] if row else None
 
         savings = {}
-        if test_savings and test_savings[0] is not None:
-            savings["tests_saved"] = test_savings[0]
-        if time_savings and time_savings[0] is not None:
-            savings["time_saved"] = time_savings[0]     
-        if time_all and time_all[0] is not None:
-            savings["time_all"] = time_all[0]     
+        if run_info_row:
+            if run_info_row["tests_deselected"] is not None:
+                savings["tests_saved"] = run_info_row["tests_deselected"]
+            if run_info_row["time_saved"] is not None:
+                savings["time_saved"] = run_info_row["time_saved"]
+            if run_info_row["time_all"] is not None:
+                savings["time_all"] = run_info_row["time_all"]
+
+            test_count = run_info_row["tests_all"]
+            create_date = run_info_row["created_at"]
     
 
         conn.close()
-        log.info(
-            "summary_success tests=%s files=%s",
-            test_count,
-            file_count,
-        )
+        log.info("summary_success tests=%s",test_count)
 
         return jsonify(
             {
@@ -1214,14 +1184,6 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
                 "run_id": run_id,
                 "create_date": create_date,
                 "test_count": test_count,
-                "file_count": file_count,
-                "environment": {
-                    "name": env["environment_name"] if env else "default",
-                    "python_version": env["python_version"] if env else "unknown",
-                    "packages": (env["system_packages"][:100] + "...")
-                    if env and env["system_packages"]
-                    else "",
-                },
                 "savings": savings,
             }
         )
@@ -1247,36 +1209,30 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
             """
             SELECT
                 CASE 
-                    WHEN instr(te.test_name, '::') > 0 
-                        THEN substr(te.test_name, 1, instr(te.test_name, '::') - 1)
-                    ELSE te.test_name
+                    WHEN instr(t.name, '::') > 0 
+                        THEN substr(t.name, 1, instr(t.name, '::') - 1)
+                    ELSE t.name
                 END AS file_name,
                 COUNT(*) AS test_count,
-                SUM(te.duration) AS total_duration,
-                SUM(CASE WHEN te.failed = 1 THEN 1 ELSE 0 END) AS failed_count,
-                SUM(CASE WHEN te.forced = 1 THEN 1 ELSE 0 END) AS forced_count,
-                COUNT(DISTINCT tef.fingerprint_id) AS dependency_count,
+                SUM(t.duration) AS total_duration,
+                SUM(CASE WHEN t.failed = 1 THEN 1 ELSE 0 END) AS failed_count,
                 GROUP_CONCAT(
                     DISTINCT
                     CASE 
-                        WHEN instr(te.test_name, '::') > 0 
-                            THEN substr(te.test_name, instr(te.test_name, '::') + 2)
+                        WHEN instr(t.name, '::') > 0 
+                            THEN substr(t.name, instr(t.name, '::') + 2)
                         ELSE NULL
                     END
                 ) AS test_methods
-            FROM test_infos te
-            LEFT JOIN test_execution_file_fp_infos tef
-                ON te.id = tef.test_execution_id     
-            WHERE te.run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)                      
+            FROM tests t 
+            WHERE t.run_id = ?                      
             GROUP BY file_name
             ORDER BY file_name;
             """,
             (run_id,),
         ).fetchall()
 
-
         conn.close()
-       
 
         return jsonify({"test_files": [dict(test) for test in test_files]})
 
@@ -1299,29 +1255,18 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
         tests = conn.execute(
             """
             SELECT 
-                te.id,
-                te.test_name,
-                te.duration,
-                te.failed,
-                te.forced,
-                COUNT(DISTINCT tef.fingerprint_id) AS dependency_count
-            FROM test_infos te
-            LEFT JOIN test_execution_file_fp_infos tef 
-                ON te.test_execution_id = tef.test_execution_id
-                AND tef.run_uid = (
-                    SELECT id FROM run_uid WHERE repo_run_id=?
-                )
-            WHERE te.run_uid = (
-                    SELECT id FROM run_uid WHERE repo_run_id=?
-                )
-            GROUP BY te.id, te.test_name, te.duration, te.failed, te.forced
-            ORDER BY te.test_name
+                t.id,
+                t.name,
+                t.duration,
+                t.failed
+            FROM tests t
+            WHERE t.run_id = ?
+            ORDER BY t.name
             """,
-            (run_id, run_id)
-).fetchall()
-
+            (run_id,)
+        ).fetchall()
+        print(f"Tests {tests}")
         conn.close()
-        #log.info("tests_list_success count=%s", len(tests))
 
         return jsonify({"run_id": run_id, "tests": [dict(test) for test in tests]})
 
@@ -1342,81 +1287,84 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
         conn.row_factory = sqlite3.Row
 
         test = conn.execute(
-            "SELECT * FROM test_infos WHERE id = ?", (test_id,)
+            "SELECT * FROM tests WHERE id = ?", (test_id,)
         ).fetchone()
         if not test:
             conn.close()
             log.warning("test_not_found test_id=%s", test_id)
             return jsonify({"error": "Test not found"}), 404
 
-        deps = conn.execute(
-            """
-            SELECT 
-                fp.filename,
-                fp.fsha,
-                fp.method_checksums,
-                fp.mtime
-            FROM test_infos ti
-            JOIN run_uid r
-                ON ti.run_uid = r.id
-            JOIN test_execution_file_fp_infos tef
-                ON tef.test_execution_id = ti.test_execution_id
-            AND tef.run_uid = r.id
-            JOIN file_fp_infos fp
-                ON fp.fingerprint_id = tef.fingerprint_id
-            AND fp.run_uid = r.id
-            WHERE ti.id = ?
-            AND r.repo_run_id = ?
-            """,
-            (test_id, run_id)
-        ).fetchall()
-        coverage_rows = conn.execute(
-            """
-                SELECT filename, lines
-                FROM test_execution_coverage
-                WHERE run_uid=(
-                    Select id
-                    From run_uid
-                    Where repo_run_id=?
-                )
-                AND test_execution_id = (
-                    Select test_execution_id 
-                    From test_infos
-                    WHERE id=? 
-                )
-                
-            """,
-            (run_id,test_id)
-        ).fetchall()
+        # Reimplement the commented parts using the new schema!!!
+
+        # deps = conn.execute(
+        #     """
+        #     SELECT
+        #         fp.filename,
+        #         fp.fsha,
+        #         fp.method_checksums,
+        #         fp.mtime
+        #     FROM test_infos ti
+        #     JOIN run_uid r
+        #         ON ti.run_uid = r.id
+        #     JOIN test_execution_file_fp_infos tef
+        #         ON tef.test_execution_id = ti.test_execution_id
+        #     AND tef.run_uid = r.id
+        #     JOIN file_fp_infos fp
+        #         ON fp.fingerprint_id = tef.fingerprint_id
+        #     AND fp.run_uid = r.id
+        #     WHERE ti.id = ?
+        #     AND r.repo_run_id = ?
+        #     """,
+        #     (test_id, run_id)
+        # ).fetchall()
+
+        # coverage_rows = conn.execute(
+        #     """
+        #         SELECT filename, lines
+        #         FROM test_execution_coverage
+        #         WHERE run_uid=(
+        #             Select id
+        #             From run_uid
+        #             Where repo_run_id=?
+        #         )
+        #         AND test_execution_id = (
+        #             Select test_execution_id
+        #             From test_infos
+        #             WHERE id=?
+        #         )
+        #
+        #     """,
+        #     (run_id,test_id)
+        # ).fetchall()
 
         # lines is stored as JSON string, so decode it
-        coverage = {
-            row["filename"]: json.loads(row["lines"])
-            for row in coverage_rows
-        }
-
-
-        conn.close()
-
-        dependencies = []
-        for dep in deps:
-
-            checksums_arr = array.array("i")
-            checksums_arr.frombytes(dep["method_checksums"])
-            dependencies.append(
-                {
-                    "filename": dep["filename"],
-                    "fsha": dep["fsha"],
-                    "mtime": dep["mtime"],
-                    "checksums": checksums_arr.tolist(),
-                }
-            )
+        # coverage = {
+        #     row["filename"]: json.loads(row["lines"])
+        #     for row in coverage_rows
+        # }
+        #
+        #
+        # conn.close()
+        #
+        # dependencies = []
+        # for dep in deps:
+        #
+        #     checksums_arr = array.array("i")
+        #     checksums_arr.frombytes(dep["method_checksums"])
+        #     dependencies.append(
+        #         {
+        #             "filename": dep["filename"],
+        #             "fsha": dep["fsha"],
+        #             "mtime": dep["mtime"],
+        #             "checksums": checksums_arr.tolist(),
+        #         }
+        #     )
 
 
         return jsonify({
-            "test": dict(test),
-            "dependencies": dependencies,
-            "coverage": coverage,
+            "test": dict(test)
+            # "dependencies": dependencies,
+            # "coverage": coverage,
         })
 
 
@@ -1437,24 +1385,14 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
         conn.row_factory = sqlite3.Row
         files = conn.execute(
             """
-            SELECT 
-                fpi.filename,
-                COUNT(DISTINCT tefi.test_execution_id) AS test_count,
-                COUNT(DISTINCT fpi.fingerprint_id)     AS fingerprint_count
-            FROM file_fp_infos fpi
-            LEFT JOIN test_execution_file_fp_infos tefi
-                ON  fpi.fingerprint_id = tefi.fingerprint_id
-                AND fpi.run_uid  = tefi.run_uid   
-            WHERE 
-                fpi.run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)
-            GROUP BY 
-                fpi.filename
-            ORDER BY 
-                fpi.filename
+            SELECT f.path
+            FROM files f
+            WHERE f.run_id = ?
+            ORDER BY f.path
             """,
             (run_id,)
         ).fetchall()
-
+        print(f"Files {files}")
         conn.close()
         log.info("files_list_success count=%s", len(files))
 

@@ -115,7 +115,6 @@ function MainContent({
                         repos={repos}
                         currentRepo={currentRepo}
                         currentJob={currentJob}
-                        currentRuns={currentRuns}
                     />
                 )}
             </main>

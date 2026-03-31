@@ -141,6 +141,9 @@ function App() {
                 setSummary((prev) => [...prev, summaryData]);
                 setAllTests((prev) => [...prev, testsData]);
                 setAllFiles((prev) => [...prev, filesData]);
+                console.log("Summary", summaryData);
+                console.log("Tests", testsData);
+                console.log("Files", filesData);
                 setActiveTab("summary");
             } catch (err) {
                 setError("Failed to load testmon data: " + err.message);
@@ -153,16 +156,15 @@ function App() {
         }
     };
 
-    const showTestDetails = async (testId, run_id) => {
+    const showTestDetails = async (testId, runId) => {
         try {
-            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/test/${testId}`, {credentials: "include"});
+            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/test/${testId}`, {credentials: "include"});
             const data = await resp.json();
 
             setModal({
                 open: true,
-                title: data.test.test_name,
-                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies}
-                                      coverage={data.coverage}/>,
+                title: data.test.name,
+                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies} coverage={data.coverage}/>,
             });
         } catch (err) {
             alert("Failed to load test details: " + err.message);
