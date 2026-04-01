@@ -165,16 +165,16 @@ function App() {
             setModal({
                 open: true,
                 title: data.test.name,
-                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies} coverage={data.coverage}/>,
+                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies} externalPackages={data.external_packages}/>,
             });
         } catch (err) {
             alert("Failed to load test details: " + err.message);
         }
     };
 
-    const showFileDetails = async (filename, run_id) => {
+    const showFileDetails = async (filename, runId) => {
         try {
-            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/fileDetails/${filename}`, {credentials: "include"});
+            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/fileDetails/${filename}`, {credentials: "include"});
             const data = await resp.json();
             setModal({
                 open: true,

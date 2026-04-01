@@ -405,7 +405,7 @@ class DB:  # pylint: disable=too-many-public-methods
         cursor.execute(
             """INSERT INTO files (path, checksum, fsha, file_type, run_id)
                VALUES (?, ?, ?, ?, ?)""",
-            (path, checksum, fsha, file_type, 1)
+            (path, checksum, fsha, file_type, run_id)
         )
         return cursor.lastrowid
 

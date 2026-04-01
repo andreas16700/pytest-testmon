@@ -2,26 +2,15 @@ import React from "react";
 import EnvItem from "./EnvItem.jsx";
 import { formatDuration } from "./utils.jsx";
 
-function TestDetails({ currentRepo, test, dependencies, coverage, branch = "main" }) {
-  // Safety defaults
+function TestDetails({ currentRepo, test, dependencies, externalPackages, branch = "main" }) {
   const deps = dependencies || [];
-  const cov = coverage || {};
 
-  const navigateToGithub = (e, filename, lines) => {
+  const navigateToGithub = (e, filename) => {
     e.stopPropagation();
-    if (!currentRepo || !filename || !lines || lines.length === 0) return;
-
-    const sorted = [...lines].sort((a, b) => a - b);
-    const first = sorted[0];
-    const last = sorted[sorted.length - 1];
-
-    let anchor = `#L${first}`;
-    if (sorted.length > 1 && last !== first) {
-      anchor = `#L${first}-L${last}`;
-    }
+    if (!currentRepo || !filename) return;
 
     const cleanPath = filename.startsWith("./") ? filename.slice(2) : filename;
-    const url = `https://github.com/${currentRepo}/blob/${branch}/${cleanPath}${anchor}`;
+    const url = `https://github.com/${currentRepo}/blob/${branch}/${cleanPath}`;
 
     window.open(url, "_blank", "noopener,noreferrer");
   };
@@ -32,15 +21,7 @@ function TestDetails({ currentRepo, test, dependencies, coverage, branch = "main
       <div className="test-details-env-section">
         <EnvItem
           label="Status"
-          value={
-            test?.failed
-              ? "Failed"
-              : test?.forced === 0
-              ? "Executed"
-              : test?.forced === 1
-              ? "Forced"
-              : "Skipped"
-          }
+          value={test?.failed ? "Failed" : "Executed"}
         />
 
         <EnvItem
@@ -49,44 +30,33 @@ function TestDetails({ currentRepo, test, dependencies, coverage, branch = "main
         />
       </div>
 
-      {/* Dependencies + coverage lines */}
+      {/* Dependencies + external packages */}
       <div className="test-details-dependencies-section">
         <h3 className="dependencies-heading">
           Dependencies ({deps.length})
         </h3>
 
         {deps.map((dep, idx) => {
-          const linesForFile = cov[dep.filename] || [];
-
           return (
             <div key={idx} className="dependency-card">
               <div className="dependency-filename">📄 {dep.filename}</div>
-
+              <div className="external-packages">External Packages: {externalPackages.join(", ")}</div>
               <div className="dependency-meta">
                 <span>
-                  SHA: {dep.fsha ? dep.fsha.substring(0, 8) : "N/A"}
+                  <span className="font-medium">SHA:</span>{" "}{dep.fsha ? dep.fsha.substring(0, 8) : "N/A"}
                 </span>
-                <span>{dep.checksums?.length ?? 0} blocks</span>
+                <span>
+                  <span className="font-medium">Checksum:</span>{" "}{dep.checksum}
+                </span>
               </div>
 
-              {/* Covered lines */}
-              <div className="dependency-checksums">
-                {linesForFile.length > 0 ? (
-                  <>Lines: [{linesForFile.join(", ")}]</>
-                ) : (
-                  <span className="text-gray-500">
-                    No coverage lines recorded for this file in this test
-                  </span>
-                )}
-              </div>
-
-              {/* View on GitHub button if we have repo + coverage lines */}
-              {currentRepo && linesForFile.length > 0 && (
+              {/* View on GitHub button */}
+              {currentRepo && (
                 <div className="mt-2">
                   <button
                     type="button"
                     className="px-3 py-1 text-sm rounded-md border border-blue-500 text-blue-600 hover:bg-blue-50 transition"
-                    onClick={(e) => navigateToGithub(e, dep.filename, linesForFile)}
+                    onClick={(e) => navigateToGithub(e, dep.filename)}
                   >
                     View on GitHub
                   </button>

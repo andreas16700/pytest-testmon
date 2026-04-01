@@ -229,6 +229,25 @@ def save_metadata(metadata: Dict):
         log_exception("metadata_write", path=str(METADATA_FILE))
 
 # -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def _decode_bitmap(blob) -> set:
+    try:
+        import zstandard as zstd
+        raw = zstd.ZstdDecompressor().decompress(blob)
+    except ImportError:
+        import gzip
+        raw = gzip.decompress(blob)
+
+    try:
+        from pyroaring import BitMap
+        return set(BitMap.deserialize(raw))
+    except ImportError:
+        import pickle
+        return pickle.loads(raw)
+
+# -----------------------------------------------------------------------------
 # Path helpers with logging
 # -----------------------------------------------------------------------------
 def get_repo_path(repo_id: str) -> Path:
@@ -1329,79 +1348,49 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             log.warning("test_not_found test_id=%s", test_id)
             return jsonify({"error": "Test not found"}), 404
 
-        # Reimplement the commented parts using the new schema!!!
+        dependency_row = conn.execute(
+            "SELECT file_bitmap, external_packages FROM test_deps WHERE test_id = ?",(test_id,)
+        ).fetchone()
 
-        # deps = conn.execute(
-        #     """
-        #     SELECT
-        #         fp.filename,
-        #         fp.fsha,
-        #         fp.method_checksums,
-        #         fp.mtime
-        #     FROM test_infos ti
-        #     JOIN run_uid r
-        #         ON ti.run_uid = r.id
-        #     JOIN test_execution_file_fp_infos tef
-        #         ON tef.test_execution_id = ti.test_execution_id
-        #     AND tef.run_uid = r.id
-        #     JOIN file_fp_infos fp
-        #         ON fp.fingerprint_id = tef.fingerprint_id
-        #     AND fp.run_uid = r.id
-        #     WHERE ti.id = ?
-        #     AND r.repo_run_id = ?
-        #     """,
-        #     (test_id, run_id)
-        # ).fetchall()
+        dependencies = []
+        external_packages = []
 
-        # coverage_rows = conn.execute(
-        #     """
-        #         SELECT filename, lines
-        #         FROM test_execution_coverage
-        #         WHERE run_uid=(
-        #             Select id
-        #             From run_uid
-        #             Where repo_run_id=?
-        #         )
-        #         AND test_execution_id = (
-        #             Select test_execution_id
-        #             From test_infos
-        #             WHERE id=?
-        #         )
-        #
-        #     """,
-        #     (run_id,test_id)
-        # ).fetchall()
+        if dependency_row:
+            # Decode the bitmap to get file IDs
+            file_ids = _decode_bitmap(dependency_row["file_bitmap"])
 
-        # lines is stored as JSON string, so decode it
-        # coverage = {
-        #     row["filename"]: json.loads(row["lines"])
-        #     for row in coverage_rows
-        # }
-        #
-        #
-        # conn.close()
-        #
-        # dependencies = []
-        # for dep in deps:
-        #
-        #     checksums_arr = array.array("i")
-        #     checksums_arr.frombytes(dep["method_checksums"])
-        #     dependencies.append(
-        #         {
-        #             "filename": dep["filename"],
-        #             "fsha": dep["fsha"],
-        #             "mtime": dep["mtime"],
-        #             "checksums": checksums_arr.tolist(),
-        #         }
-        #     )
+            if file_ids:
+                # Fetch file metadata for all dependency IDs in one query
+                placeholders = ",".join("?" * len(file_ids))
+                ids = [i for i in file_ids]
+                file_rows = conn.execute(
+                    f"SELECT id, path, checksum, fsha, file_type FROM files WHERE id IN ({placeholders})",
+                    ids
+                ).fetchall()
 
+                for f in file_rows:
+                    dependencies.append({
+                        "filename": f["path"],
+                        "fsha": f["fsha"],
+                        "checksum": f["checksum"],
+                        "file_type": f["file_type"],
+                    })
+
+            # Parse external packages string e.g. "pytest,numpy==2.2.1"
+            if dependency_row["external_packages"]:
+                external_packages = [
+                    p.strip()
+                    for p in dependency_row["external_packages"].split(",")
+                    if p.strip()
+                ]
+
+        conn.close()
 
         return jsonify({
-            "test": dict(test)
-            # "dependencies": dependencies,
-            # "coverage": coverage,
+            "test": dict(test),
+            "dependencies": dependencies,
+            "external_packages": external_packages
         })
-
 
     except Exception:
         log_exception("test_details_query", repo_id=repo_id, job_id=job_id, test_id=test_id)
@@ -1438,11 +1427,8 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
         return jsonify({"error": "Failed to read files"}), 500
 
 
-@app.route(
-    "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>",
-    methods=["GET"]
-)
-def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
+@app.route( "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>", methods=["GET"])
+def get_file_details(repo_id: str, job_id: str, run_id:str, file_name:str):
     g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
 
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
@@ -1467,8 +1453,8 @@ def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
             ORDER BY tei.test_name
             """,
             (run_id, file_name)
-
         ).fetchall()
+
         conn.close()
         log.info("files_list_success count=%s", len(files))
 
