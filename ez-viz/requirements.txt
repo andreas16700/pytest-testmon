@@ -4,3 +4,5 @@ flask-cors
 python-dotenv
 openai
 PyGithub
+zstandard
+pyroaring
