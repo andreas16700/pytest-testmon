@@ -92,6 +92,7 @@ class DepStore:
         checksum: int = None,
         fsha: str = None,
         file_type: str = "python",
+        run_id: int = None,
     ) -> int:
         """Dict lookup. If new file, INSERT into DB and add to cache. O(1) for known files."""
         entry = self._files.get(path)
@@ -101,8 +102,8 @@ class DepStore:
         # New file -- INSERT into DB immediately
         cursor = self._db.con.cursor()
         cursor.execute(
-            "INSERT INTO files (path, checksum, fsha, file_type) VALUES (?, ?, ?, ?)",
-            (path, checksum, fsha, file_type),
+            "INSERT INTO files (path, checksum, fsha, file_type, run_id) VALUES (?, ?, ?, ?, ?)",
+            (path, checksum, fsha, file_type, run_id),
         )
         file_id = cursor.lastrowid
         self._files[path] = FileEntry(
@@ -110,7 +111,7 @@ class DepStore:
             checksum=checksum,
             fsha=fsha,
             file_type=file_type,
-            run_id=None,
+            run_id=run_id,
         )
         return file_id
 

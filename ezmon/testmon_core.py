@@ -811,13 +811,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
                     if ds:
                         file_id = ds.get_file_id(
-                            filename, checksum=checksum, fsha=fsha, file_type='python'
+                            filename, checksum=checksum, fsha=fsha, file_type='python', run_id=self.run_id
                         )
                     else:
                         file_id = self._file_id_cache.get(filename)
                         if file_id is None:
                             file_id = self.db.get_or_create_file_id(
-                                filename, checksum=checksum, fsha=fsha, file_type='python'
+                                filename, checksum=checksum, fsha=fsha, file_type='python', run_id=self.run_id
                             )
                             if file_id is not None:
                                 self._file_id_cache[filename] = file_id
@@ -832,13 +832,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
                     if ds:
                         file_id = ds.get_file_id(
-                            filename, checksum=checksum, fsha=sha, file_type='data'
+                            filename, checksum=checksum, fsha=sha, file_type='data', run_id=self.run_id
                         )
                     else:
                         file_id = self._file_id_cache.get(filename)
                         if file_id is None:
                             file_id = self.db.get_or_create_file_id(
-                                filename, checksum=checksum, fsha=sha, file_type='data'
+                                filename, checksum=checksum, fsha=sha, file_type='data', run_id=self.run_id
                             )
                             if file_id is not None:
                                 self._file_id_cache[filename] = file_id
