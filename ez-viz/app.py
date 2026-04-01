@@ -445,7 +445,7 @@ def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None
 @app.route("/api/ask_ai", methods=["POST"])
 def leverage_ai_model():
     if not OPENAI_AVAILABLE:
-        return jsonify({"error": "OpenAI not available. Install with: pip install openai"}), 503
+        return jsonify({"error": "OpenAI library is not installed on the server. Install with: pip install openai"}), 503
 
     data = request.get_json()
     content = data.get("content")
@@ -453,8 +453,9 @@ def leverage_ai_model():
         return jsonify({"error": "No content provided"}), 400
     api_key = os.getenv("AI_GITHUB_TOKEN")
     if not api_key:
-        print("Error: AI_GITHUB_TOKEN environment variable not set.")
-        return
+        error_message = "Server configuration error: AI_GITHUB_TOKEN is missing."
+        print(f"Error: {error_message}")
+        return jsonify({"error": error_message}), 500
 
     client = OpenAI(
         base_url="https://models.inference.ai.azure.com",
@@ -462,11 +463,45 @@ def leverage_ai_model():
     )
 
     print(f"--- Using {CURRENT_MODEL}")
-
     user_prompt = (
-        "You are an expert GitHub Actions engineer. Update the following workflow file "
-        "to include a step that runs the 'testmon' plugin using the command: 'pytest --ezmon'. "
-        "Return ONLY the updated YAML content. Do not include markdown formatting (```yaml) or explanations.\n\n"
+        "You are an expert GitHub Actions engineer. Update the following workflow file to integrate 'ezmon', "
+        "an improved version of the testmon plugin for intelligent test selection.\n\n"
+
+        "CRITICAL REQUIREMENTS:\n"
+        "1. Add ezmon environment variables at the workflow or job level:\n"
+        "   TESTMON_NET_ENABLED: \"true\"\n"
+        "   TESTMON_SERVER: \"https://ezmon.aloiz.ch\"\n"
+        "   TESTMON_AUTH_TOKEN: ${{ secrets.EZMON_AUTH_TOKEN }}\n"
+        "   REPO_ID: ${{ github.repository }}\n"
+        "   RUN_ID: ${{ github.run_id }}\n\n"
+
+        "2. MANDATORY: Add a step to install the ezmon fork AFTER all other Python dependencies are installed.\n"
+        "   This step must include:\n"
+        "   pip install \"git+https://github.com/andreas16700/pytest-testmon@main\"\n"
+        "   pip install networkx pyvis\n"
+        "   Name this step 'Install ezmon plugin' or similar.\n"
+        "   IMPORTANT: Keep all existing dependency installation commands (requirements.txt, setup.py, etc.)\n\n"
+
+        "3. In the pytest execution step:\n"
+        "   a. Add JOB_ID environment variable: JOB_ID=\"python-${{ matrix.python-version }}-${{ matrix.os }}\"\n"
+        "      (or create a unique identifier combining OS and Python version for non-matrix builds)\n"
+        "   b. Modify the pytest command to use: pytest --ezmon -v\n"
+        "      If there are existing pytest flags, keep them and add --ezmon\n"
+        "   If there's an existing pytest step, update it. If not, add a new step named 'Run tests with ezmon'.\n\n"
+
+        "GUIDELINES:\n"
+        "- Preserve all existing steps and configuration that don't conflict with ezmon\n"
+        "- If the workflow has multiple jobs, apply changes to the primary test job\n"
+        "- Keep existing Python version, OS, and other configurations unchanged\n"
+        "- Maintain the workflow's existing structure and formatting style\n"
+        "- Do not remove any existing environment variables or steps\n"
+        "- For matrix builds with multiple OS/Python combinations, ensure each job gets a unique JOB_ID\n\n"
+
+        "OUTPUT FORMAT:\n"
+        "Return ONLY the complete updated YAML content. Do not include markdown code blocks (```yaml), "
+        "explanations, or comments about what was changed.\n\n"
+
+        "EXISTING WORKFLOW FILE:\n"
         f"{content}"
     )
     print(f"\nConnecting to {CURRENT_MODEL}... \n")

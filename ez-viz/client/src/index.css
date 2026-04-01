@@ -228,6 +228,10 @@
     @apply px-6 py-3 bg-indigo-500 text-white rounded-lg font-semibold hover:bg-indigo-600 transition-all flex items-center gap-2;
 }
 
+.reset-button {
+    @apply px-6 py-3 bg-red-500 border border-red-600 text-white rounded-lg font-semibold hover:bg-red-600 transition-all flex items-center gap-2;
+}
+
 .tip-box {
     @apply bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded-md shadow-sm;
 }
@@ -1020,4 +1024,20 @@
 
 .btn-github-link span {
     @apply text-sm;
+}
+
+.selection-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    margin-right: 8px;
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    color: white;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 700;
+    box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);
 }

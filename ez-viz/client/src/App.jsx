@@ -6,6 +6,7 @@ import MainContent from "./components/MainContent.jsx";
 import TestDetails from "./components/TestDetails.jsx";
 import FileDetails from "./components/FileDetails.jsx";
 import WorkflowFilePopup from "./components/WorkflowFilePopup.jsx";
+import {Toaster, toast} from "react-hot-toast";
 
 function App() {
     const [user, setUser] = useState(null);
@@ -96,15 +97,15 @@ function App() {
                 },
                 body: JSON.stringify({content: content}),
             });
-            if (!aiResponse.ok) {
-                throw new Error(`Server error: ${aiResponse.status}`);
-            }
-
             const data = await aiResponse.json();
+            if (!aiResponse.ok) {
+                throw new Error(data.error || `Server error: ${aiResponse.status}`);
+            }
             setWorkflowFile(data.content);
             setIsPopupWindowOpen(true);
         } catch (err) {
             console.error(err);
+            toast.error("The AI service encountered an internal error. Try again later!");
         }
     };
 
@@ -199,6 +200,7 @@ function App() {
 
     return (
         <div className="app-root-container">
+            <Toaster />
             <Header user={user} handleLogout={handleLogout}/>
 
             <div className="app-main-layout flex h-screen overflow-hidden relative">
