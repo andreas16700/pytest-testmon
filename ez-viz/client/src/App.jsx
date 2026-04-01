@@ -179,7 +179,7 @@ function App() {
             setModal({
                 open: true,
                 title: filename,
-                content: <FileDetails filename={filename} files={data.files}/>,
+                content: <FileDetails filename={filename} affectedTests={data.affectedTests}/>,
             });
         } catch (err) {
             alert("Failed to load file details : " + err.message);

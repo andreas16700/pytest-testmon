@@ -1428,7 +1428,7 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
 
 
 @app.route( "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>", methods=["GET"])
-def get_file_details(repo_id: str, job_id: str, run_id:str, file_name:str):
+def get_file_details(repo_id: str, job_id: str, run_id: str, file_name: str):
     g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
 
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
@@ -1438,135 +1438,98 @@ def get_file_details(repo_id: str, job_id: str, run_id:str, file_name:str):
     try:
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
-        files = conn.execute(
-            """
-            SELECT  tei.test_name , tei.duration , tei.failed , tei.forced 
-            FROM file_fp_infos fpi
-            JOIN test_execution_file_fp_infos tefi
-            ON tefi.fingerprint_id = fpi.fingerprint_id
-            AND tefi.run_uid        = fpi.run_uid
-            JOIN test_infos tei
-            ON tei.test_execution_id      = tefi.test_execution_id
-            AND tei.run_uid = fpi.run_uid
-            WHERE fpi.run_uid  = (SELECT id FROM run_uid WHERE repo_run_id = ?)
-            AND fpi.filename = ?
-            ORDER BY tei.test_name
-            """,
-            (run_id, file_name)
+
+        file = conn.execute(
+            "SELECT * FROM files WHERE path = ?", (file_name,)
+        ).fetchone()
+
+        if not file:
+            conn.close()
+            log.warning("file_not_found file_name=%s", file_name)
+            return jsonify({"error": "File not found"}), 404
+
+        dependency_rows = conn.execute(
+            "SELECT test_id, file_bitmap FROM test_deps"
         ).fetchall()
 
-        conn.close()
-        log.info("files_list_success count=%s", len(files))
+        affected_tests = []
+        for row in dependency_rows:
+            file_ids = _decode_bitmap(row["file_bitmap"])
+            if file["id"] in file_ids:
+                test_id = row["test_id"]
+                test_info = conn.execute(
+                    "SELECT name, duration, failed FROM tests WHERE id = ?",
+                    (test_id,)
+                ).fetchone()
+                if test_info:
+                    log.info("file_test_dependency file_name=%s test_name=%s", file_name, test_info["name"])
+                    affected_tests.append({
+                        "testId": test_id,
+                        "testName": test_info["name"],
+                        "duration": test_info["duration"],
+                        "failed": test_info["failed"],
+                    })
 
-        return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
+        conn.close()
+
+        print(f"Affected Tests: {affected_tests}")
+
+        return jsonify({"affectedTests": affected_tests})
 
     except Exception:
-        log_exception("files_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read files"}), 500
+        log_exception("file_tests_dependency_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to retrieve affected tests"}), 500
 
 
-@app.route("/api/data/<path:repo_id>/<job_id>/<int:run_id>/fileDependencies", methods=["GET"])
-def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
-    """Get file dependency graph for visualization.
-
-    This endpoint now uses the dependency_graph table which contains
-    actual import relationships discovered during test execution,
-    rather than the old "co-files" heuristic approach.
-    """
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/fileDependencies", methods=["GET"])
+def get_file_dependencies(repo_id: str, job_id: str, run_id: str):
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
         return resp, code
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
 
-    # Get the run_uid for this run_id
-    # First try repo_run_id (external CI run ID), then try direct id match
-    # (for local runs without external IDs)
-    run_uid_row = cur.execute(
-        "SELECT id FROM run_uid WHERE repo_run_id = ?", (run_id,)
-    ).fetchone()
+    try:
+        conn = get_db_connection(db_path, readonly=True)
+        conn.row_factory = sqlite3.Row
 
-    # If not found by repo_run_id, try direct id match
-    if not run_uid_row:
-        run_uid_row = cur.execute(
-            "SELECT id FROM run_uid WHERE id = ?", (run_id,)
-        ).fetchone()
+        id_to_path = dict(conn.execute("SELECT id, path FROM files").fetchall())
 
-    # If still not found, fall back to latest
-    if not run_uid_row:
-        run_uid_row = cur.execute("SELECT MAX(id) as id FROM run_uid").fetchone()
+        dep_rows = conn.execute(
+            "SELECT file_bitmap, external_packages FROM test_deps"
+        ).fetchall()
 
-    if not run_uid_row or not run_uid_row["id"]:
+        file_deps: dict[str, set[str]] = {}
+        file_ext_deps: dict[str, set[str]] = {}
+
+        for row in dep_rows:
+            file_ids = _decode_bitmap(row["file_bitmap"])
+            paths = [id_to_path.get(i) for i in file_ids]
+            paths = [p for p in paths if p]
+
+            for path in paths:
+                file_deps.setdefault(path, set()).update(p for p in paths if p != path)
+
+            if row["external_packages"]:
+                pkgs = [p.strip() for p in row["external_packages"].split(",") if p.strip()]
+                for path in paths:
+                    file_ext_deps.setdefault(path, set()).update(pkgs)
+
         conn.close()
-        return jsonify({"run_id": run_id, "files": []})
 
-    run_uid = run_uid_row["id"]
+        return jsonify({
+            "run_id": run_id,
+            "files": [
+                {
+                    "filename": filename,
+                    "dependencies": sorted(deps),
+                    "external_dependencies": sorted(file_ext_deps.get(filename, set())),
+                }
+                for filename, deps in sorted(file_deps.items())
+            ]
+        })
 
-    # Check if dependency_graph table exists
-    table_exists = cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='dependency_graph'"
-    ).fetchone()
-
-    if not table_exists:
-        # Fall back to old co-files approach if new table doesn't exist
-        conn.close()
-        return _get_file_dependencies_legacy(repo_id, job_id, run_id)
-
-    # Query the dependency_graph table for actual import relationships
-    deps_map = {}
-    external_deps_map = {}
-
-    cur.execute(
-        """SELECT source_file, target_file, target_package, edge_type
-           FROM dependency_graph
-           WHERE run_uid = ?
-           ORDER BY source_file, target_file, target_package""",
-        (run_uid,),
-    )
-
-    rows = cur.fetchall()
-
-    # If dependency_graph table exists but has no data for this run,
-    # fall back to legacy approach (for runs before graph collection was added)
-    if not rows:
-        conn.close()
-        return _get_file_dependencies_legacy(repo_id, job_id, run_id)
-
-    for row in rows:
-        source = row["source_file"]
-        edge_type = row["edge_type"]
-
-        if source not in deps_map:
-            deps_map[source] = set()
-        if source not in external_deps_map:
-            external_deps_map[source] = set()
-
-        if edge_type == "local" and row["target_file"]:
-            deps_map[source].add(row["target_file"])
-            # Also ensure target file appears in deps_map
-            if row["target_file"] not in deps_map:
-                deps_map[row["target_file"]] = set()
-        elif edge_type == "external" and row["target_package"]:
-            external_deps_map[source].add(row["target_package"])
-
-    conn.close()
-
-    # Build final JSON in the shape the React graph expects
-    files_list = [
-        {
-            "filename": filename,
-            "dependencies": sorted(list(deps)),
-            "external_dependencies": sorted(list(external_deps_map.get(filename, set()))),
-        }
-        for filename, deps in sorted(deps_map.items())
-    ]
-
-    return jsonify({
-        "run_id": run_id,
-        "run_uid": run_uid,
-        "files": files_list
-    })
+    except Exception:
+        log_exception("file_dependencies_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to read file dependencies"}), 500
 
 
 def _get_file_dependencies_legacy(repo_id: str, job_id: str, run_id: int):

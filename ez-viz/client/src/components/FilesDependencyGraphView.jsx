@@ -1,17 +1,5 @@
-import React, {
-  useMemo,
-  useCallback,
-  useEffect,
-  useState,
-  useRef
-} from "react";
-import ReactFlow, {
-  Background,
-  Controls,
-  MiniMap,
-  useNodesState,
-  useEdgesState
-} from "reactflow";
+import React, {useMemo, useCallback, useEffect, useState, useRef} from "react";
+import ReactFlow, {Background, Controls, MiniMap, useNodesState, useEdgesState} from "reactflow";
 import "reactflow/dist/style.css";
 
 const DEP_FIELD = "dependencies";
@@ -185,20 +173,20 @@ function buildGraphFromRuns(runs) {
 
   // Create nodes
   const nodes = Array.from(allNodes)
-    .filter(name => connectedNodes.has(name))
-    .map((name) => {
-      const isExternal = isExternalPackage(name);
-      return {
-        id: name,
-        type: 'default',
-        data: {
-          label: isExternal ? name : (name.split('/').pop() || name),
-          fullPath: name,
-          isExternal
-        },
-        position: { x: 0, y: 0 }
-      };
-    });
+      .filter(name => connectedNodes.has(name))
+      .map((name) => {
+        const isExternal = isExternalPackage(name);
+        return {
+          id: name,
+          type: 'default',
+          data: {
+            label: isExternal ? name : (name.split('/').pop() || name),
+            fullPath: name,
+            isExternal
+          },
+          position: { x: 0, y: 0 }
+        };
+      });
 
   // Create edges
   const edges = rawEdges.map(e => ({
@@ -219,13 +207,7 @@ function buildGraphFromRuns(runs) {
   return { nodes: layoutedNodes, edges, runIdByFile };
 }
 
-export default function FilesDependencyGraphView({
-  repoId,
-  jobId,
-  runId,
-  onOpenFile,
-  height = 650
-}) {
+export default function FilesDependencyGraphView({repoId, jobId, runId, onOpenFile, height = 650}) {
   const [runs, setRuns] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -246,32 +228,32 @@ export default function FilesDependencyGraphView({
     const url = `/api/data/${repoId}/${jobId}/${runId}/fileDependencies`;
 
     fetch(url, { credentials: "include" })
-      .then(async (res) => {
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(
-            `HTTP ${res.status} ${res.statusText} - ${text.slice(0, 180)}`
-          );
-        }
-        return res.json();
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setRuns([
-          {
-            run_id: data.run_id,
-            files: data.files || []
+        .then(async (res) => {
+          if (!res.ok) {
+            const text = await res.text();
+            throw new Error(
+                `HTTP ${res.status} ${res.statusText} - ${text.slice(0, 180)}`
+            );
           }
-        ]);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        console.error("Failed to load file dependencies", err);
-        setError(err.message || "Failed to load file dependencies");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+          return res.json();
+        })
+        .then((data) => {
+          if (cancelled) return;
+          setRuns([
+            {
+              run_id: data.run_id,
+              files: data.files || []
+            }
+          ]);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          console.error("Failed to load file dependencies", err);
+          setError(err.message || "Failed to load file dependencies");
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
 
     return () => {
       cancelled = true;
@@ -390,8 +372,8 @@ export default function FilesDependencyGraphView({
 
     const term = searchTerm.toLowerCase();
     const matchedNodes = nodes.filter(n =>
-      n.id.toLowerCase().includes(term) ||
-      n.data.label.toLowerCase().includes(term)
+        n.id.toLowerCase().includes(term) ||
+        n.data.label.toLowerCase().includes(term)
     );
     const matchedIds = new Set(matchedNodes.map(n => n.id));
 
@@ -411,24 +393,24 @@ export default function FilesDependencyGraphView({
     const uniqueIds = new Set(uniqueNodes.map(n => n.id));
 
     const filteredEdges = edges.filter(e =>
-      uniqueIds.has(e.source) && uniqueIds.has(e.target)
+        uniqueIds.has(e.source) && uniqueIds.has(e.target)
     );
 
     return { nodes: uniqueNodes, edges: filteredEdges };
   }, [nodes, edges, searchTerm]);
 
   const onNodeClick = useCallback(
-    (_evt, node) => {
-      if (node.data.isExternal) return; // Don't navigate for external packages
+      (_evt, node) => {
+        if (node.data.isExternal) return; // Don't navigate for external packages
 
-      const filename = node.id;
-      const runIdForFile = runIdByFileRef.current.get(filename) ?? runs?.[0]?.run_id;
+        const filename = node.id;
+        const runIdForFile = runIdByFileRef.current.get(filename) ?? runs?.[0]?.run_id;
 
-      if (runIdForFile != null) {
-        onOpenFile?.(filename, runIdForFile);
-      }
-    },
-    [onOpenFile, runs]
+        if (runIdForFile != null) {
+          onOpenFile?.(filename, runIdForFile);
+        }
+      },
+      [onOpenFile, runs]
   );
 
   const hasData = nodes && nodes.length > 0;
@@ -445,114 +427,114 @@ export default function FilesDependencyGraphView({
   }, [nodes, edges, hasData]);
 
   return (
-    <div
-      style={{
-        height,
-        width: "100%",
-        display: "flex",
-        flexDirection: "column",
-        background: COLORS.background,
-        borderRadius: '8px',
-        overflow: 'hidden'
-      }}
-    >
-      {/* Controls header - dark theme */}
-      <div style={{
-        padding: "10px 16px",
-        background: '#333333',
-        borderBottom: '1px solid #444',
-        display: 'flex',
-        gap: '16px',
-        alignItems: 'center',
-        flexWrap: 'wrap'
-      }}>
-        {loading && <span style={{ fontSize: 13, color: COLORS.text }}>Loading file dependencies...</span>}
-        {!loading && error && (
-          <span style={{ color: "#ff6b6b", fontSize: 13 }}>Error: {error}</span>
-        )}
-        {!loading && !error && hasData && (
-          <>
-            <input
-              type="text"
-              placeholder="Search files..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              style={{
-                padding: '6px 10px',
-                fontSize: 12,
-                border: '1px solid #555',
-                borderRadius: '4px',
-                minWidth: '180px',
-                background: '#444',
-                color: COLORS.text,
-              }}
-            />
+      <div
+          style={{
+            height,
+            width: "100%",
+            display: "flex",
+            flexDirection: "column",
+            background: COLORS.background,
+            borderRadius: '8px',
+            overflow: 'hidden'
+          }}
+      >
+        {/* Controls header - dark theme */}
+        <div style={{
+          padding: "10px 16px",
+          background: '#333333',
+          borderBottom: '1px solid #444',
+          display: 'flex',
+          gap: '16px',
+          alignItems: 'center',
+          flexWrap: 'wrap'
+        }}>
+          {loading && <span style={{ fontSize: 13, color: COLORS.text }}>Loading file dependencies...</span>}
+          {!loading && error && (
+              <span style={{ color: "#ff6b6b", fontSize: 13 }}>Error: {error}</span>
+          )}
+          {!loading && !error && hasData && (
+              <>
+                <input
+                    type="text"
+                    placeholder="Search files..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    style={{
+                      padding: '6px 10px',
+                      fontSize: 12,
+                      border: '1px solid #555',
+                      borderRadius: '4px',
+                      minWidth: '180px',
+                      background: '#444',
+                      color: COLORS.text,
+                    }}
+                />
 
-            <button
-              onClick={() => setPhysicsEnabled(!physicsEnabled)}
-              style={{
-                padding: '6px 12px',
-                fontSize: 12,
-                border: 'none',
-                borderRadius: '4px',
-                background: physicsEnabled ? '#4CAF50' : '#555',
-                color: COLORS.text,
-                cursor: 'pointer',
-                transition: 'background 0.2s'
-              }}
-            >
-              Physics: {physicsEnabled ? 'ON' : 'OFF'}
-            </button>
+                <button
+                    onClick={() => setPhysicsEnabled(!physicsEnabled)}
+                    style={{
+                      padding: '6px 12px',
+                      fontSize: 12,
+                      border: 'none',
+                      borderRadius: '4px',
+                      background: physicsEnabled ? '#4CAF50' : '#555',
+                      color: COLORS.text,
+                      cursor: 'pointer',
+                      transition: 'background 0.2s'
+                    }}
+                >
+                  Physics: {physicsEnabled ? 'ON' : 'OFF'}
+                </button>
 
-            {stats && (
-              <div style={{
-                fontSize: 11,
-                color: '#aaa',
-                marginLeft: 'auto',
-                display: 'flex',
-                gap: '12px'
-              }}>
-                <span style={{ color: COLORS.internal }}>● {stats.internal} internal</span>
-                <span style={{ color: COLORS.external }}>■ {stats.external} external</span>
-                <span style={{ color: '#888' }}>─ {stats.edges} edges</span>
-              </div>
-            )}
-          </>
-        )}
-        {!loading && !error && !hasData && (
-          <span style={{ fontSize: 13, color: COLORS.text }}>No dependencies found for this run.</span>
-        )}
+                {stats && (
+                    <div style={{
+                      fontSize: 11,
+                      color: '#aaa',
+                      marginLeft: 'auto',
+                      display: 'flex',
+                      gap: '12px'
+                    }}>
+                      <span style={{ color: COLORS.internal }}>● {stats.internal} internal</span>
+                      <span style={{ color: COLORS.external }}>■ {stats.external} external</span>
+                      <span style={{ color: '#888' }}>─ {stats.edges} edges</span>
+                    </div>
+                )}
+              </>
+          )}
+          {!loading && !error && !hasData && (
+              <span style={{ fontSize: 13, color: COLORS.text }}>No dependencies found for this run.</span>
+          )}
+        </div>
+
+        {/* Graph area */}
+        <div style={{ flex: 1, position: 'relative' }}>
+          {hasData && (
+              <ReactFlow
+                  nodes={filteredData.nodes}
+                  edges={filteredData.edges}
+                  onNodesChange={onNodesChange}
+                  onEdgesChange={onEdgesChange}
+                  onNodeClick={onNodeClick}
+                  fitView
+                  minZoom={0.1}
+                  maxZoom={2}
+                  nodesDraggable={true}
+                  style={{ background: COLORS.background }}
+              >
+                <MiniMap
+                    nodeColor={(node) => node.data.isExternal ? COLORS.external : COLORS.internal}
+                    maskColor="rgba(0,0,0,0.8)"
+                    style={{ background: '#333' }}
+                />
+                <Controls
+                    style={{
+                      button: { background: '#444', color: COLORS.text, border: '1px solid #555' }
+                    }}
+                />
+                <Background color="#444" gap={20} />
+              </ReactFlow>
+          )}
+        </div>
       </div>
-
-      {/* Graph area */}
-      <div style={{ flex: 1, position: 'relative' }}>
-        {hasData && (
-          <ReactFlow
-            nodes={filteredData.nodes}
-            edges={filteredData.edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onNodeClick={onNodeClick}
-            fitView
-            minZoom={0.1}
-            maxZoom={2}
-            nodesDraggable={true}
-            style={{ background: COLORS.background }}
-          >
-            <MiniMap
-              nodeColor={(node) => node.data.isExternal ? COLORS.external : COLORS.internal}
-              maskColor="rgba(0,0,0,0.8)"
-              style={{ background: '#333' }}
-            />
-            <Controls
-              style={{
-                button: { background: '#444', color: COLORS.text, border: '1px solid #555' }
-              }}
-            />
-            <Background color="#444" gap={20} />
-          </ReactFlow>
-        )}
-      </div>
-    </div>
   );
 }

@@ -7,6 +7,5 @@ export const formatDuration = (ms) => {
 
 export const getStatusText = (test) => {
     if (test.failed) return '✗ FAILED';
-    if (test.forced) return '⚠ FORCED';
     return '✓ PASSED';
 }

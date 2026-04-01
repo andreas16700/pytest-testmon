@@ -2,13 +2,12 @@ import React from "react";
 import { formatDuration, getStatusText } from "./utils.jsx";
 import { Clock, ShieldCheck, Activity } from "lucide-react";
 
-function FileDetails({ filename, files }) {
+function FileDetails({ filename, affectedTests }) {
     // Helper to map status text to our CSS classes
-    const getStatusClass = (file) => {
-        const text = getStatusText(file).toLowerCase();
+    const getStatusClass = (test) => {
+        const text = getStatusText(test).toLowerCase();
         if (text.includes('pass')) return 'status-passed';
-        if (text.includes('fail')) return 'status-failed';
-        return 'status-skipped';
+        return 'status-failed';
     };
 
     return (
@@ -27,23 +26,23 @@ function FileDetails({ filename, files }) {
                 </div>
             </div>
 
-            {files.length > 0 ? (
+            {affectedTests.length > 0 ? (
                 <div className="space-y-3">
-                    {files.map((file, idx) => (
+                    {affectedTests.map((test, idx) => (
                         <div key={idx} className="details-test-card border-l-4 border-l-indigo-500">
                             <div className="flex items-start justify-between gap-4">
                                 <div className="font-mono text-sm font-semibold text-gray-800 break-all">
-                                    {file.test_name}
+                                    {test.testName}
                                 </div>
-                                <span className={`status-badge shrink-0 ${getStatusClass(file)}`}>
-                                    {getStatusText(file)}
+                                <span className={`status-badge shrink-0 ${getStatusClass(test)}`}>
+                                    {getStatusText(test)}
                                 </span>
                             </div>
                             
                             <div className="flex items-center gap-4 mt-3 text-xs text-gray-500">
                                 <div className="flex items-center gap-1">
                                     <Clock size={12} className="text-gray-400" />
-                                    {formatDuration(file.duration)}
+                                    {formatDuration(test.duration)}
                                 </div>
                                 <div className="flex items-center gap-1">
                                     <ShieldCheck size={12} className="text-gray-400" />
