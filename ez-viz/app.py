@@ -1348,25 +1348,38 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             log.warning("test_not_found test_id=%s", test_id)
             return jsonify({"error": "Test not found"}), 404
 
+        log.info("debug_test test_id=%s name=%s", test_id, test["name"])
+
         dependency_row = conn.execute(
-            "SELECT file_bitmap, external_packages FROM test_deps WHERE test_id = ?",(test_id,)
+            "SELECT file_bitmap, external_packages FROM test_deps WHERE test_id = ?", (test_id,)
         ).fetchone()
+
+        log.info("debug_dep_row found=%s", dependency_row is not None)
 
         dependencies = []
         external_packages = []
 
         if dependency_row:
-            # Decode the bitmap to get file IDs
-            file_ids = _decode_bitmap(dependency_row["file_bitmap"])
+            raw_bitmap = dependency_row["file_bitmap"]
+            log.info("debug_bitmap type=%s len=%s hex=%s",
+                     type(raw_bitmap).__name__,
+                     len(raw_bitmap) if raw_bitmap else 0,
+                     raw_bitmap.hex()[:60] if isinstance(raw_bitmap, (bytes, bytearray)) else str(raw_bitmap)[:60])
+
+            file_ids = _decode_bitmap(raw_bitmap)
+            log.info("debug_file_ids ids=%s", sorted(file_ids))
 
             if file_ids:
-                # Fetch file metadata for all dependency IDs in one query
-                placeholders = ",".join("?" * len(file_ids))
-                ids = [i for i in file_ids]
+                adjusted_ids = [i + 1 for i in file_ids]
+                log.info("debug_adjusted_ids ids=%s", adjusted_ids)
+                placeholders = ",".join("?" * len(adjusted_ids))
                 file_rows = conn.execute(
                     f"SELECT id, path, checksum, fsha, file_type FROM files WHERE id IN ({placeholders})",
-                    ids
+                    adjusted_ids
                 ).fetchall()
+
+                log.info("debug_file_rows count=%s paths=%s",
+                         len(file_rows), [r["path"] for r in file_rows])
 
                 for f in file_rows:
                     dependencies.append({
@@ -1376,7 +1389,6 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
                         "file_type": f["file_type"],
                     })
 
-            # Parse external packages string e.g. "pytest,numpy==2.2.1"
             if dependency_row["external_packages"]:
                 external_packages = [
                     p.strip()
@@ -1397,9 +1409,14 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             "external_packages": external_packages
         })
 
-    except Exception:
-        log_exception("test_details_query", repo_id=repo_id, job_id=job_id, test_id=test_id)
-        return jsonify({"error": "Failed to read test details"}), 500
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error("test_details_error error=%s traceback=%s", str(e), tb)
+        return jsonify({
+            "error": str(e),
+            "traceback": tb
+        }), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/files", methods=["GET"])
 def get_files(repo_id: str, job_id: str ,run_id:str):
