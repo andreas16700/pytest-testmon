@@ -1387,7 +1387,12 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
         conn.close()
 
         return jsonify({
-            "test": dict(test),
+            "test": {
+                "id": test["id"],
+                "name": test["name"],
+                "duration": test["duration"],
+                "failed": test["failed"],
+            },
             "dependencies": dependencies,
             "external_packages": external_packages
         })
