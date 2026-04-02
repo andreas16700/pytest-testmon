@@ -13,12 +13,10 @@ function TestsTab({ allTests, search, setSearch, showTestDetails }) {
     forced: true,
   });
 
-  // The function should be refactored to adapt the new database structure
   const getStatusKey = (test) => {
     if (test.failed) return "failed";
-    if (test.forced !== 0 && test.forced !== 1) return "skipped";
+    if (test.forced) return "forced";
     if (test.forced === 0) return "executed";
-    if (test.forced === 1) return "forced";
     return "skipped";
   };
 

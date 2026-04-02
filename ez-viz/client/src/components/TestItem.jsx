@@ -2,7 +2,6 @@ import React from "react";
 import { formatDuration } from "./utils.jsx";
 
 function TestItem({ runId, test, onClick }) {
-  // Refactor this function to adapt the new database structure
   const getStatusClass = () => {
     if (test.failed) return "status-failed";
     if (test.forced) return "status-forced";
@@ -21,7 +20,7 @@ function TestItem({ runId, test, onClick }) {
         </div>
         <div className="test-name">{test.name}</div>
         <span className={`status-badge ${getStatusClass()}`}>
-          {test.failed ? <p>Failed</p> : <p>Executed</p>} {/* Other status conditions must be added! */}
+          {test.failed ? <p>Failed</p> : test.forced ? <p>Forced</p> : test.forced === 0 ?  <p>Executed</p> : <p>Skipped</p>}
         </span>
       </div>
       <div className="test-item-footer">
