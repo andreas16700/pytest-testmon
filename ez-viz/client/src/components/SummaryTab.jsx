@@ -22,13 +22,15 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
     const getRunData = (runId) => {
         const runTests = allTests.find(run => run.run_id == runId) || { tests: [] };
         const runSummary = summary.find(s => s.run_id == runId) || {};
-
+        console.log("Run summary is" , runSummary)
+        console.log("Run tests " , runTests)
         const currentTests = runTests.tests || [];
         const failed = currentTests.filter(t => t.failed).length;
         const ran = currentTests.filter(t => t.forced === 0 || t.forced===1) .length; 
-        const totalTests = runSummary.test_count || 0;
-        const skipped = totalTests - ran;
-        const passed= totalTests - skipped - failed
+        const totalTests = runSummary?.test_count ?? 0;
+        const skipped = runSummary?.savings?.tests_saved ?? 0;
+        const passed = totalTests - skipped - failed;
+
         const [runtimeSpent, runtimeSaved] = currentTests.reduce(
             (acc, test) => {
                 if (test.forced !== null ) {
@@ -74,12 +76,12 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
 
     // --- Charts for Single View ---
     const testsChartData = {
-        labels: ["Tests Executed", "Tests Skipped"],
+        labels: ["Tests Executed", "Tests Skipped", "Tests Failed"],
         datasets: [
             {
-                data: [primaryRun.stats.ran, primaryRun.stats.skipped],
-                backgroundColor: ["#10B981", "#eab308"],
-                borderColor: ["#059669", "#ca8a04"],
+                data: [primaryRun.stats.passed, primaryRun.stats.skipped, primaryRun.stats.failed],
+                backgroundColor: ["#10B981", "#eab308", "#ef4444"],
+                borderColor: ["#059669", "#ca8a04", "#dc2626"],
                 borderWidth: 2,
             },
         ],
@@ -353,7 +355,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                 <h3 className="chart-title">
                                     Test Distribution
                                 </h3>
-                                <div className="chart-wrapper" style={{ maxWidth: "300px", margin: "0 auto" }}>
+                                <div className="chart-wrapper" style={{ maxWidth: "420px", margin: "0 auto" }}>
                                     <Doughnut data={testsChartData} options={chartOptions} />
                                 </div>
                             </div>
