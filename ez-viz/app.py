@@ -1362,7 +1362,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             if file_ids:
                 # Fetch file metadata for all dependency IDs in one query
                 placeholders = ",".join("?" * len(file_ids))
-                ids = [i + 1 for i in file_ids]
+                ids = [i for i in file_ids]
                 file_rows = conn.execute(
                     f"SELECT id, path, checksum, fsha, file_type FROM files WHERE id IN ({placeholders})",
                     ids
