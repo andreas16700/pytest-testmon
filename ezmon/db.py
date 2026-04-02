@@ -116,16 +116,20 @@ class DB:  # pylint: disable=too-many-public-methods
             """DELETE FROM tests WHERE id NOT IN (SELECT test_id FROM test_deps)"""
         )
 
-    def fetch_current_run_stats(self):
+    def fetch_current_run_stats(self, run_id=None):
         """Fetch run statistics from the tests table."""
         with self.con as con:
             cursor = con.cursor()
-            run_saved_tests, run_saved_time = cursor.execute(
-                "SELECT count(*), sum(duration) FROM tests"
-            ).fetchone()
             run_all_tests, run_all_time = cursor.execute(
                 "SELECT count(*), sum(duration) FROM tests"
             ).fetchone()
+            if run_id is not None:
+                run_saved_tests, run_saved_time = cursor.execute(
+                    "SELECT count(*), sum(duration) FROM tests WHERE run_id = ?",
+                    (run_id,)
+                ).fetchone()
+            else:
+                run_saved_tests, run_saved_time = run_all_tests, run_all_time
 
         return (
             run_saved_time,
@@ -280,7 +284,8 @@ class DB:  # pylint: disable=too-many-public-methods
                 name TEXT NOT NULL UNIQUE,
                 test_file TEXT,
                 duration REAL,
-                failed INTEGER DEFAULT 0
+                failed INTEGER DEFAULT 0,
+                forced INTEGER DEFAULT NULL
             );
             CREATE INDEX IF NOT EXISTS tests_name ON tests (name);
         """
@@ -336,9 +341,9 @@ class DB:  # pylint: disable=too-many-public-methods
     def all_test_executions(self):
         """Get all tests with their metadata."""
         return {
-            row["name"]: {"duration": row["duration"], "failed": bool(row["failed"]), "forced": None}
+            row["name"]: {"duration": row["duration"], "failed": bool(row["failed"]), "forced": row["forced"]}
             for row in self.con.execute(
-                "SELECT name, duration, failed FROM tests"
+                "SELECT name, duration, failed, forced FROM tests"
             )
         }
 
@@ -455,6 +460,7 @@ class DB:  # pylint: disable=too-many-public-methods
         failed: bool = False,
         test_file: Optional[str] = None,
         run_id: int = None,
+        forced: Optional[int] = None,
     ) -> int:
         """Get or create a test ID for a given test name.
 
@@ -474,8 +480,8 @@ class DB:  # pylint: disable=too-many-public-methods
         if row:
             test_id = row[0]
             updates = ["duration = COALESCE(?, duration)", "failed = ?",
-                        "test_file = COALESCE(?, test_file)"]
-            params = [duration, 1 if failed else 0, test_file]
+                        "test_file = COALESCE(?, test_file)", "forced = ?"]
+            params = [duration, 1 if failed else 0, test_file, forced]
             if run_id is not None:
                 updates.append("run_id = ?")
                 params.append(run_id)
@@ -486,9 +492,9 @@ class DB:  # pylint: disable=too-many-public-methods
             return test_id
 
         cursor.execute(
-            """INSERT INTO tests (name, test_file, duration, failed, run_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (test_name, test_file, duration, 1 if failed else 0, run_id)
+            """INSERT INTO tests (name, test_file, duration, failed, forced, run_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (test_name, test_file, duration, 1 if failed else 0, forced, run_id)
         )
         return cursor.lastrowid
 
@@ -514,9 +520,9 @@ class DB:  # pylint: disable=too-many-public-methods
 
         # 1. Bulk INSERT OR IGNORE — creates rows for new tests
         cursor.executemany(
-            """INSERT OR IGNORE INTO tests (name, test_file, duration, failed, run_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            [(name, tf, dur, 1 if fail else 0, run_id) for name, tf, dur, fail in tests],
+            """INSERT OR IGNORE INTO tests (name, test_file, duration, failed, forced, run_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [(name, tf, dur, 1 if fail else 0, forced, run_id) for name, tf, dur, fail, forced in tests],
         )
 
         # 2. Bulk SELECT to get all IDs
@@ -532,13 +538,13 @@ class DB:  # pylint: disable=too-many-public-methods
             for row in rows:
                 result[row[1]] = row[0]
 
-        # 3. Bulk UPDATE duration/failed/run_id for all tests
+        # 3. Bulk UPDATE duration/failed/forced/run_id for all tests
         cursor.executemany(
             """UPDATE tests SET duration = COALESCE(?, duration),
-               failed = ?, test_file = COALESCE(?, test_file),
+               failed = ?, forced = ?, test_file = COALESCE(?, test_file),
                run_id = COALESCE(?, run_id)
                WHERE name = ?""",
-            [(dur, 1 if fail else 0, tf, run_id, name) for name, tf, dur, fail in tests],
+            [(dur, 1 if fail else 0, forced, tf, run_id, name) for name, tf, dur, fail, forced in tests],
         )
 
         return result

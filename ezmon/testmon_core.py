@@ -411,9 +411,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
             outcome = outcomes.get(context, {"failed": False, "duration": 0.0})
             deps_n_outcomes.update(outcome)
-            deps_n_outcomes["forced"] = context in self.stable_test_names and (
-                context not in self.failing_tests
-            )
             test_executions_fingerprints[context] = deps_n_outcomes
         return test_executions_fingerprints
 
@@ -787,6 +784,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     test_name, test_file,
                     deps_n_outcomes.get("duration"),
                     deps_n_outcomes.get("failed", False),
+                    deps_n_outcomes.get("forced", None),
                 ))
 
             if ds:
