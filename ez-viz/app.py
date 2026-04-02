@@ -1660,8 +1660,8 @@ def upload_test_preferences():
     always_run_tests = data.get("alwaysRunTests", [])  # Array of test file names
     prioritized_tests = data.get("prioritizedTests", [])  # Array of test file names
     
-    log.info("Always run tests", always_run_tests)
-    log.info("Prioritized tests", prioritized_tests)
+    log.info("Always run tests %s", always_run_tests)
+    log.info("Prioritized tests %s", prioritized_tests)
     # Enrich per-request context for logging
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 

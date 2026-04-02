@@ -86,10 +86,11 @@ function TestManagementTab({repos, currentRepo, currentJob}) {
 
     const handleSave = async () => {
         try {
-            const orderedAlwaysRunTests = prioritizedTests.filter(test =>
-                alwaysRunTests.includes(test)
-            );
-
+            const orderedAlwaysRunTests = [
+                ...prioritizedTests.filter(test => alwaysRunTests.includes(test)),
+                ...alwaysRunTests.filter(test => !prioritizedTests.includes(test)),
+            ];
+            console.log("always run tests" ,orderedAlwaysRunTests)
             const response = await fetch("/api/client/testPreferences", {
                 method: "POST",
                 headers: {
