@@ -825,6 +825,9 @@ class TestmonCollect:
         outcome["duration"] += getattr(report, "duration", 0.0) or 0.0
         if report.outcome == "failed":
             outcome["failed"] = True
+        if "forced" not in outcome:
+            forced_nodeids = getattr(self, "_forced_nodeids", set())
+            outcome["forced"] = 1 if report.nodeid in forced_nodeids else 0
 
         if self._running_as == "worker":
             if report.when == "call" and self._worker_batches:
@@ -1222,7 +1225,7 @@ class TestmonCollect:
                         )
             _timing_log(session.config, "controller_save_deps_start")
             duration = time.time() - self._sessionstarttime
-            run_stats = self.testmon_data.db.fetch_current_run_stats()
+            run_stats = self.testmon_data.db.fetch_current_run_stats(self.testmon_data.run_id)
             run_saved_time, run_all_time, run_saved_tests, run_all_tests = run_stats
             self.testmon_data.db.finish_run(
                 self.testmon_data.run_id,
@@ -1727,6 +1730,7 @@ class TestmonSelect:
             sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
 
         selected = forced + prioritized + normal_selected
+        self._forced_nodeids = {item.nodeid for item in forced}
 
 
 
