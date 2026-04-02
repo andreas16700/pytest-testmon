@@ -25,7 +25,7 @@ function TestItem({ runId, test, onClick }) {
         </span>
       </div>
       <div className="test-item-footer">
-        <span>{formatDuration(test.duration)}</span>
+        <span>{formatDuration(test.duration * 1000)}</span>
         {/* Dependency count will be added here! */}
       </div>
     </div>

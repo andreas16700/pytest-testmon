@@ -15,15 +15,14 @@ import { CheckCircle2, ArrowRightLeft, LayoutDashboard, GitCompare } from "lucid
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement);
 
-function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, selectedRunId, setSelectedRunId }) {
+function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelectedRunId }) {
     const [activeTab, setActiveTab] = useState('single');
     const [compareRunA, setCompareRunA] = useState(selectedRunId);
     const [compareRunB, setCompareRunB] = useState(currentRuns.find(r => r !== selectedRunId) || currentRuns[0]);
+
     const getRunData = (runId) => {
         const runTests = allTests.find(run => run.run_id == runId) || { tests: [] };
         const runSummary = summary.find(s => s.run_id == runId) || {};
-        console.log("Run summary is" , runSummary)
-        console.log("Run tests " , runTests)
         const currentTests = runTests.tests || [];
         const failed = currentTests.filter(t => t.failed).length;
         const ran = currentTests.filter(t => t.forced === 0 || t.forced===1) .length; 
@@ -31,17 +30,10 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         const skipped = runSummary?.savings?.tests_saved ?? 0;
         const passed = totalTests - skipped - failed;
 
-        const [runtimeSpent, runtimeSaved] = currentTests.reduce(
-            (acc, test) => {
-                if (test.forced !== null ) {
-                    acc[0] += test.duration;
-                } else {
-                    acc[1] += test.duration;
-                }
-                return acc;
-            },
-            [0, 0]
-        );
+        const runtimeAll = (runSummary?.savings?.time_all || 0) * 1000;
+        const runtimeSaved = (runSummary?.savings?.time_saved || 0) * 1000;
+
+        const runtimeSpent = Math.max(0, runtimeAll - runtimeSaved);
 
         return {
             id: runId,
@@ -58,7 +50,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
 
     // Data for single view
     const primaryRun = useMemo(() => getRunData(selectedRunId), [selectedRunId, allTests, summary]);
-        const { passed, failed, skipped, totalTests } = primaryRun.stats;
+    const { passed, failed, skipped, totalTests } = primaryRun.stats;
 
     const passRatio   = totalTests ? (passed  / totalTests) * 100 : 0;
     const skipRatio   = totalTests ? (skipped / totalTests) * 100 : 0;
@@ -144,6 +136,23 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         plugins: {
             legend: { position: 'bottom' },
         },
+    };
+
+    const runtimeChartOptions = {
+        ...chartOptions,
+        plugins: {
+            ...chartOptions.plugins,
+            tooltip: {
+                callbacks: {
+                    label: function(context) {
+                        if (context.parsed !== null) {
+                            return ' ' + Number(context.parsed).toFixed(2) + ' ms';
+                        }
+                        return '';
+                    }
+                }
+            }
+        }
     };
 
     return (
@@ -239,7 +248,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                         { label: 'Executed', key: 'ran' },
                                         { label: 'Skipped', key: 'skipped' },
                                         { label: 'Failed', key: 'failed', reverseColor: true },
-                                        { label: 'Runtime (s)', key: 'runtimeSpent', format: (v) => v.toFixed(2) },
+                                        { label: 'Runtime (ms)', key: 'runtimeSpent', format: (v) => v.toFixed(2) },
                                     ].map((row) => {
                                         const v1 = runAData.stats[row.key];
                                         const v2 = runBData.stats[row.key];
@@ -364,7 +373,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                     Runtime Distribution
                                 </h3>
                                 <div className="chart-wrapper" style={{ maxWidth: "300px", margin: "0 auto" }}>
-                                    <Doughnut data={runtimeChartData} options={chartOptions} />
+                                    <Doughnut data={runtimeChartData} options={runtimeChartOptions} />
                                 </div>
                             </div>
                         </div>

@@ -81,8 +81,6 @@ function MainContent({
                     <SummaryTab
                         summary={summary}
                         allTests={allTests}
-                        currentRepo={currentRepo}
-                        currentJob={currentJob}
                         currentRuns={currentRuns}
                         selectedRunId={selectedRunId}
                         setSelectedRunId={setSelectedRunId}

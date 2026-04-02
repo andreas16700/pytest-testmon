@@ -26,7 +26,7 @@ function TestDetails({ currentRepo, test, dependencies, externalPackages, branch
 
         <EnvItem
           label="Duration"
-          value={formatDuration(test?.duration ?? 0)}
+          value={formatDuration((test?.duration ?? 0) * 1000)}
         />
       </div>
 
@@ -41,14 +41,6 @@ function TestDetails({ currentRepo, test, dependencies, externalPackages, branch
             <div key={idx} className="dependency-card">
               <div className="dependency-filename">📄 {dep.filename}</div>
               <div className="external-packages">External Packages: {externalPackages.join(", ")}</div>
-              <div className="dependency-meta">
-                <span>
-                  <span className="font-medium">SHA:</span>{" "}{dep.fsha ? dep.fsha.substring(0, 8) : "N/A"}
-                </span>
-                <span>
-                  <span className="font-medium">Checksum:</span>{" "}{dep.checksum}
-                </span>
-              </div>
 
               {/* View on GitHub button */}
               {currentRepo && (

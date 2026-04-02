@@ -142,9 +142,6 @@ function App() {
                 setSummary((prev) => [...prev, summaryData]);
                 setAllTests((prev) => [...prev, testsData]);
                 setAllFiles((prev) => [...prev, filesData]);
-                console.log("Summary", summaryData);
-                console.log("Tests", testsData);
-                console.log("Files", filesData);
                 setActiveTab("summary");
             } catch (err) {
                 setError("Failed to load testmon data: " + err.message);
