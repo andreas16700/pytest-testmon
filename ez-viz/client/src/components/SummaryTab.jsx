@@ -24,16 +24,16 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
         const runTests = allTests.find(run => run.run_id == runId) || { tests: [] };
         const runSummary = summary.find(s => s.run_id == runId) || {};
         const currentTests = runTests.tests || [];
-        const failed = currentTests.filter(t => t.failed).length;
-        const ran = currentTests.filter(t => t.forced === 0 || t.forced===1) .length; 
+        const ran = currentTests.filter(t => t.forced === 0 || t.forced === 1).length;
         const totalTests = runSummary?.test_count ?? 0;
+        const failed = runSummary?.tests_failed ?? 0;
         const skipped = runSummary?.savings?.tests_saved ?? 0;
         const passed = totalTests - skipped - failed;
 
         const runtimeAll = (runSummary?.savings?.time_all || 0) * 1000;
-        const runtimeSaved = (runSummary?.savings?.time_saved || 0) * 1000;
+        const runtimeSpent = (runSummary?.savings?.time_saved || 0) * 1000;
 
-        const runtimeSpent = Math.max(0, runtimeAll - runtimeSaved);
+        const runtimeSaved = Math.max(0, runtimeAll - runtimeSpent);
 
         return {
             id: runId,

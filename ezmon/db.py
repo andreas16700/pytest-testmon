@@ -9,7 +9,7 @@ from ezmon.common import get_logger
 from ezmon.bitmap_deps import TestDeps, find_affected_tests
 
 
-DATA_VERSION = 19  # Radical schema simplification: 5 tables, no environment partitioning
+DATA_VERSION = 20  # Add tests_failed column to runs table
 
 
 class TestmonDbException(Exception):
@@ -181,13 +181,13 @@ class DB:  # pylint: disable=too-many-public-methods
         return cursor.lastrowid
 
     def finish_run(self, run_id, duration, tests_selected, tests_deselected,
-                   tests_all, time_saved, time_all):
+                   tests_failed, tests_all, time_saved, time_all):
         """Update a run with final stats. Called at session end."""
         self.con.execute(
             """UPDATE runs SET duration=?, tests_selected=?, tests_deselected=?,
-               tests_all=?, time_saved=?, time_all=? WHERE id=?""",
-            (duration, tests_selected, tests_deselected, tests_all,
-             time_saved, time_all, run_id),
+               tests_failed=?, tests_all=?, time_saved=?, time_all=? WHERE id=?""",
+            (duration, tests_selected, tests_deselected, tests_failed,
+             tests_all, time_saved, time_all, run_id),
         )
 
     def get_latest_run_commit_id(self) -> Optional[str]:
@@ -256,6 +256,7 @@ class DB:  # pylint: disable=too-many-public-methods
             duration REAL,
             tests_selected INTEGER DEFAULT 0,
             tests_deselected INTEGER DEFAULT 0,
+            tests_failed INTEGER DEFAULT 0,
             tests_all INTEGER DEFAULT 0,
             time_saved REAL DEFAULT 0,
             time_all REAL DEFAULT 0
