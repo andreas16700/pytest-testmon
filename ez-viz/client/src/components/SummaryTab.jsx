@@ -324,7 +324,7 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
                                     return (
                                         <div
                                             key={index}
-                                           s className={`run-card ${isSelected ? 'run-card-selected' : 'run-card-unselected'}`}
+                                            className={`run-card ${isSelected ? 'run-card-selected' : 'run-card-unselected'}`}
                                             onClick={() => setSelectedRunId(runId)}
                                         >
                                             <div className="run-card-header">

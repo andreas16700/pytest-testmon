@@ -22,7 +22,7 @@ const multiReorder = (list, selectedIds, insertAtIndex) => {
     return unselectedItems;
 };
 
-function TestManagementTab({repos, currentRepo, currentJob}) {
+function TestManagementTab({currentRepo, currentJob, currentRuns, pytestTests}) {
     const [searchTerm, setSearchTerm] = useState("");
     const [isOpen, setIsOpen] = useState(false);
     const [testFileList, setTestFileList] = useState([]);
@@ -146,28 +146,35 @@ function TestManagementTab({repos, currentRepo, currentJob}) {
         }
     };
 
-    /* Send latest run id as parameter */
     useEffect(() => {
-        if (!repos || repos.length === 0) return;
+        if (!pytestTests || pytestTests.length === 0) return;
 
-        const currentRepoLocal = repos.find((repo) => repo.id === currentRepo);
-        if (!currentRepoLocal) {
-            console.error("Repo not found:", currentRepo);
-            return;
+        const latestRunId = currentRuns[currentRuns.length - 1];
+        const runData = pytestTests.find((r) => r.run_id === latestRunId) ?? pytestTests[pytestTests.length - 1];
+
+        const fileMap = {};
+        for (const t of runData.tests) {
+            const sepIdx = t.nodeid.indexOf("::");
+            const fileName = sepIdx > -1 ? t.nodeid.slice(0, sepIdx) : t.nodeid;
+            const method = sepIdx > -1 ? t.nodeid.slice(sepIdx + 2) : null;
+            if (!fileMap[fileName]) {
+                fileMap[fileName] = { file_name: fileName, test_count: 0, total_duration: 0, failed_count: 0, methods: [] };
+            }
+            fileMap[fileName].test_count += 1;
+            fileMap[fileName].total_duration += t.duration || 0;
+            if (t.outcome === "failed" || t.outcome === "error") fileMap[fileName].failed_count += 1;
+            if (method) fileMap[fileName].methods.push(method);
         }
 
-        const currentJobLocal = currentRepoLocal.jobs.find((job) => job.name === currentJob);
-        if (!currentJobLocal) {
-            console.error("Job not found:", currentJob);
-            return;
-        }
+        const derived = Object.values(fileMap).map((f) => ({
+            ...f,
+            test_methods: f.methods.join(","),
+        }));
 
-        const latestRun = currentJobLocal.runs.at(-1);
-        if (latestRun) {
-            loadTestFileList(latestRun.id);
-            loadTestPreferences();
-        }
-    }, [repos, currentRepo, currentJob]);
+        setTestFileList(derived);
+        setLoading(true);
+        loadTestPreferences();
+    }, [pytestTests, currentRuns, currentRepo, currentJob]);
 
     const loadTestPreferences = async () => {
         try {
@@ -187,19 +194,6 @@ function TestManagementTab({repos, currentRepo, currentJob}) {
         }
     };
 
-    const loadTestFileList = async (run_id) => {
-        try {
-            const response = await fetch(
-                `${API_BASE}/data/${currentRepo}/${currentJob}/${run_id}/test_files`
-            );
-            const data = await response.json();
-
-            setTestFileList(data.test_files || []);
-            setLoading(true);
-        } catch (err) {
-            console.error("Failed to load test file list:", err);
-        }
-    };
 
     const onDragStart = (result) => {
         setFailedAttemptId(null);

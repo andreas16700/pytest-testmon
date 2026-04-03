@@ -164,31 +164,12 @@ function App() {
         }
     };
 
-    const showTestDetails = async (testId, runId, pytestEntry = null) => {
-        try {
-            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/test/${testId}`, {credentials: "include"});
-            const data = await resp.json();
-
-            // Merge pytest JSON data (duration, lineno, status, error) over DB data
-            const mergedTest = {
-                ...data.test,
-                ...(pytestEntry && {
-                    duration: pytestEntry.duration,
-                    lineno: pytestEntry.lineno,
-                    status: pytestEntry.status,
-                    error_message: pytestEntry.error_message,
-                    longrepr: pytestEntry.longrepr,
-                }),
-            };
-
-            setModal({
-                open: true,
-                title: mergedTest.name,
-                content: <TestDetails currentRepo={currentRepo} test={mergedTest} dependencies={data.dependencies} externalPackages={data.external_packages}/>,
-            });
-        } catch (err) {
-            alert("Failed to load test details: " + err.message);
-        }
+    const showTestDetails = (test) => {
+        setModal({
+            open: true,
+            title: test.name,
+            content: <TestDetails currentRepo={currentRepo} test={test} dependencies={[]} externalPackages={[]}/>,
+        });
     };
 
     const showFileDetails = async (filename, runId) => {
@@ -342,7 +323,6 @@ function App() {
                                 currentRuns={currentRuns}
                                 selectedRunId={selectedRunId}
                                 setSelectedRunId={setSelectedRunId}
-                                repos={repos}
                             />
                         </div>
                     )}
