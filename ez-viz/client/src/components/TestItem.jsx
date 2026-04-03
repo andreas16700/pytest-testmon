@@ -29,7 +29,7 @@ function TestItem({ runId, test, onClick }) {
       <div className="test-item-footer">
         <span>{formatDuration(test.duration)}</span>
         {test.lineno != null && (
-          <span className="test-lineno">Line No: {test.lineno}</span>
+          <span className="test-lineno">Line No: {test.lineno + 1}</span>
         )}
         {test.status === "failed" && test.error_message && (
           <span className="test-error-hint" title={test.longrepr || test.error_message}>
