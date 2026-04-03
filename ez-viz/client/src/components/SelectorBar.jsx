@@ -1,7 +1,7 @@
 import {RefreshCw, ChevronDown, Loader2, FileCode, AlertCircle} from "lucide-react";
 import React, {useState, useRef, useEffect} from "react";
 
-function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo, selectedJob, onRepoChange, onJobChange, onRunChange, onRefresh, setIsAdded, setSummary, setAllTests, setAllFiles, selectedRunId, setSelectedRunId, userOtherRepos, generateWorkflowFile}) {
+function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo, selectedJob, onRepoChange, onJobChange, onRunChange, onRefresh, setIsAdded, setSummary, setAllTests, setAllFiles, setAllPytestTests, selectedRunId, setSelectedRunId, userOtherRepos, generateWorkflowFile}) {
     const [isRepoDropdownOpen, setIsRepoDropdownOpen] = useState(false);
     const [isJobDropdownOpen, setIsJobDropdownOpen] = useState(false);
     const [isRunDropdownOpen, setIsRunDropdownOpen] = useState(false);
@@ -189,6 +189,7 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                             setSummary(prev => prev.filter(item => item.run_id != run.id));
                                             setAllTests(prev => prev.filter(item => item.run_id != run.id));
                                             setAllFiles(prev => prev.filter(item => item.run_id != run.id));
+                                            setAllPytestTests(prev => prev.filter(item => item.run_id != run.id));
                                             if (run.id === selectedRunId) {
                                                 setSelectedRunId(remaining.length > 0 ? remaining[0] : null);
                                             }
