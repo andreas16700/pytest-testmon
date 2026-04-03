@@ -18,16 +18,18 @@ function TestsTab({ pytestTests, search, setSearch, showTestDetails }) {
 
   const filterKey = (status) => {
     if (status === "error") return "failed";
+    if (status === "deselected") return "skipped";
     return status;
   };
 
   const getStatusOrder = (status) => {
     switch (status) {
-      case "failed":  return 0;
-      case "error":   return 0;
-      case "skipped": return 1;
-      case "passed":  return 2;
-      default:        return 99;
+      case "failed":
+      case "error":      return 0;
+      case "skipped":
+      case "deselected": return 1;
+      case "passed":     return 2;
+      default:           return 99;
     }
   };
 
