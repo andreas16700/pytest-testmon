@@ -38,10 +38,31 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -e .
-          python3 -m pip install pytest pytest-cov
+          python3 -m pip install pytest pytest-cov pytest-json-report
 
       - name: Run unit tests with ezmon
-        run: python3 -m pytest tests/ -v --ezmon --tb=short
+        run: |
+          python3 -m pytest tests/ -v --ezmon --tb=short --json-report --json-report-file=test-report.json || true
+          python3 -c "
+          import json, os
+          with open('test-report.json') as f:
+              report = json.load(f)
+          report['commit_id'] = os.environ['GITHUB_SHA']
+          report['repo_id'] = os.environ['GITHUB_REPOSITORY']
+          with open('test-report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          "
+
+      - name: Print test report JSON
+        if: always()
+        run: cat test-report.json
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ github.sha }}
+          path: test-report.json
 
   # ============================================================================
   # Integration Tests - Self-hosted macOS runner with NetDB
