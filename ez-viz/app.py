@@ -713,23 +713,23 @@ def get_run_infos(db_path):
                 r.tests_selected,
                 r.tests_deselected,
                 r.time_all,
-                r.time_saved
+                r.time_saved,
+                r.commit_id
             FROM runs r
             ORDER BY r.created_at DESC
         """)
         rows = cursor.fetchall()
 
-        # Always use internal id for uniqueness (handles matrix jobs with same repo_run_id)
-        # Include repo_run_id for display/reference when available
         runs = [
             {
-                "id": row[0],  # Always use internal id for uniqueness
+                "id": row[0],
                 "created_at": row[1],
-                "tests_all": row[2],  # Total tests in this run
-                "tests_selected": row[3],  # Tests skipped (saved) by ezmon
+                "tests_all": row[2],
+                "tests_selected": row[3],
                 "tests_deselected": row[4],
-                "time_all": row[5],  # Total test time
-                "time_saved": row[6],  # Time saved by skipping
+                "time_all": row[5],
+                "time_saved": row[6],
+                "commit_id": row[7],
             }
             for row in rows
         ]
@@ -2105,20 +2105,22 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id = repo_id, job_id
 
     try:
-        # Allow bypassing DB lookup with a direct GitHub run ID (for testing)
         gh_run_id = request.args.get("gh_run_id")
+        commit_sha = request.args.get("commit_id")
+
         if gh_run_id:
             log.info("pytest_tests_direct_gh_run repo=%s gh_run_id=%s", repo_id, gh_run_id)
             data = _download_artifact_from_run(repo_id, int(gh_run_id), _gh_headers())
+        elif commit_sha:
+            log.info("pytest_tests_commit_sha repo=%s sha=%s", repo_id, commit_sha)
+            data = _fetch_pytest_report_from_github(repo_id, commit_sha)
         else:
-            # Get commit SHA for this testmon run_id from the DB
+            # Last resort: look up commit SHA from DB
             db_path = get_job_db_path(repo_id, job_id)
             commit_sha = _get_commit_sha_for_run(db_path, run_id) if db_path.exists() else None
-
             if not commit_sha:
                 log.warning("pytest_tests_no_commit repo=%s job=%s run=%s", repo_id, job_id, run_id)
                 return jsonify({"error": "No commit SHA found for this run"}), 404
-
             data = _fetch_pytest_report_from_github(repo_id, commit_sha)
         if not data:
             return jsonify({"error": "No pytest report artifact found on GitHub"}), 404

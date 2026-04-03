@@ -136,11 +136,19 @@ function App() {
         if (isAdded) {
             try {
                 const lastRunId = currentRuns[currentRuns.length - 1];
+                const repoObj = repos.find(r => r.id === currentRepo);
+                const jobObj = repoObj?.jobs.find(j => j.id == currentJob || j.name == currentJob);
+                const runObj = jobObj?.runs.find(r => r.id == lastRunId);
+                const commitId = runObj?.commit_id;
+                const pytestUrl = commitId
+                    ? `/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests?commit_id=${commitId}`
+                    : `/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests`;
+
                 const [summaryData, testsData, filesData, pytestData] = await Promise.all([
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/summary`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/tests`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/files`, {credentials: "include"}).then((r) => r.json()),
-                    fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests`, {credentials: "include"}).then((r) => r.ok ? r.json() : null).catch(() => null),
+                    fetch(pytestUrl, {credentials: "include"}).then((r) => r.ok ? r.json() : null).catch(() => null),
                 ]);
                 setSummary((prev) => [...prev, summaryData]);
                 setAllTests((prev) => [...prev, testsData]);
@@ -238,6 +246,7 @@ function App() {
                                 setSummary={setSummary}
                                 setAllTests={setAllTests}
                                 setAllFiles={setAllFiles}
+                                setAllPytestTests={setAllPytestTests}
                                 selectedRunId={selectedRunId}
                                 setSelectedRunId={setSelectedRunId}
                                 userOtherRepos={userOtherRepos}
