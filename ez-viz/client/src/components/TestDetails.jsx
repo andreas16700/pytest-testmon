@@ -18,7 +18,7 @@ function TestDetails({ currentRepo, test, dependencies, externalPackages, branch
 
   const testFile = test?.name?.split("::")[0];
   const ghUrl = currentRepo && testFile
-    ? `https://github.com/${currentRepo}/blob/${branch}/${testFile}${test?.lineno ? `#L${test.lineno}` : ""}`
+    ? `https://github.com/${currentRepo}/blob/${branch}/${testFile}${test?.lineno ? `#L${test.lineno + 1}` : ""}`
     : null;
 
   return (
@@ -33,7 +33,7 @@ function TestDetails({ currentRepo, test, dependencies, externalPackages, branch
       {test?.lineno != null && (
         <div className="test-details-location-row">
           <span className="test-location-label">Line No:</span>
-          <span className="test-location-value">{test.lineno}</span>
+          <span className="test-location-value">{test.lineno + 1}</span>
           {ghUrl && (
             <a
               href={ghUrl}
