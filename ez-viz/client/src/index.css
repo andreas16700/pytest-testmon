@@ -339,10 +339,6 @@
     @apply text-gray-700 text-sm mb-1;
 }
 
-.dependency-meta {
-    @apply text-sm text-gray-600 flex gap-5 flex-wrap mb-2;
-}
-
 .dependency-checksums {
     @apply mt-2 p-3 bg-white rounded text-sm font-mono break-words;
 }

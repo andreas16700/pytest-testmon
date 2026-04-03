@@ -42,7 +42,7 @@ function FileDetails({ filename, affectedTests }) {
                             <div className="flex items-center gap-4 mt-3 text-xs text-gray-500">
                                 <div className="flex items-center gap-1">
                                     <Clock size={12} className="text-gray-400" />
-                                    {formatDuration(test.duration)}
+                                    {formatDuration(test.duration * 1000)}
                                 </div>
                                 <div className="flex items-center gap-1">
                                     <ShieldCheck size={12} className="text-gray-400" />

@@ -1351,38 +1351,25 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             log.warning("test_not_found test_id=%s", test_id)
             return jsonify({"error": "Test not found"}), 404
 
-        log.info("debug_test test_id=%s name=%s", test_id, test["name"])
-
         dependency_row = conn.execute(
-            "SELECT file_bitmap, external_packages FROM test_deps WHERE test_id = ?", (test_id,)
+            "SELECT file_bitmap, external_packages FROM test_deps WHERE test_id = ?",(test_id,)
         ).fetchone()
-
-        log.info("debug_dep_row found=%s", dependency_row is not None)
 
         dependencies = []
         external_packages = []
 
         if dependency_row:
-            raw_bitmap = dependency_row["file_bitmap"]
-            log.info("debug_bitmap type=%s len=%s hex=%s",
-                     type(raw_bitmap).__name__,
-                     len(raw_bitmap) if raw_bitmap else 0,
-                     raw_bitmap.hex()[:60] if isinstance(raw_bitmap, (bytes, bytearray)) else str(raw_bitmap)[:60])
-
-            file_ids = _decode_bitmap(raw_bitmap)
-            log.info("debug_file_ids ids=%s", sorted(file_ids))
+            # Decode the bitmap to get file IDs
+            file_ids = _decode_bitmap(dependency_row["file_bitmap"])
 
             if file_ids:
-                adjusted_ids = [i + 1 for i in file_ids]
-                log.info("debug_adjusted_ids ids=%s", adjusted_ids)
-                placeholders = ",".join("?" * len(adjusted_ids))
+                # Fetch file metadata for all dependency IDs in one query
+                placeholders = ",".join("?" * len(file_ids))
+                ids = [i for i in file_ids]
                 file_rows = conn.execute(
                     f"SELECT id, path, checksum, fsha, file_type FROM files WHERE id IN ({placeholders})",
-                    adjusted_ids
+                    ids
                 ).fetchall()
-
-                log.info("debug_file_rows count=%s paths=%s",
-                         len(file_rows), [r["path"] for r in file_rows])
 
                 for f in file_rows:
                     dependencies.append({
@@ -1392,6 +1379,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
                         "file_type": f["file_type"],
                     })
 
+            # Parse external packages string e.g. "pytest,numpy==2.2.1"
             if dependency_row["external_packages"]:
                 external_packages = [
                     p.strip()
@@ -1412,18 +1400,13 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
             "external_packages": external_packages
         })
 
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        log.error("test_details_error error=%s traceback=%s", str(e), tb)
-        return jsonify({
-            "error": str(e),
-            "traceback": tb
-        }), 500
+    except Exception:
+        log_exception("test_details_query", repo_id=repo_id, job_id=job_id, test_id=test_id)
+        return jsonify({"error": "Failed to read test details"}), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/files", methods=["GET"])
 def get_files(repo_id: str, job_id: str ,run_id:str):
-    g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
@@ -1432,24 +1415,47 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
     try:
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
-        files = conn.execute(
-            """
-            SELECT f.path
-            FROM files f
-            WHERE f.run_id = ?
-            ORDER BY f.path
-            """,
+        row = conn.execute(
+            "SELECT commit_id FROM runs WHERE id = ?",
             (run_id,)
-        ).fetchall()
-        print(f"Files {files}")
+        ).fetchone()
         conn.close()
-        log.info("files_list_success count=%s", len(files))
 
-        return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
+        if not row or not row["commit_id"]:
+            return jsonify({"error": "No commit found for this run"}), 404
+
+        commit_sha = row["commit_id"]
 
     except Exception:
-        log_exception("files_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read files"}), 500
+        log_exception("run_commit_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to read run info"}), 500
+
+    try:
+        token = session.get("github_token")
+        gh = Github(token) if token else Github()
+        print(f"Repo ID: {repo_id}")
+        repo = gh.get_repo(repo_id)
+        tree = repo.get_git_tree(commit_sha, recursive=True)
+
+        files = [
+            {"path": item.path}
+            for item in tree.tree
+            if item.type == "blob"
+        ]
+
+        log.info("files_list_success commit=%s count=%s", commit_sha, len(files))
+        return jsonify({
+            "run_id": run_id,
+            "commit_id": commit_sha,
+            "files": files
+        })
+
+    except GithubException as e:
+        log.warning("github_tree_fetch_failed commit=%s error=%s", commit_sha, e)
+        return jsonify({"error": "Failed to fetch files from GitHub", "detail": str(e)}), 502
+    except Exception:
+        log_exception("github_tree_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to fetch files"}), 500
 
 
 @app.route( "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>", methods=["GET"])
@@ -1496,8 +1502,6 @@ def get_file_details(repo_id: str, job_id: str, run_id: str, file_name: str):
                     })
 
         conn.close()
-
-        print(f"Affected Tests: {affected_tests}")
 
         return jsonify({"affectedTests": affected_tests})
 

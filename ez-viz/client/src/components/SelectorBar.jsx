@@ -36,7 +36,6 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
     }, []);
 
     const handleOtherRepoSelect = async (otherRepo) => {
-        console.log(otherRepo)
         setSelectedOtherRepo(otherRepo);
         setIsFutureRepoDropdownOpen(false);
 
@@ -201,8 +200,7 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                         <span className="font-semibold">Run #{run.id}</span>
                                         {run.tests_all != null ? (
                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700">
-                                                {run.tests_all - (run.tests_selected || 0)} ran
-                                                {run.tests_selected > 0 && `, ${run.tests_selected} skipped`}
+                                                {run.tests_selected} executed, {run.tests_all - run.tests_selected} skipped
                                             </span>
                                         ) : (
                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700">
