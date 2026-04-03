@@ -954,7 +954,7 @@ class TestmonCollect:
                 if ds:
                     ds.ensure_tests_batch(
                         self.testmon_data.run_id,
-                        [(test_name, test_file, outcome.get("duration"), True)],
+                        [(test_name, test_file, outcome.get("duration"), True, None)],
                     )
                 else:
                     self.testmon_data.db.get_or_create_test_id(
@@ -1204,7 +1204,8 @@ class TestmonCollect:
                 (name,
                  name.split("::")[0] if "::" in name else name,
                  outcome.get("duration", 0.0),
-                 True)
+                 True,
+                 None)
                 for name, outcome in self._outcomes.items()
                 if outcome.get("failed")
             ]
@@ -1434,7 +1435,8 @@ class TestmonCollect:
                     (name,
                      name.split("::")[0] if "::" in name else name,
                      self._outcomes.get(name, {}).get("duration", 0.0),
-                     True)
+                     True,
+                     None)
                     for name in failed_tests
                 ]
                 ds = self.testmon_data.dep_store

@@ -1311,11 +1311,12 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
 
         tests = conn.execute(
             """
-            SELECT 
+            SELECT
                 t.id,
                 t.name,
                 t.duration,
-                t.failed
+                t.failed,
+                t.forced
             FROM tests t
             WHERE t.run_id = ?
             ORDER BY t.name
