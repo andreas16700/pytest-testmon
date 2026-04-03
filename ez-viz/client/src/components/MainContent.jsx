@@ -11,6 +11,7 @@ function MainContent({
                          summary,
                          allTests,
                          allFiles,
+                         pytestTests,
                          activeTab,
                          setActiveTab,
                          testSearch,
@@ -90,6 +91,7 @@ function MainContent({
                 {activeTab === "tests" && (
                     <TestsTab
                         allTests={allTests}
+                        pytestTests={pytestTests}
                         search={testSearch}
                         setSearch={setTestSearch}
                         showTestDetails={showTestDetails}
