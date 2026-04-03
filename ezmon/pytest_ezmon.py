@@ -954,7 +954,7 @@ class TestmonCollect:
                 if ds:
                     ds.ensure_tests_batch(
                         self.testmon_data.run_id,
-                        [(test_name, test_file, outcome.get("duration"), True)],
+                        [(test_name, test_file, outcome.get("duration"), True, None)],
                     )
                 else:
                     self.testmon_data.db.get_or_create_test_id(
@@ -1204,10 +1204,12 @@ class TestmonCollect:
                 (name,
                  name.split("::")[0] if "::" in name else name,
                  outcome.get("duration", 0.0),
-                 True)
+                 True,
+                 None)
                 for name, outcome in self._outcomes.items()
                 if outcome.get("failed")
             ]
+            tests_failed_count = len(failed_tests_for_db)
             if failed_tests_for_db:
                 ds = self.testmon_data.dep_store
                 if ds:
@@ -1217,7 +1219,7 @@ class TestmonCollect:
                     with self.testmon_data.db.con:
                         ds.save_batch([])  # flush dirty test metadata, no deps to write
                 else:
-                    for name, test_file, dur, _failed in failed_tests_for_db:
+                    for name, test_file, dur, _failed, _forced in failed_tests_for_db:
                         self.testmon_data.db.get_or_create_test_id(
                             name, duration=dur, failed=True,
                             test_file=test_file,
@@ -1232,6 +1234,7 @@ class TestmonCollect:
                 duration=duration,
                 tests_selected=run_saved_tests or 0,
                 tests_deselected=(run_all_tests or 0) - (run_saved_tests or 0),
+                tests_failed=tests_failed_count,
                 tests_all=run_all_tests or 0,
                 time_saved=run_saved_time or 0,
                 time_all=run_all_time or 0,
@@ -1434,7 +1437,8 @@ class TestmonCollect:
                     (name,
                      name.split("::")[0] if "::" in name else name,
                      self._outcomes.get(name, {}).get("duration", 0.0),
-                     True)
+                     True,
+                     None)
                     for name in failed_tests
                 ]
                 ds = self.testmon_data.dep_store

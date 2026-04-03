@@ -1212,7 +1212,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         cursor = conn.cursor()
 
         run_info_row = cursor.execute(
-            "SELECT tests_all, tests_deselected, time_saved, time_all, created_at FROM runs WHERE id = ?",
+            "SELECT tests_all, tests_deselected, tests_failed, time_saved, time_all, created_at FROM runs WHERE id = ?",
             (run_id,)
         ).fetchone()
 
@@ -1226,6 +1226,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
                 savings["time_all"] = run_info_row["time_all"]
 
             test_count = run_info_row["tests_all"]
+            tests_failed = run_info_row["tests_failed"] or 0
             create_date = run_info_row["created_at"]
     
 
@@ -1239,6 +1240,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
                 "run_id": run_id,
                 "create_date": create_date,
                 "test_count": test_count,
+                "tests_failed": tests_failed,
                 "savings": savings,
             }
         )
@@ -1309,11 +1311,12 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
 
         tests = conn.execute(
             """
-            SELECT 
+            SELECT
                 t.id,
                 t.name,
                 t.duration,
-                t.failed
+                t.failed,
+                t.forced
             FROM tests t
             WHERE t.run_id = ?
             ORDER BY t.name

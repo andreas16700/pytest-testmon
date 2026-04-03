@@ -945,7 +945,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             for test_name in nodes_files_lines:
                 outcome = outcomes.get(test_name, {"failed": False, "duration": 0.0})
                 test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False)))
+                tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False), outcome.get("forced", None)))
 
             _tlog("save_raw_bulk_test_ids_start", n_tests=len(tests_for_db))
             test_id_map = ds.ensure_tests_batch(self.run_id, tests_for_db)
