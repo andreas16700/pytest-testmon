@@ -1203,7 +1203,6 @@ def get_file_content(owner, repo):
 def get_summary(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
-    print(f"Repo ID: {repo_id}, Job ID: {job_id}, Run ID: {run_id}, DB Path: {db_path}, Response: {resp}, Code: {code}")
     if resp:
         return resp, code
 
@@ -1211,7 +1210,6 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        print("Database connection established successfully.")
 
         run_info_row = cursor.execute(
             "SELECT tests_all, tests_deselected, tests_failed, time_saved, time_all, created_at FROM runs WHERE id = ?",

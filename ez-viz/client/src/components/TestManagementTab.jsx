@@ -2,6 +2,7 @@ import React, {useEffect, useState} from "react";
 import {Save, ChevronDown, GripVertical, Info, RotateCcw} from "lucide-react";
 import {DragDropContext, Droppable, Draggable} from "@hello-pangea/dnd";
 import {Toaster, toast} from "react-hot-toast";
+import {formatDuration} from "./utils.jsx";
 
 const API_BASE = "/api";
 
@@ -322,7 +323,7 @@ function TestManagementTab({currentRepo, currentJob, currentRuns, pytestTests}) 
                                 <Info size={16} className="info-icon"/>
                                 <div className="tooltip">
                                     <div className="tooltip-content">
-                                        Took {(test.total_duration / 2).toFixed(4)}s last run
+                                        Took {formatDuration(test.total_duration)} last run
                                         <div className="tooltip-arrow"></div>
                                     </div>
                                 </div>

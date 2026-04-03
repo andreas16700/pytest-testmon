@@ -183,6 +183,10 @@ function App() {
     const showFileDetails = async (filename, runId) => {
         try {
             const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/fileDetails/${filename}`, {credentials: "include"});
+            if (!resp.ok) {
+                toast.error(`Details for "${filename}" are not available.`);
+                return;
+            }
             const data = await resp.json();
             setModal({
                 open: true,
@@ -190,7 +194,8 @@ function App() {
                 content: <FileDetails filename={filename} affectedTests={data.affectedTests}/>,
             });
         } catch (err) {
-            alert("Failed to load file details : " + err.message);
+            console.error(err);
+            toast.error("Failed to load file details. Please try again later.");
         }
     };
 

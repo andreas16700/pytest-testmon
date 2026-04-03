@@ -1,6 +1,6 @@
 import React from "react";
 import { formatDuration, getStatusText } from "./utils.jsx";
-import { Clock, ShieldCheck, Activity } from "lucide-react";
+import { Clock, Activity } from "lucide-react";
 
 function FileDetails({ filename, affectedTests }) {
     // Helper to map status text to our CSS classes
@@ -42,11 +42,7 @@ function FileDetails({ filename, affectedTests }) {
                             <div className="flex items-center gap-4 mt-3 text-xs text-gray-500">
                                 <div className="flex items-center gap-1">
                                     <Clock size={12} className="text-gray-400" />
-                                    {formatDuration(test.duration * 1000)}
-                                </div>
-                                <div className="flex items-center gap-1">
-                                    <ShieldCheck size={12} className="text-gray-400" />
-                                    <span>Verified run</span>
+                                    {formatDuration(test.duration)}
                                 </div>
                             </div>
                         </div>
