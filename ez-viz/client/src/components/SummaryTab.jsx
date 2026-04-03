@@ -250,8 +250,15 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
                                         { label: 'Failed', key: 'failed', reverseColor: true },
                                         { label: 'Runtime (ms)', key: 'runtimeSpent', format: (v) => v.toFixed(2) },
                                     ].map((row) => {
-                                        const v1 = runAData.stats[row.key];
-                                        const v2 = runBData.stats[row.key];
+                                        let v1;
+                                        let v2;
+                                        if (row.key === "ran") {
+                                            v1 = runAData.stats['failed'] + runAData.stats['passed'];
+                                            v2 = runBData.stats['failed'] + runBData.stats['passed'];
+                                        } else {
+                                            v1 = runAData.stats[row.key];
+                                            v2 = runBData.stats[row.key];
+                                        }
                                         const diff = v1 - v2;
                                         const format = row.format || ((v) => v);
                                         const colorClass = diff === 0 ? 'text-gray-400' : (row.reverseColor ? (diff < 0 ? 'text-green-600' : 'text-red-600') : (diff > 0 ? 'text-green-600' : 'text-red-600'));
@@ -294,7 +301,8 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
                                                 }
                                             },
                                             plugins: {
-                                                legend: { 
+                                                legend: {
+                                                    display: false,
                                                     position: 'top',
                                                     labels: {
                                                         font: { size: 13 },
@@ -359,12 +367,12 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
                             />
                         </div>
 
-                        <div className="charts-grid">
+                        <div className="charts-grid mt-8">
                             <div className="chart-card">
                                 <h3 className="chart-title">
                                     Test Distribution
                                 </h3>
-                                <div className="chart-wrapper" style={{ maxWidth: "420px", margin: "0 auto" }}>
+                                <div className="chart-wrapper" style={{ maxWidth: "350px", margin: "0 auto" }}>
                                     <Doughnut data={testsChartData} options={chartOptions} />
                                 </div>
                             </div>
@@ -372,7 +380,7 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
                                 <h3 className="chart-title">
                                     Runtime Distribution
                                 </h3>
-                                <div className="chart-wrapper" style={{ maxWidth: "300px", margin: "0 auto" }}>
+                                <div className="chart-wrapper" style={{ maxWidth: "350px", margin: "0 auto" }}>
                                     <Doughnut data={runtimeChartData} options={runtimeChartOptions} />
                                 </div>
                             </div>
