@@ -32,6 +32,9 @@ from functools import wraps
 import traceback
 from urllib.parse import urlencode
 import array
+import zipfile
+import io
+import re
 from github import Github, GithubException
 
 # Ensure repo root is on sys.path so ezmon modules are importable.
@@ -1965,36 +1968,175 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
         return jsonify({"error": "Failed to read pytest summary"}), 500
 
 
-@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-tests", methods=["GET"])
-def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
-    """Get all tests from pytest JSON report"""
-    g.repo_id, g.job_id = repo_id, job_id
+def _gh_headers():
+    """Build GitHub API headers using the session token if available."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = session.get("github_token") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
-    report_path = get_pytest_report_path(repo_id, job_id, run_id)
 
-    if not report_path.exists():
-        log.warning("pytest_tests_not_found path=%s", report_path)
-        return jsonify({"error": "Report not found"}), 404
+def _get_commit_sha_for_run(db_path, run_id: str) -> Optional[str]:
+    """Look up commit_id from the testmon DB for a given run_id."""
+    try:
+        con = sqlite3.connect(str(db_path))
+        row = con.execute(
+            "SELECT commit_id FROM runs WHERE id = ? LIMIT 1", (run_id,)
+        ).fetchone()
+        con.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _download_artifact_from_run(repo_id: str, gh_run_id: int, headers: dict) -> Optional[dict]:
+    """Find and download the test-report artifact from a specific GitHub Actions run ID."""
+    artifacts_url = f"https://api.github.com/repos/{repo_id}/actions/runs/{gh_run_id}/artifacts"
+    art_resp = requests.get(artifacts_url, headers=headers, timeout=15)
+    if not art_resp.ok:
+        return None
+    artifacts = art_resp.json().get("artifacts", [])
+    artifact = next((a for a in artifacts if "test-report" in a["name"]), None)
+    if not artifact:
+        log.warning("gh_artifact_not_found repo=%s gh_run_id=%s", repo_id, gh_run_id)
+        return None
+
+    zip_url = f"https://api.github.com/repos/{repo_id}/actions/artifacts/{artifact['id']}/zip"
+    zip_resp = requests.get(zip_url, headers=headers, timeout=30)
+    zip_resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+        json_file = next((n for n in zf.namelist() if n.endswith(".json")), None)
+        if not json_file:
+            return None
+        with zf.open(json_file) as f:
+            data = json.load(f)
+    log.info("gh_artifact_fetched repo=%s gh_run_id=%s artifact=%s", repo_id, gh_run_id, artifact["name"])
+    return data
+
+
+def _fetch_pytest_report_from_github(repo_id: str, commit_sha: str) -> Optional[dict]:
+    """Fetch pytest JSON report artifact from GitHub Actions for a given commit SHA."""
+    try:
+        headers = _gh_headers()
+
+        runs_url = f"https://api.github.com/repos/{repo_id}/actions/runs?head_sha={commit_sha}"
+        runs_resp = requests.get(runs_url, headers=headers, timeout=15)
+        runs_resp.raise_for_status()
+        workflow_runs = runs_resp.json().get("workflow_runs", [])
+        if not workflow_runs:
+            log.warning("gh_artifact_no_runs repo=%s sha=%s", repo_id, commit_sha)
+            return None
+
+        for run in workflow_runs:
+            data = _download_artifact_from_run(repo_id, run["id"], headers)
+            if data:
+                return data
+
+        log.warning("gh_artifact_not_found repo=%s sha=%s", repo_id, commit_sha)
+        return None
+
+    except Exception:
+        log_exception("gh_artifact_fetch", repo_id=repo_id, commit_sha=commit_sha)
+        return None
+
+
+@app.route("/api/pytest-tests-from-url", methods=["GET"])
+def get_pytest_tests_from_url():
+    """Fetch pytest test report directly from a GitHub Actions URL.
+    Query param: url = https://github.com/{owner}/{repo}/actions/runs/{run_id}[/job/{job_id}]
+    """
+    gh_url = request.args.get("url")
+    if not gh_url:
+        return jsonify({"error": "url param required"}), 400
+
+    match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", gh_url)
+    if not match:
+        return jsonify({"error": "Could not parse GitHub Actions URL"}), 400
+
+    repo_id = match.group(1)
+    gh_run_id = int(match.group(2))
 
     try:
-        with open(report_path, "r") as f:
-            data = json.load(f)
+        data = _download_artifact_from_run(repo_id, gh_run_id, _gh_headers())
+        if not data:
+            return jsonify({"error": "No test-report artifact found"}), 404
 
         tests = []
         for t in data.get("tests", []):
-            test_duration = (
-                t.get("setup", {}).get("duration", 0) +
-                t.get("call", {}).get("duration", 0) +
-                t.get("teardown", {}).get("duration", 0)
-            )
+            outcome = t.get("outcome")
+            if outcome == "deselected":
+                duration = t.get("duration", 0.0)
+            else:
+                duration = (
+                    t.get("setup", {}).get("duration", 0) +
+                    t.get("call", {}).get("duration", 0) +
+                    t.get("teardown", {}).get("duration", 0)
+                )
             tests.append({
                 "nodeid": t.get("nodeid"),
                 "lineno": t.get("lineno"),
-                "outcome": t.get("outcome"),
-                "duration": test_duration,
-                "keywords": t.get("keywords", []),
-                "failed": t.get("outcome") == "failed",
-                "error_message": t.get("call", {}).get("crash", {}).get("message") if t.get("outcome") == "failed" else None,
+                "outcome": outcome,
+                "duration": duration,
+                "error_message": t.get("call", {}).get("crash", {}).get("message") if outcome == "failed" else None,
+                "longrepr": t.get("call", {}).get("longrepr") if outcome == "failed" else None,
+            })
+
+        log.info("pytest_tests_from_url repo=%s gh_run_id=%s count=%s", repo_id, gh_run_id, len(tests))
+        return jsonify({
+            "repo_id": repo_id,
+            "gh_run_id": gh_run_id,
+            "summary": data.get("summary", {}),
+            "tests": tests,
+        })
+
+    except Exception:
+        log_exception("pytest_tests_from_url", url=gh_url)
+        return jsonify({"error": "Failed to fetch pytest tests"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-tests", methods=["GET"])
+def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
+    """Get all tests from pytest JSON report fetched from GitHub Actions artifact."""
+    g.repo_id, g.job_id = repo_id, job_id
+
+    try:
+        # Allow bypassing DB lookup with a direct GitHub run ID (for testing)
+        gh_run_id = request.args.get("gh_run_id")
+        if gh_run_id:
+            log.info("pytest_tests_direct_gh_run repo=%s gh_run_id=%s", repo_id, gh_run_id)
+            data = _download_artifact_from_run(repo_id, int(gh_run_id), _gh_headers())
+        else:
+            # Get commit SHA for this testmon run_id from the DB
+            db_path = get_job_db_path(repo_id, job_id)
+            commit_sha = _get_commit_sha_for_run(db_path, run_id) if db_path.exists() else None
+
+            if not commit_sha:
+                log.warning("pytest_tests_no_commit repo=%s job=%s run=%s", repo_id, job_id, run_id)
+                return jsonify({"error": "No commit SHA found for this run"}), 404
+
+            data = _fetch_pytest_report_from_github(repo_id, commit_sha)
+        if not data:
+            return jsonify({"error": "No pytest report artifact found on GitHub"}), 404
+
+        tests = []
+        for t in data.get("tests", []):
+            outcome = t.get("outcome")
+            if outcome == "deselected":
+                duration = t.get("duration", 0.0)
+            else:
+                duration = (
+                    t.get("setup", {}).get("duration", 0) +
+                    t.get("call", {}).get("duration", 0) +
+                    t.get("teardown", {}).get("duration", 0)
+                )
+            tests.append({
+                "nodeid": t.get("nodeid"),
+                "lineno": t.get("lineno"),
+                "outcome": outcome,
+                "duration": duration,
+                "error_message": t.get("call", {}).get("crash", {}).get("message") if outcome == "failed" else None,
+                "longrepr": t.get("call", {}).get("longrepr") if outcome == "failed" else None,
             })
 
         log.info("pytest_tests_success count=%s", len(tests))
@@ -2002,12 +2144,13 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
             "repo_id": repo_id,
             "job_id": job_id,
             "run_id": run_id,
+            "commit_sha": commit_sha,
             "tests": tests,
         })
 
     except Exception:
         log_exception("pytest_tests_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
-        return jsonify({"error": "Failed to read pytest tests"}), 500
+        return jsonify({"error": "Failed to fetch pytest tests"}), 500
 
 
 @app.route("/api/data/<path:repo_id>/<job_id>/runs", methods=["GET"])

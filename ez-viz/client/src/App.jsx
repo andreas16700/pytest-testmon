@@ -23,6 +23,7 @@ function App() {
     const [summary, setSummary] = useState([]);
     const [allTests, setAllTests] = useState([]);
     const [allFiles, setAllFiles] = useState([]);
+    const [allPytestTests, setAllPytestTests] = useState([]);
     const [isPopupWindowOpen, setIsPopupWindowOpen] = useState(false);
     const [workflowFile, setWorkflowFile] = useState("");
     const [originalWorkflowFile, setOriginalWorkflowFile] = useState("");
@@ -56,6 +57,7 @@ function App() {
     useEffect(() => {
         setAllTests([]);
         setAllFiles([]);
+        setAllPytestTests([]);
     }, [currentRepo, currentJob]);
 
     const fetchUser = async () => {
@@ -134,17 +136,22 @@ function App() {
         if (isAdded) {
             try {
                 const lastRunId = currentRuns[currentRuns.length - 1];
-                const [summaryData, testsData, filesData] = await Promise.all([
+                const [summaryData, testsData, filesData, pytestData] = await Promise.all([
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/summary`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/tests`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/files`, {credentials: "include"}).then((r) => r.json()),
+                    fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests`, {credentials: "include"}).then((r) => r.ok ? r.json() : null).catch(() => null),
                 ]);
                 setSummary((prev) => [...prev, summaryData]);
                 setAllTests((prev) => [...prev, testsData]);
                 setAllFiles((prev) => [...prev, filesData]);
+                if (pytestData?.tests) {
+                    setAllPytestTests((prev) => [...prev, { run_id: lastRunId, tests: pytestData.tests }]);
+                }
                 console.log("Summary", summaryData);
                 console.log("Tests", testsData);
                 console.log("Files", filesData);
+                console.log("PytestTests", pytestData);
                 setActiveTab("summary");
             } catch (err) {
                 setError("Failed to load testmon data: " + err.message);
@@ -157,15 +164,27 @@ function App() {
         }
     };
 
-    const showTestDetails = async (testId, runId) => {
+    const showTestDetails = async (testId, runId, pytestEntry = null) => {
         try {
             const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/test/${testId}`, {credentials: "include"});
             const data = await resp.json();
 
+            // Merge pytest JSON data (duration, lineno, status, error) over DB data
+            const mergedTest = {
+                ...data.test,
+                ...(pytestEntry && {
+                    duration: pytestEntry.duration,
+                    lineno: pytestEntry.lineno,
+                    status: pytestEntry.status,
+                    error_message: pytestEntry.error_message,
+                    longrepr: pytestEntry.longrepr,
+                }),
+            };
+
             setModal({
                 open: true,
-                title: data.test.name,
-                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies} externalPackages={data.external_packages}/>,
+                title: mergedTest.name,
+                content: <TestDetails currentRepo={currentRepo} test={mergedTest} dependencies={data.dependencies} externalPackages={data.external_packages}/>,
             });
         } catch (err) {
             alert("Failed to load test details: " + err.message);
@@ -309,6 +328,7 @@ function App() {
                                 summary={summary}
                                 allTests={allTests}
                                 allFiles={allFiles}
+                                pytestTests={allPytestTests}
                                 activeTab={activeTab}
                                 setActiveTab={setActiveTab}
                                 testSearch={testSearch}

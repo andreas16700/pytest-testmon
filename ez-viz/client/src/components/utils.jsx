@@ -1,8 +1,8 @@
-export const formatDuration = (ms) => {
-    if (!ms) return '0ms';
-    if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
-    if (ms < 1000) return `${ms.toFixed(2)}ms`;
-    return `${(ms / 1000).toFixed(2)}s`;
+export const formatDuration = (seconds) => {
+    if (!seconds) return '0ms';
+    const ms = seconds * 1000;
+    if (ms < 1) return `${ms.toFixed(3)}ms`;
+    return `${ms.toFixed(2)}ms`;
 }
 
 export const getStatusText = (test) => {
