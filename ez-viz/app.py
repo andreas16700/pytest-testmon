@@ -1914,12 +1914,7 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
         tests = data.get("tests", [])
 
         # Calculate additional metrics
-        total_duration = sum(
-            t.get("setup", {}).get("duration", 0) +
-            t.get("call", {}).get("duration", 0) +
-            t.get("teardown", {}).get("duration", 0)
-            for t in tests
-        )
+        total_duration = sum(_parse_test_duration(t) for t in tests)
 
         # Group tests by file
         test_files = {}
@@ -1993,6 +1988,18 @@ def _get_commit_sha_for_run(db_path, run_id: str) -> Optional[str]:
         return row[0] if row and row[0] else None
     except Exception:
         return None
+
+
+def _parse_test_duration(t: dict) -> float:
+    """Return test duration, supporting both flat and pytest-json-report nested formats."""
+    flat = t.get("duration")
+    if flat is not None:
+        return float(flat)
+    return (
+        t.get("setup", {}).get("duration", 0) +
+        t.get("call", {}).get("duration", 0) +
+        t.get("teardown", {}).get("duration", 0)
+    )
 
 
 def _download_artifact_from_run(repo_id: str, gh_run_id: int, headers: dict) -> Optional[dict]:
@@ -2070,14 +2077,7 @@ def get_pytest_tests_from_url():
         tests = []
         for t in data.get("tests", []):
             outcome = t.get("outcome")
-            if outcome == "deselected":
-                duration = t.get("duration", 0.0)
-            else:
-                duration = (
-                    t.get("setup", {}).get("duration", 0) +
-                    t.get("call", {}).get("duration", 0) +
-                    t.get("teardown", {}).get("duration", 0)
-                )
+            duration = _parse_test_duration(t)
             tests.append({
                 "nodeid": t.get("nodeid"),
                 "lineno": t.get("lineno"),
@@ -2129,14 +2129,7 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
         tests = []
         for t in data.get("tests", []):
             outcome = t.get("outcome")
-            if outcome == "deselected":
-                duration = t.get("duration", 0.0)
-            else:
-                duration = (
-                    t.get("setup", {}).get("duration", 0) +
-                    t.get("call", {}).get("duration", 0) +
-                    t.get("teardown", {}).get("duration", 0)
-                )
+            duration = _parse_test_duration(t)
             tests.append({
                 "nodeid": t.get("nodeid"),
                 "lineno": t.get("lineno"),
