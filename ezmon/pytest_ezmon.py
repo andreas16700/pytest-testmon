@@ -825,7 +825,7 @@ class TestmonCollect:
         outcome["duration"] += getattr(report, "duration", 0.0) or 0.0
         if report.outcome == "failed":
             outcome["failed"] = True
-            if report.when == "call" and hasattr(report, "longrepr") and report.longrepr:
+            if hasattr(report, "longrepr") and report.longrepr:
                 outcome["longrepr"] = str(report.longrepr)
                 reprcrash = getattr(report.longrepr, "reprcrash", None)
                 if reprcrash:
