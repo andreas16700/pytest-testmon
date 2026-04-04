@@ -1934,8 +1934,8 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
             {
                 "nodeid": t.get("nodeid"),
                 "lineno": t.get("lineno"),
-                "message": t.get("call", {}).get("crash", {}).get("message"),
-                "longrepr": t.get("call", {}).get("longrepr"),
+                "message": t.get("error_message") or t.get("call", {}).get("crash", {}).get("message"),
+                "longrepr": t.get("longrepr") or t.get("call", {}).get("longrepr"),
             }
             for t in tests if t.get("outcome") == "failed"
         ]
@@ -2083,8 +2083,8 @@ def get_pytest_tests_from_url():
                 "lineno": t.get("lineno"),
                 "outcome": outcome,
                 "duration": duration,
-                "error_message": t.get("call", {}).get("crash", {}).get("message") if outcome == "failed" else None,
-                "longrepr": t.get("call", {}).get("longrepr") if outcome == "failed" else None,
+                "error_message": (t.get("error_message") or t.get("call", {}).get("crash", {}).get("message")) if outcome == "failed" else None,
+                "longrepr": (t.get("longrepr") or t.get("call", {}).get("longrepr")) if outcome == "failed" else None,
             })
 
         log.info("pytest_tests_from_url repo=%s gh_run_id=%s count=%s", repo_id, gh_run_id, len(tests))
@@ -2135,8 +2135,8 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
                 "lineno": t.get("lineno"),
                 "outcome": outcome,
                 "duration": duration,
-                "error_message": t.get("call", {}).get("crash", {}).get("message") if outcome == "failed" else None,
-                "longrepr": t.get("call", {}).get("longrepr") if outcome == "failed" else None,
+                "error_message": (t.get("error_message") or t.get("call", {}).get("crash", {}).get("message")) if outcome == "failed" else None,
+                "longrepr": (t.get("longrepr") or t.get("call", {}).get("longrepr")) if outcome == "failed" else None,
             })
 
         log.info("pytest_tests_success count=%s", len(tests))
