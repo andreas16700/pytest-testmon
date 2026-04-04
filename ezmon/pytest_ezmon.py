@@ -15,7 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
-from ezmon.net_db import get_net_db_config, upload_db_to_server
+from ezmon.net_db import get_net_db_config, upload_db_to_server, upload_report_to_server
 from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
@@ -1255,6 +1255,57 @@ class TestmonCollect:
             _flush_timing_logs(timing_dir)
         self.testmon.close()
 
+        if self._running_as in ("single", "controller"):
+            net_config = get_net_db_config()
+            if net_config:
+                self._generate_and_upload_report(session, net_config)
+
+    def _generate_and_upload_report(self, session, net_config):
+        """Build a JSON test report (run + deselected) and upload it to the server."""
+        select_plugin = session.config.pluginmanager.get_plugin("TestmonSelect")
+        deselected_nodeids = getattr(select_plugin, "_deselected_nodeids", []) if select_plugin else []
+        item_locations = getattr(select_plugin, "_item_locations", {}) if select_plugin else {}
+
+        tests = []
+        for nodeid, outcome in self._outcomes.items():
+            entry = {
+                "nodeid": nodeid,
+                "outcome": "failed" if outcome.get("failed") else "passed",
+                "duration": outcome.get("duration", 0.0),
+            }
+            if nodeid in item_locations:
+                entry["lineno"] = item_locations[nodeid]
+            tests.append(entry)
+        for entry in deselected_nodeids:
+            tests.append({
+                "nodeid": entry["nodeid"],
+                "lineno": entry["lineno"],
+                "outcome": "deselected",
+                "duration": 0.0,
+            })
+
+        summary = {
+            "total": len(tests),
+            "passed": sum(1 for t in tests if t["outcome"] == "passed"),
+            "failed": sum(1 for t in tests if t["outcome"] == "failed"),
+            "deselected": len(deselected_nodeids),
+        }
+        report = {
+            "tests": tests,
+            "summary": summary,
+            "commit_id": os.environ.get("GITHUB_SHA", ""),
+            "repo_id": os.environ.get("GITHUB_REPOSITORY", net_config["repo_id"]),
+        }
+
+        upload_report_to_server(
+            server_url=net_config["server_url"],
+            repo_id=net_config["repo_id"],
+            job_id=net_config["job_id"],
+            auth_token=net_config["auth_token"],
+            run_id=net_config["run_id"],
+            report=report,
+        )
+
     def _handle_worker_output(self, workeroutput, worker_id):
         _timing_log_for_actor("controller", "controller_receive_start", worker_id=worker_id)
         payload_dir = os.environ.get("EZMON_WORKER_PAYLOAD_DIR")
@@ -1628,6 +1679,7 @@ class TestmonSelect:
         )
 
         self._interrupted = False
+        self._deselected_nodeids = []
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), config.rootdir.strpath)
@@ -1652,6 +1704,7 @@ class TestmonSelect:
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
         _timing_log(config, "selection_start", item_count=len(items))
+        self._item_locations = {item.nodeid: item.location[1] for item in items}
         always_run_files = getattr(config, "always_run_files", [])
         prioritized_files = getattr(config, "prioritized_files", [])
 
@@ -1753,6 +1806,10 @@ class TestmonSelect:
             if not no_reorder:
                 sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
+        self._deselected_nodeids = [
+            {"nodeid": item.nodeid, "lineno": item.location[1]}
+            for item in deselected
+        ]
         _timing_log(
             config,
             "selection_end",
