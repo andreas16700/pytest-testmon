@@ -157,3 +157,55 @@ def upload_db_to_server(
     except requests.exceptions.RequestException as e:
         logger.warning(f"Upload failed: {e} - local file preserved at {source_path}")
         return False
+
+
+def upload_report_to_server(
+    server_url: str,
+    repo_id: str,
+    job_id: str,
+    auth_token: Optional[str],
+    run_id: Optional[str],
+    report: dict,
+) -> bool:
+    """
+    Upload the JSON test report (with deselected tests injected) to the server.
+
+    Posts to /api/client/pytest-report as JSON.
+
+    Args:
+        server_url: Base URL of the server
+        repo_id: Repository identifier
+        job_id: Job/variant identifier
+        auth_token: Bearer token (or None)
+        run_id: CI run ID (required by server)
+        report: Report dict to POST
+
+    Returns:
+        True if upload succeeded, False otherwise
+    """
+    if not run_id:
+        logger.warning("Skipping report upload: run_id (GITHUB_RUN_ID / RUN_ID) is not set")
+        return False
+
+    url = f"{server_url}/api/client/pytest-report"
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    payload = dict(report)
+    payload["repo_id"] = repo_id
+    payload["job_id"] = job_id
+    payload["run_id"] = run_id
+
+    logger.info(f"Uploading test report to server: repo={repo_id}, job={job_id}, run={run_id}")
+
+    try:
+        import json as _json
+        response = requests.post(url, data=_json.dumps(payload), headers=headers, timeout=30)
+        response.raise_for_status()
+        logger.info("Report upload successful")
+        return True
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Report upload failed: {e}")
+        return False
