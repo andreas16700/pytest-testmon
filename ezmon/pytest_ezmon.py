@@ -15,7 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import pytest
 
-from ezmon.net_db import get_net_db_config, upload_db_to_server, upload_report_to_server
+from ezmon.net_db import get_net_db_config, upload_db_to_server
 from ezmon.server_sync import get_test_preferences
 from _pytest.config import ExitCode, Config
 from _pytest.terminal import TerminalReporter
@@ -1297,14 +1297,13 @@ class TestmonCollect:
             "repo_id": os.environ.get("GITHUB_REPOSITORY", net_config["repo_id"]),
         }
 
-        upload_report_to_server(
-            server_url=net_config["server_url"],
-            repo_id=net_config["repo_id"],
-            job_id=net_config["job_id"],
-            auth_token=net_config["auth_token"],
-            run_id=net_config["run_id"],
-            report=report,
-        )
+        report_path = "test-report.json"
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            logger.info(f"Test report written to {report_path}")
+        except OSError as e:
+            logger.warning(f"Could not write test report: {e}")
 
     def _handle_worker_output(self, workeroutput, worker_id):
         _timing_log_for_actor("controller", "controller_receive_start", worker_id=worker_id)
