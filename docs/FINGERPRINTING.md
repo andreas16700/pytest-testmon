@@ -16,26 +16,18 @@ Ezmon-nocov uses **import-based dependency tracking** combined with **AST-based 
 
 ### 1. Import Tracking
 
-When a test runs, ezmon hooks Python's import system to track every file imported:
+When a test runs, ezmon hooks `builtins.__import__` to record raw import events with zero processing:
 
 ```python
 def _tracking_import(self, name, globals=None, locals=None, fromlist=(), level=0):
     result = self._original_import(name, globals, locals, fromlist, level)
-
-    # Track the imported module
-    self._track_import(result, name)
-
-    # For 'from X import Y', also track Y's defining module
-    if fromlist:
-        for attr_name in fromlist:
-            imported_obj = getattr(result, attr_name, None)
-            if hasattr(imported_obj, '__module__'):
-                defining_module = sys.modules.get(imported_obj.__module__)
-                if defining_module:
-                    self._track_import(defining_module, imported_obj.__module__)
-
+    fl = tuple(fromlist) if fromlist is not None else None
+    self._recording[name].add(fl)
+    self._recording[result.__name__].add(fl)
     return result
 ```
+
+The hook records `name` (what CPython asked for) and `result.__name__` (what Python resolved) into a `defaultdict(set)`. No path lookups or classification at import time. After the test completes, a single `_reconcile()` pass resolves all recorded module names to file paths via prefix expansion, fromlist expansion, and `__module__` tracing. See `docs/IMPORT_TRACKING_OPTIMIZATION.md` for the full design.
 
 ### 2. AST Fingerprinting
 
@@ -109,10 +101,25 @@ The dependency tracker ignores anything outside these sets to minimize overhead.
 
 ### Parallel Execution
 
-In xdist mode, workers encode dependency paths and package names as integer IDs
-using the controller-provided `expected_files_list` and `expected_packages_list`.
-The controller decodes these IDs, resolves SHAs, computes checksums, and writes the final
-dependency data.
+In xdist mode, each worker runs its assigned tests locally and records dependencies
+with the hook-based tracker. Workers send batches of `{test_name: {deps, file_deps,
+external_deps}}` payloads to the controller using plain relative paths — no encoding
+or integer-ID layer. Each batch uses a `file_common_unique_v2` compression: within a
+test file, dependencies common to all its tests are factored out once and only the
+per-test differences are serialized.
+
+Workers attach batch data to test reports via `user_properties`. The controller's
+`pytest_runtest_logreport` extracts each batch and calls `_handle_worker_output`,
+which processes it immediately via `save_test_deps_raw` — no end-of-session queue
+drain for the dependency data. Any residual batches are flushed via
+`pytest_testnodedown` when a worker tears down. The DepStore in-memory cache (see
+`docs/STATUS.md` → "DepStore: Unified In-Memory Cache") eliminates per-row DB
+round-trips so batch processing stays fast even at pandas scale.
+
+Workers filter out failed tests before building the wire payload. The controller
+marks failed tests with `failed=1` in its own post-processing pass using the outcomes
+it observes directly from the xdist results events (see "Fix: Failed Test Persistence
+in xdist" in `STATUS.md`).
 
 ## Dependency Phase Model
 

@@ -1,6 +1,6 @@
 # ezmon-nocov Plugin Status
 
-**Last Updated**: 2026-03-15
+**Last Updated**: 2026-04-05
 
 ## Trie Removal & xdist Fix (2026-03-14)
 
@@ -161,6 +161,160 @@ This resolves three classes of failures documented in the old approach:
 
 See `docs/checkpoint-import-tracking.md` for the full design reference.
 
+## Schema Simplification (2026-03-15)
+
+Reduced the database from 17 tables to 5. Removed environment partitioning, execution tracking, and the junction-table dependency model. All dependency data is now stored as roaring bitmaps in a single `test_deps` table. See `docs/SCHEMA.md` for the current schema reference.
+
+## DepStore: Unified In-Memory Cache (2026-03-16)
+
+### Problem
+
+At pandas scale (230K tests, ~1000 deps each), the controller made millions of individual DB round-trips for file ID lookups, test ID creation, and checksum comparisons. This caused +190% cold-start overhead (339s vs 117s no-plugin).
+
+### Solution
+
+`DepStore` (`ezmon/dep_store.py`) pre-loads the entire `files`, `tests`, and `test_deps` tables into Python dicts at session start. All lookups become O(1) dict access. New entries INSERT immediately; dirty metadata flushes in batch via `save_batch()`.
+
+### Impact
+
+| Metric | Before DepStore | After DepStore |
+|--------|----------------|----------------|
+| Pandas cold-start overhead | +190% | +123% |
+| Pandas pipeline (68 commits) | Cancelled (+300%) | +49% net |
+| Matplotlib pipeline (15 commits) | 69% savings | 72% savings |
+| Pandas DB write time | ~250s | ~140s |
+
+The DB write bottleneck is solved. Remaining overhead is worker-side import tracing (~60s across 16 workers).
+
+## Fix: Failed Test Persistence in xdist (2026-03-16)
+
+### Bug
+
+In xdist mode, failed tests were never written to the DB with `failed=1`. Workers correctly excluded failed tests from dependency payloads, but the controller's `ensure_tests_batch()` only marked entries dirty in the in-memory DepStore — `save_batch()` was never called afterward, so the SQL `UPDATE tests SET failed = ?` never executed. On the next run, `determine_stable()` didn't re-select them.
+
+### Fix
+
+Added `save_batch([])` call after `ensure_tests_batch()` in `pytest_sessionfinish` to flush dirty test metadata. Removed dead code: workers' `fail` list (always empty since failed tests are filtered before building `unique`), the `failed_idx` reader on the controller side, and the `all_failed` accumulator in `_drain_write_queue`.
+
+### Tests
+
+3 new integration tests in `integration_tests/test_failed_test_reselection.py`:
+- `test_failed_test_reselected_single` — single-process mode
+- `test_failed_test_reselected_xdist` — xdist mode (catches the original bug)
+- `test_fixed_test_deselected` — verifies fixed tests are deselected
+
+## NetDB: Download/Upload SQLite Flow (2026-03-16)
+
+### Problem
+
+The original NetDB integration was a ~900-line RPC class (`ezmon/net_db.py`) mimicking the local DB API over HTTP — one network round-trip per SQL-equivalent call. This didn't scale: pandas-scale sessions made hundreds of thousands of RPC calls and made NetDB-mode runs 5–10× slower than local-mode runs even with a zero-latency LAN server.
+
+### Solution
+
+Replaced with a two-call flow:
+
+1. **Session start**: `GET /api/client/download?repo_id=...&job_id=...` fetches the stored `.testmondata` file to a local path.
+2. **Session body**: runs exactly as in local mode — all operations hit the local SQLite file.
+3. **Session end**: `POST /api/client/upload` replaces the stored file with the modified copy.
+
+The server (`ez-viz` Flask app) is a thin storage layer. It never parses the SQLite and has no schema awareness — the plugin can change its schema without touching the server.
+
+### Benefits
+
+- Eliminated ~900 lines of RPC glue and server-side schema endpoints
+- NetDB-mode performance is now identical to local-mode (minus download/upload latency)
+- Server can be upgraded independently of the plugin
+- Integration tests can write to a real DB file instead of mocking an RPC layer
+
+### Cost
+
+No concurrent access to the same `(repo, job)` DB — "last writer wins" semantics if two jobs run against the same entry simultaneously. For A/B benchmarking this is fine (we partition by `job_id` per platform), but fan-out CI scenarios that need concurrent writers would require a proper server-side merge. Commit `c21ac6e`.
+
+## Race Condition Fix: Snapshot `fromlists` in `_reconcile` (2026-03-17)
+
+### Bug
+
+Pipeline-04 of the matplotlib A/B benchmark surfaced `INTERNALERROR> RuntimeError: Set changed size during iteration` in `dependency_tracker.py:375` on 2 of 3 platforms. The `_reconcile()` method iterates `recording.items()` and nested `fromlists` sets, but the import hook can fire on another thread (pytest-xdist worker setup, test fixture loading) and mutate those collections concurrently.
+
+### Fix
+
+Snapshot the three hot loops with `list(...)`:
+
+- `for key, fromlists in list(recording.items())` — outer loop
+- `for fl in list(fromlists)` — re-export detection loop
+- `for fl in list(fromlists)` — fromlist expansion loop
+
+Commit `8e35af5`. Pipeline-05 through pipeline-11 have been clean since.
+
+## A/B Benchmark Pipeline on Matplotlib (2026-03-16 → ongoing)
+
+### Methodology
+
+A 27-commit sequence on `andreas16700/matplotlib` (tags `pipeline-01` through `pipeline-27`) runs a GitHub Actions workflow that executes the matplotlib test suite both with and without ezmon on 3 platforms in parallel:
+
+- macos-14 / Python 3.11
+- ubuntu-22.04 / Python 3.12
+- ubuntu-24.04-arm / Python 3.12
+
+Each commit dispatches 6 jobs (3 ezmon + 3 vanilla). Ezmon jobs download the previous session's DB at session start and upload the updated DB at session end. Vanilla jobs run the same test set without the plugin for a baseline.
+
+The commits are real matplotlib history — selected from upstream PRs — so the invalidation pattern reflects realistic day-to-day development. Workflow file: `.github/workflows/tests.yml` on the matplotlib fork.
+
+### Infrastructure
+
+- **Plugin source**: `pip install git+https://github.com/andreas16700/pytest-testmon.git@main`
+- **Storage server**: `ezmon.aloiz.ch` (production) — `ez-viz` Flask app with `/api/client/download` and `/api/client/upload` endpoints, backed by a per-`(repo, job)` file store at `ez-viz/testmon_data/<repo-hash>/<job-id>/.testmondata`
+- **Dev server**: `ezmon-dev.aloiz.ch` → `localhost:6133` — same codebase, used during development; retired for this benchmark after pipeline-05 when 502 outages blocked progress
+- **Parsers**: `scripts/parse_ab_results.py` extracts per-job pytest summaries from GHA logs; `scripts/snapshot_db_sizes.py` appends DB size/row counts to `profile/matplotlib/db_sizes.csv`
+- **Trigger**: `gh workflow run "Tests (A/B ezmon benchmark)" --repo andreas16700/matplotlib --ref pipeline-XX`
+
+### Results through pipeline-11
+
+Cold-start (pipeline-01, fresh DB):
+
+| Platform | Ezmon | Vanilla | Delta |
+|---|---|---|---|
+| macos-14 | 7m58s | 6m51s | +16% |
+| ubuntu-22.04 | 12m57s | 11m59s | +8% |
+| ubuntu-24.04-arm | 9m12s | 8m21s | +10% |
+
+Hot cache, small code diff (pipeline-05):
+
+| Platform | Ezmon | Vanilla | Savings |
+|---|---|---|---|
+| macos-14 | 7m03s | 12m04s | -42% |
+| ubuntu-22.04 | 3m58s | 12m55s | -69% |
+| ubuntu-24.04-arm | 6m02s | 10m19s | -42% |
+
+Tiny diff / ~99.97% deselection (pipeline-09 and pipeline-11):
+
+| Pipeline | Platform | Ezmon test time | Tests run |
+|---|---|---|---|
+| p09 | macos-14 | 20s | 227 passed, 2 failed |
+| p09 | ubuntu-22.04 | 22s | 227 passed, 2 failed |
+| p09 | ubuntu-24.04-arm | 16s | 227 passed, 2 failed |
+| p11 | macos-14 | 13s | 2 failed, 2 skipped |
+| p11 | ubuntu-22.04 | 8s | 2 failed, 2 skipped |
+| p11 | ubuntu-24.04-arm | 8s | 2 failed, 2 skipped |
+
+Large-diff pipelines (p07, p10) invalidate most fingerprints and re-run ~100% of tests — ezmon performs the same as vanilla within margin.
+
+### Issues encountered and resolved
+
+| Issue | Surfaced in | Resolution |
+|---|---|---|
+| Failed tests never persisted with `failed=1` in xdist mode | p01–p05 (benchmarking noticed 0 failures on ezmon vs 2 on vanilla) | `save_batch([])` after `ensure_tests_batch` — commit `1eb0405` |
+| `RuntimeError: Set changed size during iteration` in `_reconcile` | p04 | Snapshot `fromlists` with `list(...)` — commit `8e35af5` |
+| Dev server (`ezmon-dev.aloiz.ch`) returned 502 on upload | p06 | Transferred 3 DBs to production server; updated all 21 remaining pipeline tag workflow files via Git Data API to use `ezmon.aloiz.ch` |
+
+### Insights
+
+1. **Hot-cache savings are real and large** — on incremental commits with small diffs, ezmon eliminates 90–99% of test time. Ubuntu-22.04 at pipeline-11 dropped from 11m53s (vanilla) to 4m03s (ezmon).
+2. **Cold-start overhead is small** — matplotlib's ~10K tests add 8–16% overhead on the first run. Roughly 10× better than coverage-based testmon.
+3. **Test selection quality is high** — no false deselections observed. Known-failing tests are correctly re-selected every run after the persistence fix.
+4. **The "savings floor" is GHA job overhead** — pip install, matplotlib build, ccache warming account for ~3–4 minutes even when the test phase is near-zero. Ezmon can't speed these up; they dominate the ezmon-job wall clock on trivial diffs.
+5. **Runner quality varies** — ARM runners occasionally stall for 30+ minutes on environment setup (vanilla/ubuntu-22.04 in pipeline-08 took 2h57m). The per-pipeline median across platforms is more reliable than any single measurement.
+
 ## Historical Fixes
 
 ### Checkpoint Dependency Fix (2026-02-01)
@@ -181,12 +335,33 @@ See `docs/checkpoint-import-tracking.md` for the full design reference.
 
 All historical run data is stored on external drive: `/Volumes/2tb/pandas/run_data/`
 
-## Known Issues
+## Known Limitations
+
+### No file/test version history
+
+The schema stores only the latest state per file and per test. Both tables have a `run_id` column but it is a "last updated by run N" back-reference, not a version pointer. Updates are in place (`UPDATE files SET checksum = ?...`, `INSERT OR REPLACE INTO test_deps`). When a file's AST checksum changes between runs, the previous checksum is overwritten and lost.
+
+This is efficient (storage is bounded by project size, not by history depth) but prevents:
+
+- Debugging "why did test T get reselected between runs X and Y?" — the fingerprint that triggered the selection is gone
+- Analyzing fingerprint churn over time (which files change most often?)
+- Rolling back to a previous session state
+- Cross-run forensics when a test flips between selected and deselected unexpectedly
+
+A proper versioning design will be planned separately.
+
+### Concurrent writers on NetDB
+
+The download/upload flow assumes one writer per `(repo, job)` entry. Two jobs racing against the same server entry have last-writer-wins semantics. Fan-out CI patterns that would need concurrent writers require a server-side merge layer that doesn't exist today.
 
 ### Database Size
 
-The roaring bitmap storage is much more compact than the old junction table approach. On matplotlib (10K tests, avg 53.7 deps): 6.2MB database. At pandas scale (~230K tests) this may be larger but should still be manageable.
+Roaring bitmap storage: matplotlib (10K tests) = 6.2 MB, pandas (230K tests) = 201 MB. The 5-table schema (see `docs/SCHEMA.md`) keeps storage compact. A versioning layer would multiply this by history depth, so any future design needs careful sizing.
+
+### Flaky GHA runners
+
+ARM runners occasionally stall on environment setup for 30+ minutes, producing misleading "ezmon is faster than vanilla by 10×" numbers in individual pipelines. Use per-pipeline medians or trimmed means when reporting.
 
 ### Existing Database Contamination
 
-Databases created before the trie removal contain encoded paths. Delete `.testmondata` and start fresh after upgrading.
+Databases created before the trie removal (pre-2026-03-14) contain encoded paths. Delete `.testmondata` and start fresh after upgrading.
