@@ -32,6 +32,12 @@ def setup_workspace() -> Path:
     workspace = temp_dir / "sample_project"
     shutil.copytree(SAMPLE_PROJECT, workspace)
 
+    # Strip any leftover ezmon state from a previous run that may have
+    # landed in the fixture directory. The test must start from a
+    # genuinely empty ezmon state regardless of local debris.
+    for leftover in workspace.rglob(".testmondata*"):
+        leftover.unlink(missing_ok=True)
+
     # Initialize git
     subprocess.run(["git", "init", "-b", "main"], cwd=workspace, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=workspace, capture_output=True)

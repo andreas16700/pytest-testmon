@@ -2,7 +2,7 @@ import json
 import os
 import sqlite3
 
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from ezmon.common import TestExecutions
 from ezmon.common import get_logger
@@ -14,6 +14,29 @@ DATA_VERSION = 19  # Radical schema simplification: 5 tables, no environment par
 
 class TestmonDbException(Exception):
     pass
+
+
+class IncompatibleDatabaseError(TestmonDbException):
+    """Raised when a .testmondata file cannot be opened safely.
+
+    The plugin never deletes or recreates the file along this error path.
+    The operator must either upgrade pytest-ezmon or move the file aside.
+
+    Raised in three situations:
+
+    1. The file's schema version is **newer** than this plugin supports.
+    2. The file's schema version is older, but **no migration** is
+       registered for the required upgrade path.
+    3. A migration raised an exception. The transaction is rolled back,
+       so the file on disk is byte-identical to its pre-open state.
+    """
+
+
+# Registry of migration callables. MIGRATIONS[K] upgrades a DB from
+# user_version K to K+1. Migrations are plain functions that run SQL on
+# a sqlite3.Connection. They must be idempotent (use CREATE IF NOT
+# EXISTS etc.) so partial applications followed by retry are safe.
+MIGRATIONS: Dict[int, Callable[[sqlite3.Connection], None]] = {}
 
 
 def connect(datafile, readonly=False):
@@ -38,28 +61,145 @@ def connection_options(connection):
     return connection
 
 
-def check_data_version(connection, datafile, data_version):
-    stored_data_version = connection.execute("PRAGMA user_version").fetchone()[0]
+def _apply_migrations(connection, from_version, to_version, datafile):
+    """Run migrations from from_version to to_version inside a single transaction.
 
-    if int(stored_data_version) == data_version:
+    Uses autocommit mode + explicit BEGIN IMMEDIATE/COMMIT/ROLLBACK so the
+    transaction boundaries are deterministic across Python sqlite3 versions.
+    On any failure the transaction is rolled back; the file on disk is
+    byte-identical to its pre-migration state.
+
+    Raises:
+        IncompatibleDatabaseError if a migration is missing. Re-raises any
+        exception from a migration callable; the caller is expected to wrap
+        these in IncompatibleDatabaseError for a uniform error surface.
+    """
+    old_isolation = connection.isolation_level
+    connection.isolation_level = None  # explicit transaction control
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for v in range(from_version, to_version):
+                migrator = MIGRATIONS.get(v)
+                if migrator is None:
+                    raise IncompatibleDatabaseError(
+                        f"{datafile} is at schema version {from_version}, "
+                        f"target is {to_version}, but no migration from "
+                        f"v{v} to v{v + 1} is registered. The file has NOT "
+                        f"been modified. To recover, delete {datafile} "
+                        f"(test dependency data will be rebuilt on next "
+                        f"run) or install a version of pytest-ezmon that "
+                        f"supports schema v{from_version}."
+                    )
+                migrator(connection)
+                connection.execute(f"PRAGMA user_version = {v + 1}")
+            connection.execute("COMMIT")
+        except Exception:
+            # KeyboardInterrupt / SystemExit intentionally not caught —
+            # we do not want to swallow signal-driven shutdowns. The
+            # uncommitted BEGIN IMMEDIATE transaction will be rolled
+            # back by SQLite automatically when the connection closes.
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        connection.isolation_level = old_isolation
+
+
+def check_data_version(connection, datafile, target_version):
+    """Inspect and reconcile the DB's user_version against target_version.
+
+    Returns:
+        (connection, needs_init) where needs_init is True only when the
+        caller should run init_tables() for a freshly-created empty DB.
+        When migrations are applied in place, needs_init is False — the
+        existing data is preserved.
+
+    Raises:
+        IncompatibleDatabaseError if the DB cannot be opened at
+        target_version without data loss. The file on disk is never
+        modified along this error path.
+    """
+    stored = int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    if stored == 0:
+        # Expected to be a brand-new DB. Verify there are no pre-existing
+        # user tables — if there are, the file is corrupt or was edited
+        # out-of-band (user_version got reset but data remained). Refuse
+        # rather than crash inside init_tables() with a raw
+        # "table already exists" error.
+        existing = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        if existing:
+            connection.close()
+            names = sorted(row[0] for row in existing)
+            # Cap the table-name list so the message stays readable on
+            # pathological inputs (e.g. a file with dozens of tables).
+            limit = 10
+            if len(names) > limit:
+                shown = ", ".join(names[:limit])
+                tail = f", ...and {len(names) - limit} more"
+            else:
+                shown = ", ".join(names)
+                tail = ""
+            raise IncompatibleDatabaseError(
+                f"{datafile} has user_version = 0 but already contains "
+                f"{len(existing)} table(s): {shown}{tail}. This usually "
+                f"means the file was corrupted or manually edited. The "
+                f"file has NOT been modified. Delete {datafile} to start "
+                f"fresh, or restore it from a backup."
+            )
+        # Genuine fresh DB. Caller will run init_tables() which sets
+        # user_version to the target.
+        return connection, True
+
+    if stored == target_version:
         return connection, False
 
-    connection.close()
-    os.remove(datafile)
-    connection = connect(datafile)
-    connection = connection_options(connection)
-    return connection, True
+    if stored > target_version:
+        connection.close()
+        raise IncompatibleDatabaseError(
+            f"{datafile} is at schema version {stored}; this plugin only "
+            f"supports up to version {target_version}. The file has NOT "
+            f"been modified. Upgrade pytest-ezmon, or delete {datafile} "
+            f"to start fresh (test dependency data will be rebuilt on "
+            f"next run)."
+        )
+
+    # stored < target_version: apply migrations in sequence
+    logger = get_logger(__name__)
+    logger.info(
+        "Migrating %s from schema v%d to v%d", datafile, stored, target_version
+    )
+    try:
+        _apply_migrations(connection, stored, target_version, datafile)
+    except IncompatibleDatabaseError:
+        connection.close()
+        raise
+    except Exception as exc:
+        connection.close()
+        raise IncompatibleDatabaseError(
+            f"Migration of {datafile} from v{stored} to v{target_version} "
+            f"raised {type(exc).__name__}: {exc}. The file has been rolled "
+            f"back to v{stored} and is unchanged on disk. Report this as "
+            f"a bug if it reproduces on a clean .testmondata file."
+        ) from exc
+
+    return connection, False
 
 
 class DB:  # pylint: disable=too-many-public-methods
     def __init__(self, datafile, readonly=False):
         self._readonly = readonly
         self._closed = False
-        file_exists = os.path.exists(datafile)
         self._logger = get_logger(__name__)
 
         connection = connect(datafile, readonly)
-        connection, old_format = check_data_version(
+        connection, needs_init = check_data_version(
             connection, datafile, self.version_compatibility()
         )
         self.con = connection_options(connection)
@@ -69,7 +209,7 @@ class DB:  # pylint: disable=too-many-public-methods
             except sqlite3.DatabaseError:
                 pass
 
-        if (not file_exists) or old_format:
+        if needs_init:
             self.init_tables()
             self.file_created = True
         else:

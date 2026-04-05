@@ -315,6 +315,39 @@ Large-diff pipelines (p07, p10) invalidate most fingerprints and re-run ~100% of
 4. **The "savings floor" is GHA job overhead** — pip install, matplotlib build, ccache warming account for ~3–4 minutes even when the test phase is near-zero. Ezmon can't speed these up; they dominate the ezmon-job wall clock on trivial diffs.
 5. **Runner quality varies** — ARM runners occasionally stall for 30+ minutes on environment setup (vanilla/ubuntu-22.04 in pipeline-08 took 2h57m). The per-pipeline median across platforms is more reliable than any single measurement.
 
+## Migration Framework (2026-04-05)
+
+### What changed
+
+Replaced the destructive version-mismatch handler in `ezmon/db.py` with a real migration framework. Previously, `check_data_version()` did `os.remove(datafile)` on any `user_version` mismatch — silently destroying the user's DB whenever the plugin's `DATA_VERSION` moved. This blocked any future schema evolution: every bump would have wiped every user's DB. The new framework applies registered migrations in a single `BEGIN IMMEDIATE … COMMIT` transaction and never deletes files.
+
+### New behavior
+
+| Situation | Old behavior | New behavior |
+|---|---|---|
+| Fresh DB (`user_version = 0`, no tables) | `init_tables()` | Same |
+| Fresh DB but tables already exist | Crash with raw `sqlite3 table already exists` | Raise `IncompatibleDatabaseError` with clear message |
+| DB at current version | Open | Open |
+| DB older, migration registered | **`os.remove`, recreate** | Apply migration in place, preserve data |
+| DB older, **no** migration registered | **`os.remove`, recreate** | Raise `IncompatibleDatabaseError`, file untouched |
+| DB newer than plugin | **`os.remove`, recreate** | Raise `IncompatibleDatabaseError`, file untouched |
+| Migration raises mid-stream | N/A | Rollback, file byte-identical to pre-open state |
+
+The exception is `ezmon.db.IncompatibleDatabaseError` (subclass of `TestmonDbException`). Error messages always include the file path, the current and target versions, an explicit "the file has NOT been modified" statement, and actionable recovery instructions.
+
+### Operator guidance for pre-v19 databases
+
+This is a **user-visible behavior change**. Any `.testmondata` file from a pre-v19 plugin version will now fail to open instead of being silently wiped. Recovery is one of:
+
+1. **Delete the file** — `rm .testmondata .testmondata-wal .testmondata-shm` from the project directory. The next pytest run creates a fresh v19 DB and rebuilds dependency data from scratch (one full-selection run, same cost as first-time installation).
+2. **Downgrade pytest-ezmon** to a version that supports the file's schema version. Only useful if downgrade is an option for your workflow.
+
+There is no automatic in-place migration for pre-v19 DBs because the schema between v17/v18 and v19 was collapsed from 17 tables to 5; there is no preserving transform. Subsequent schema bumps (v19 → v20 and later) will ship with real migrations inside this framework.
+
+### Commit
+
+`tests/test_migrations.py` covers 12 cases: fresh init, fresh-but-corrupt (user_version=0 with existing tables), table-list truncation in the corruption error message, matching version no-op, future version refuses, missing migration refuses, missing migration error message is actionable, single and chained successful migrations, rollback on mid-migration exception, rollback on later-migration exception.
+
 ## Historical Fixes
 
 ### Checkpoint Dependency Fix (2026-02-01)
