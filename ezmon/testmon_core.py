@@ -855,12 +855,16 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 packages_str = deps.serialize_external_packages()
                 pending.append((test_id, blob, packages_str))
 
-            # Skip unchanged deps
+            # Skip unchanged deps. Compare BOTH bitmap and external
+            # packages — bitmap-only comparison drops rows where a
+            # package version bump changed `external_packages` but
+            # not the file set, silently losing those updates.
             if ds:
                 pending = [
                     (tid, blob, pkgs)
                     for tid, blob, pkgs in pending
                     if ds.get_existing_blob(tid) != blob
+                    or ds.get_existing_packages(tid) != (pkgs or "")
                 ]
                 ds.save_batch(pending)
             else:
@@ -871,7 +875,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                         pending = [
                             (tid, blob, pkgs)
                             for tid, blob, pkgs in pending
-                            if existing.get(tid) != blob
+                            if existing.get(tid) != (blob, pkgs or "")
                         ]
                 if pending and hasattr(self.db, "save_test_deps_batch"):
                     self.db.save_test_deps_batch(pending)
@@ -980,8 +984,14 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 n_file_ids += len(file_ids)
                 deps = TestDeps.from_file_ids(test_id, file_ids, external_packages)
                 blob = deps.serialize()
-                if blob != ds.get_existing_blob(test_id):
-                    pending.append((test_id, blob, deps.serialize_external_packages()))
+                packages_str = deps.serialize_external_packages()
+                # Both bitmap and packages must match cache to skip —
+                # otherwise a package-version bump with unchanged imports
+                # would be silently dropped.
+                if (blob != ds.get_existing_blob(test_id)
+                        or (packages_str or "")
+                        != ds.get_existing_packages(test_id)):
+                    pending.append((test_id, blob, packages_str))
 
             _tlog("save_raw_batch_write_start", n_pending=len(pending), n_file_ids=n_file_ids)
 

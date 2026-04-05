@@ -2,7 +2,7 @@ import json
 import os
 import sqlite3
 
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from ezmon.common import TestExecutions
 from ezmon.common import get_logger
@@ -715,14 +715,16 @@ class DB:  # pylint: disable=too-many-public-methods
                 batch,
             )
 
-    def get_test_deps_batch(self, test_ids: list) -> Dict[int, bytes]:
-        """Bulk-load existing test_deps blobs for a set of test IDs.
+    def get_test_deps_batch(self, test_ids: list) -> Dict[int, Tuple[bytes, str]]:
+        """Bulk-load existing test_deps (bitmap + external packages).
 
         Args:
             test_ids: List of test IDs to look up
 
         Returns:
-            Dict mapping test_id to file_bitmap blob
+            Dict mapping test_id to (file_bitmap_blob, external_packages_str).
+            external_packages is normalized to "" when NULL so callers can
+            do uniform tuple comparisons against new (blob, pkgs) pairs.
         """
         if not test_ids:
             return {}
@@ -733,11 +735,15 @@ class DB:  # pylint: disable=too-many-public-methods
             chunk = test_ids[i:i + chunk_size]
             placeholders = ",".join("?" * len(chunk))
             cursor = self.con.execute(
-                f"SELECT test_id, file_bitmap FROM test_deps WHERE test_id IN ({placeholders})",
+                f"SELECT test_id, file_bitmap, external_packages "
+                f"FROM test_deps WHERE test_id IN ({placeholders})",
                 chunk,
             )
             for row in cursor:
-                result[row["test_id"]] = bytes(row["file_bitmap"])
+                result[row["test_id"]] = (
+                    bytes(row["file_bitmap"]),
+                    row["external_packages"] or "",
+                )
         return result
 
     def get_test_deps(self, test_id: int) -> Optional[TestDeps]:

@@ -46,6 +46,7 @@ class DepStore:
         self._files: Dict[str, FileEntry] = {}  # path -> FileEntry
         self._tests: Dict[str, TestEntry] = {}  # name -> TestEntry
         self._blobs: Dict[int, bytes] = {}       # test_id -> file_bitmap blob
+        self._packages: Dict[int, str] = {}      # test_id -> external_packages (normalized "")
         self._preload()
 
     def _preload(self):
@@ -74,8 +75,15 @@ class DepStore:
                 run_id=row["run_id"],
             )
 
-        for row in con.execute("SELECT test_id, file_bitmap FROM test_deps"):
-            self._blobs[row["test_id"]] = bytes(row["file_bitmap"])
+        for row in con.execute(
+            "SELECT test_id, file_bitmap, external_packages FROM test_deps"
+        ):
+            test_id = row["test_id"]
+            self._blobs[test_id] = bytes(row["file_bitmap"])
+            # Normalize NULL -> "" so skip-unchanged comparisons don't
+            # treat "no packages cached" and "empty packages list"
+            # differently.
+            self._packages[test_id] = row["external_packages"] or ""
 
         logger.info(
             "DepStore pre-loaded: %d files, %d tests, %d blobs",
@@ -180,6 +188,16 @@ class DepStore:
         """Dict lookup for skip-unchanged check. No DB read."""
         return self._blobs.get(test_id)
 
+    def get_existing_packages(self, test_id: int) -> str:
+        """Dict lookup for skip-unchanged check on external packages.
+
+        Returns the normalized packages string ("" for no packages or
+        unknown test_id). Paired with ``get_existing_blob`` to form a
+        complete test_deps equality check — skipping a write based on
+        bitmap alone drops package-only changes on the floor.
+        """
+        return self._packages.get(test_id, "")
+
     def save_batch(self, pending: List[Tuple[int, bytes, str]]) -> None:
         """Flush dirty tests and write changed test_deps.
 
@@ -214,9 +232,11 @@ class DepStore:
                 " (test_id, file_bitmap, external_packages) VALUES (?, ?, ?)",
                 pending,
             )
-            # Update blob cache
-            for test_id, blob, _pkgs in pending:
+            # Update blob and packages caches so subsequent skip-unchanged
+            # checks in the same session see the just-written state.
+            for test_id, blob, pkgs in pending:
                 self._blobs[test_id] = blob
+                self._packages[test_id] = pkgs or ""
 
     # ---- Read-only accessors (all from cache) ----
 
