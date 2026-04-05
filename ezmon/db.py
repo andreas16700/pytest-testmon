@@ -9,7 +9,7 @@ from ezmon.common import get_logger
 from ezmon.bitmap_deps import TestDeps, find_affected_tests
 
 
-DATA_VERSION = 19  # Radical schema simplification: 5 tables, no environment partitioning
+DATA_VERSION = 20  # v20: empty history tables added alongside v19 schema
 
 
 class TestmonDbException(Exception):
@@ -32,11 +32,83 @@ class IncompatibleDatabaseError(TestmonDbException):
     """
 
 
+# ---- v20 history-table DDL (shared by init_tables and migrations) ----
+#
+# Defined at module scope so `_migrate_19_to_20` (which receives a bare
+# sqlite3 connection, not a DB instance) and `DB.init_tables` can run
+# the same statements without duplication.
+#
+# Stored as a list of individual statements rather than one big script
+# because `sqlite3.Connection.executescript()` issues an implicit
+# COMMIT before running, which breaks the explicit `BEGIN IMMEDIATE …
+# COMMIT` transaction wrapper in `_apply_migrations`. Callers iterate
+# and `execute()` each statement individually inside whatever
+# transaction is active.
+
+_HISTORY_DDL_STATEMENTS: List[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS files_history (
+        file_id    INTEGER NOT NULL,
+        run_id     INTEGER NOT NULL REFERENCES runs(id),
+        path       TEXT    NOT NULL,
+        file_type  TEXT    NOT NULL,
+        checksum   INTEGER,
+        fsha       TEXT,
+        PRIMARY KEY (file_id, run_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS files_history_path_run ON files_history (path, run_id)",
+    "CREATE INDEX IF NOT EXISTS files_history_run ON files_history (run_id)",
+    """
+    CREATE TABLE IF NOT EXISTS tests_failed_history (
+        test_id   INTEGER NOT NULL,
+        run_id    INTEGER NOT NULL REFERENCES runs(id),
+        name      TEXT    NOT NULL,
+        test_file TEXT,
+        failed    INTEGER NOT NULL,
+        PRIMARY KEY (test_id, run_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS tests_failed_history_run ON tests_failed_history (run_id)",
+    """
+    CREATE TABLE IF NOT EXISTS test_deps_history (
+        test_id           INTEGER NOT NULL,
+        run_id            INTEGER NOT NULL REFERENCES runs(id),
+        name              TEXT    NOT NULL,
+        test_file         TEXT,
+        file_bitmap       BLOB,
+        external_packages TEXT,
+        PRIMARY KEY (test_id, run_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS test_deps_history_run ON test_deps_history (run_id)",
+]
+
+
+def _migrate_19_to_20(connection: sqlite3.Connection) -> None:
+    """Upgrade a v19 DB to v20 by adding the history tables.
+
+    Idempotent: uses CREATE TABLE IF NOT EXISTS throughout, so partial
+    applications followed by retry are safe. No existing data is read
+    or modified; the history tables start empty and are populated only
+    by subsequent sessions that run with versioning enabled.
+
+    Uses individual execute() calls instead of executescript() because
+    executescript() implicitly commits any open transaction, which
+    would break the BEGIN IMMEDIATE / ROLLBACK guarantee in
+    _apply_migrations.
+    """
+    for stmt in _HISTORY_DDL_STATEMENTS:
+        connection.execute(stmt)
+
+
 # Registry of migration callables. MIGRATIONS[K] upgrades a DB from
 # user_version K to K+1. Migrations are plain functions that run SQL on
 # a sqlite3.Connection. They must be idempotent (use CREATE IF NOT
 # EXISTS etc.) so partial applications followed by retry are safe.
-MIGRATIONS: Dict[int, Callable[[sqlite3.Connection], None]] = {}
+MIGRATIONS: Dict[int, Callable[[sqlite3.Connection], None]] = {
+    19: _migrate_19_to_20,
+}
 
 
 def connect(datafile, readonly=False):
@@ -444,6 +516,7 @@ class DB:  # pylint: disable=too-many-public-methods
     def init_tables(self):
         connection = self.con
 
+        # Core v19 schema — use executescript for the multi-statement block
         connection.executescript(
             self._create_metadata_statement()
             + self._create_runs_statement()
@@ -451,6 +524,10 @@ class DB:  # pylint: disable=too-many-public-methods
             + self._create_tests_table_statement()
             + self._create_test_deps_table_statement()
         )
+        # v20 history tables — execute individually so this method works
+        # the same way whether or not there's an outer transaction.
+        for stmt in _HISTORY_DDL_STATEMENTS:
+            connection.execute(stmt)
 
         connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
 

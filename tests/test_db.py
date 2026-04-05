@@ -394,13 +394,22 @@ class TestSchemaIntegrity:
         database.con.close()
         os.unlink(db_path)
 
-    def test_only_five_tables_created(self, temp_db):
-        """Schema should only have 5 user tables: metadata, runs, files, tests, test_deps."""
+    def test_eight_tables_created(self, temp_db):
+        """v20 schema: 5 core tables + 3 history tables = 8 user tables."""
         tables = temp_db.con.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()
         table_names = sorted([row[0] for row in tables])
-        assert table_names == ["files", "metadata", "runs", "test_deps", "tests"]
+        assert table_names == [
+            "files",
+            "files_history",
+            "metadata",
+            "runs",
+            "test_deps",
+            "test_deps_history",
+            "tests",
+            "tests_failed_history",
+        ]
 
     def test_metadata_uses_key_value(self, temp_db):
         """Metadata table should use key/value columns."""
@@ -408,7 +417,7 @@ class TestSchemaIntegrity:
         result = temp_db.fetch_attribute("test_key")
         assert result == "test_value"
 
-    def test_data_version_is_19(self, temp_db):
-        """Data version should be 19."""
+    def test_data_version_is_20(self, temp_db):
+        """Data version should be 20 (v20 added empty history tables)."""
         version = temp_db.con.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 19
+        assert version == 20

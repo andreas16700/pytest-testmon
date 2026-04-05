@@ -317,6 +317,194 @@ class TestSuccessfulMigration:
         database.close()
 
 
+class TestV19ToV20:
+    """Schema v20 adds empty history tables alongside the v19 schema.
+
+    These tests pin the migration-framework integration for the real
+    v19 -> v20 upgrade registered in db.MIGRATIONS. The v1 schema PR
+    creates the tables but does not yet write to them — rows only
+    appear once the versioning writers land in a later PR.
+    """
+
+    def test_fresh_v20_db_has_history_tables(self, tmp_db_path):
+        """A freshly initialized DB has all 8 tables at v20."""
+        database = DB(tmp_db_path)
+        assert _read_user_version(tmp_db_path) == 20
+        tables = {
+            row[0]
+            for row in database.con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        # 5 core + 3 history
+        assert "files_history" in tables
+        assert "tests_failed_history" in tables
+        assert "test_deps_history" in tables
+        # History tables start empty
+        for tbl in ("files_history", "tests_failed_history", "test_deps_history"):
+            count = database.con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            assert count == 0
+        database.close()
+
+    def test_v19_db_upgrades_to_v20_in_place(self, tmp_db_path):
+        """An existing v19 DB with data upgrades without losing anything."""
+        # Build a v19-shaped DB by hand: same tables as the v19 schema
+        con = sqlite3.connect(tmp_db_path)
+        con.executescript("""
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                commit_id TEXT,
+                packages TEXT,
+                python_version TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                duration REAL,
+                tests_selected INTEGER DEFAULT 0,
+                tests_deselected INTEGER DEFAULT 0,
+                tests_all INTEGER DEFAULT 0,
+                time_saved REAL DEFAULT 0,
+                time_all REAL DEFAULT 0
+            );
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER REFERENCES runs(id),
+                path TEXT NOT NULL UNIQUE,
+                file_type TEXT DEFAULT 'python' CHECK (file_type IN ('python', 'data')),
+                checksum INTEGER,
+                fsha TEXT
+            );
+            CREATE INDEX files_path ON files (path);
+            CREATE TABLE tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER REFERENCES runs(id),
+                name TEXT NOT NULL UNIQUE,
+                test_file TEXT,
+                duration REAL,
+                failed INTEGER DEFAULT 0
+            );
+            CREATE INDEX tests_name ON tests (name);
+            CREATE TABLE test_deps (
+                test_id INTEGER PRIMARY KEY,
+                file_bitmap BLOB NOT NULL,
+                external_packages TEXT,
+                FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+            );
+        """)
+        # Populate with sentinel rows across every table we care about
+        con.execute(
+            "INSERT INTO runs (commit_id, packages, python_version) VALUES (?, ?, ?)",
+            ("abc123", "pkgs", "3.11"),
+        )
+        con.execute(
+            "INSERT INTO files (path, checksum, fsha) VALUES (?, ?, ?)",
+            ("src/foo.py", 42, "deadbeef"),
+        )
+        con.execute(
+            "INSERT INTO tests (name, test_file, duration, failed) VALUES (?, ?, ?, ?)",
+            ("test_foo::case_1", "src/test_foo.py", 0.5, 1),
+        )
+        con.execute(
+            "INSERT INTO test_deps (test_id, file_bitmap, external_packages) "
+            "VALUES (?, ?, ?)",
+            (1, b"\x00\x01\x02", "numpy"),
+        )
+        con.execute("PRAGMA user_version = 19")
+        con.commit()
+        con.close()
+
+        assert _read_user_version(tmp_db_path) == 19
+
+        # Open with current plugin — migration runs automatically
+        database = DB(tmp_db_path)
+        assert database.file_created is False  # in-place upgrade, not recreation
+        assert _read_user_version(tmp_db_path) == 20
+
+        # Existing data is intact
+        files = database.con.execute(
+            "SELECT path, checksum, fsha FROM files"
+        ).fetchall()
+        assert len(files) == 1
+        assert files[0]["path"] == "src/foo.py"
+        assert files[0]["checksum"] == 42
+        assert files[0]["fsha"] == "deadbeef"
+
+        tests = database.con.execute(
+            "SELECT name, test_file, duration, failed FROM tests"
+        ).fetchall()
+        assert len(tests) == 1
+        assert tests[0]["name"] == "test_foo::case_1"
+        assert tests[0]["failed"] == 1
+
+        deps = database.con.execute(
+            "SELECT test_id, file_bitmap, external_packages FROM test_deps"
+        ).fetchall()
+        assert len(deps) == 1
+        assert bytes(deps[0]["file_bitmap"]) == b"\x00\x01\x02"
+        assert deps[0]["external_packages"] == "numpy"
+
+        # History tables exist but are empty (no backfill in v1)
+        for tbl in ("files_history", "tests_failed_history", "test_deps_history"):
+            count = database.con.execute(
+                f"SELECT COUNT(*) FROM {tbl}"
+            ).fetchone()[0]
+            assert count == 0, f"{tbl} should start empty after migration"
+
+        database.close()
+
+    def test_v19_to_v20_migration_is_idempotent(self, tmp_db_path, monkeypatch):
+        """Running the 19->20 migration twice does not error and adds nothing."""
+        from ezmon.db import _migrate_19_to_20
+
+        # Create a v19 DB
+        con = sqlite3.connect(tmp_db_path)
+        con.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY)")
+        con.execute("PRAGMA user_version = 19")
+        con.commit()
+        con.close()
+
+        # First application
+        con = sqlite3.connect(tmp_db_path)
+        _migrate_19_to_20(con)
+        con.commit()
+        # Second application should be a no-op (CREATE TABLE IF NOT EXISTS)
+        _migrate_19_to_20(con)
+        con.commit()
+
+        # History tables exist and are empty
+        tables = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        assert "files_history" in tables
+        assert "tests_failed_history" in tables
+        assert "test_deps_history" in tables
+        con.close()
+
+    def test_v20_history_tables_have_expected_columns(self, tmp_db_path):
+        """Verify each history table's column set matches the schema doc."""
+        database = DB(tmp_db_path)
+
+        def _columns(table):
+            rows = database.con.execute(f"PRAGMA table_info({table})").fetchall()
+            return sorted(row[1] for row in rows)
+
+        assert _columns("files_history") == sorted([
+            "file_id", "run_id", "path", "file_type", "checksum", "fsha",
+        ])
+        assert _columns("tests_failed_history") == sorted([
+            "test_id", "run_id", "name", "test_file", "failed",
+        ])
+        assert _columns("test_deps_history") == sorted([
+            "test_id", "run_id", "name", "test_file",
+            "file_bitmap", "external_packages",
+        ])
+        database.close()
+
+
 class TestMigrationException:
     def test_exception_during_migration_rolls_back(
         self, tmp_db_path, clean_migrations, monkeypatch
