@@ -246,6 +246,8 @@ class DepStore:
                 name,
                 entry.test_file,
                 -1,
+                entry.duration,
+                entry.forced
             ),
         )
 
@@ -274,6 +276,8 @@ class DepStore:
             name,
             entry.test_file,
             1 if entry.failed else 0,
+            entry.duration,
+            entry.forced
         )
 
     def _maybe_emit_test_deps_history(
@@ -331,8 +335,8 @@ class DepStore:
         if "tests_failed_history" in by_table:
             con.executemany(
                 "INSERT OR REPLACE INTO tests_failed_history "
-                "(test_id, run_id, name, test_file, failed) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(test_id, run_id, name, test_file, failed, duration, forced) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 by_table["tests_failed_history"],
             )
         if "test_deps_history" in by_table:

@@ -66,6 +66,8 @@ _HISTORY_DDL_STATEMENTS: List[str] = [
         name      TEXT    NOT NULL,
         test_file TEXT,
         failed    INTEGER NOT NULL,
+        duration  REAL,
+        forced    INTEGER,
         PRIMARY KEY (test_id, run_id)
     )
     """,

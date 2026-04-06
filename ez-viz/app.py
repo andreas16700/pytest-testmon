@@ -1316,6 +1316,8 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
                     name,
                     failed,
                     test_file,
+                    duration,
+                    forced,
                     ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
                 FROM tests_failed_history
                 WHERE run_id <= ?
@@ -1324,13 +1326,12 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
                 rh.test_id AS id,
                 rh.name,
                 rh.failed,
-                t.duration,
-                t.forced,
+                -- Use COALESCE to prefer the main table, but fall back to history if deleted
+                COALESCE(t.duration, rh.duration) AS duration,
+                COALESCE(t.forced, rh.forced) AS forced,
                 COALESCE(t.test_file, rh.test_file) AS test_file
             FROM RankedHistory rh
-            -- Use LEFT JOIN so we don't lose tests that were deleted in later runs
             LEFT JOIN tests t ON rh.test_id = t.id
-            -- Ensure we only look at the most recent state, and filter out tombstones (-1)
             WHERE rh.rn = 1 AND rh.failed != -1
             ORDER BY rh.name
         """
