@@ -914,21 +914,6 @@ def _open_db_or_404(repo_id: str, job_id: str):
         return None, jsonify({"error": "No data found"}), 404
     return db_path, None, None
 
-@app.route("/api/dependencyGraph/<path:repo_id>/<job_id>/<run_id>", methods=["GET"])
-def retrieve_dependency_graph(repo_id: str, job_id: str, run_id: str):
-    try:
-        db_path = get_job_db_path(repo_id, job_id)
-        job_path = db_path.parent
-        dependency_graph_path = job_path / f"dependency_graph_{run_id}.html"
-
-        if not dependency_graph_path.exists():
-            log.error(f"Graph not found at: {dependency_graph_path}")
-            return {"error": "Graph not found"}, 404
-
-        return send_file(dependency_graph_path)
-    except Exception as e:
-        return {"error": str(e)}, 500
-
 @app.route("/api/repos", methods=["GET"])
 def list_repos():
     metadata = get_metadata()
@@ -1524,16 +1509,51 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
 
-        id_to_path = dict(conn.execute("SELECT id, path FROM files").fetchall())
+        files_query = """
+            WITH RankedFiles AS (
+                SELECT file_id, path, checksum,
+                       ROW_NUMBER() OVER(PARTITION BY file_id ORDER BY run_id DESC) as rn
+                FROM files_history
+                WHERE run_id <= ?
+            )
+            SELECT file_id, path 
+            FROM RankedFiles 
+            WHERE rn = 1 AND checksum IS NOT NULL
+        """
 
-        dep_rows = conn.execute(
-            "SELECT file_bitmap, external_packages FROM test_deps"
-        ).fetchall()
+        id_to_path = dict(
+            (row["file_id"], row["path"])
+            for row in conn.execute(files_query, (run_id,)).fetchall()
+        )
+
+        deps_query = """
+            WITH RankedTests AS (
+                SELECT test_id, failed,
+                       ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
+                FROM tests_failed_history
+                WHERE run_id <= ?
+            ),
+            RankedDeps AS (
+                SELECT test_id, file_bitmap, external_packages,
+                       ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
+                FROM test_deps_history
+                WHERE run_id <= ?
+            )
+            SELECT d.file_bitmap, d.external_packages
+            FROM RankedDeps d
+            JOIN RankedTests t ON d.test_id = t.test_id
+            WHERE d.rn = 1 AND t.rn = 1 AND t.failed != -1
+        """
+
+        dep_rows = conn.execute(deps_query, (run_id, run_id)).fetchall()
 
         file_deps: dict[str, set[str]] = {}
         file_ext_deps: dict[str, set[str]] = {}
 
         for row in dep_rows:
+            if not row["file_bitmap"]:
+                continue
+
             file_ids = _decode_bitmap(row["file_bitmap"])
             paths = [id_to_path.get(i) for i in file_ids]
             paths = [p for p in paths if p]
@@ -1562,7 +1582,10 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: str):
 
     except Exception:
         log_exception("file_dependencies_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read file dependencies"}), 500
+        return jsonify({
+            "error": "Failed to fetch file dependencies from database snapshot",
+            "detail": str(e)
+        }), 500
 
 
 def _get_file_dependencies_legacy(repo_id: str, job_id: str, run_id: int):
