@@ -79,8 +79,6 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
         setIsGenerating(false);
     };
 
-    const isSelectionValid = selectedWorkflow && selectedWorkflow.uses_pytest;
-
     return (
         <div className="selector-bar">
             {/* Repository Selector */}
@@ -209,7 +207,7 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                         )}
                                     </div>
                                     <span className="text-[10px] text-gray-400">
-                                        {new Date(run.created_at).toLocaleString()}
+                                        {new Date(run.created_at).toLocaleString('en-GB')}
                                         {run.repo_run_id && <span className="ml-1 text-gray-500">(GH: {run.repo_run_id})</span>}
                                     </span>
                                 </div>

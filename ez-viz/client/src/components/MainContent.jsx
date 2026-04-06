@@ -63,7 +63,6 @@ function MainContent({
             </div>
         );
     }
-
     const totalTests = allTests.reduce((total, run) => total + (run.tests?.length || 0), 0);
     const totalFiles = allFiles.reduce((total, run) => total + (run.files?.length || 0), 0);
 
@@ -84,6 +83,7 @@ function MainContent({
                         currentRuns={currentRuns}
                         selectedRunId={selectedRunId}
                         setSelectedRunId={setSelectedRunId}
+                        allFiles={allFiles}
                     />
                 )}
 

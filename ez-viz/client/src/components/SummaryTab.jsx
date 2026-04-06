@@ -15,7 +15,14 @@ import { CheckCircle2, ArrowRightLeft, LayoutDashboard, GitCompare } from "lucid
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement);
 
-function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelectedRunId }) {
+const formatDateTime = (dateString) => {
+    if (!dateString) return 'N/A';
+    const [datePart, timePart] = dateString.split(' ');
+    const [year, month, day] = datePart.split('-');
+    return `${day}/${month}/${year} ${timePart || ''}`.trim();
+};
+
+function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelectedRunId, allFiles }) {
     const [activeTab, setActiveTab] = useState('single');
     const [compareRunA, setCompareRunA] = useState(selectedRunId);
     const [compareRunB, setCompareRunB] = useState(currentRuns.find(r => r !== selectedRunId) || currentRuns[0]);
@@ -356,13 +363,13 @@ function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelected
                             />
                             <StatCard
                                 title="Files Tracked"
-                                value={primaryRun.summary.file_count || 0}
+                                value={allFiles.find(f => f.run_id == selectedRunId)?.files?.length || 0}
                                 label="monitored for changes"
                             />
                           
-                               <StatCard
+                            <StatCard
                                 title="Created"
-                                value={primaryRun.summary.create_date || 'N/A'}
+                                value={formatDateTime(primaryRun.summary.create_date)}
                                 smallValue
                             />
                         </div>

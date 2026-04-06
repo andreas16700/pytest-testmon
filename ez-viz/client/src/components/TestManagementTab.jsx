@@ -91,7 +91,6 @@ function TestManagementTab({currentRepo, currentJob, currentRuns, pytestTests}) 
                 ...prioritizedTests.filter(test => alwaysRunTests.includes(test)),
                 ...alwaysRunTests.filter(test => !prioritizedTests.includes(test)),
             ];
-            console.log("always run tests" ,orderedAlwaysRunTests)
             const response = await fetch("/api/client/testPreferences", {
                 method: "POST",
                 headers: {

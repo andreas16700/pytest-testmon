@@ -1228,7 +1228,6 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
             test_count = run_info_row["tests_all"]
             tests_failed = run_info_row["tests_failed"] or 0
             create_date = run_info_row["created_at"]
-    
 
         conn.close()
         log.info("summary_success tests=%s",test_count)

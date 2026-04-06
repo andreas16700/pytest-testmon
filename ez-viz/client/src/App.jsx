@@ -154,12 +154,20 @@ function App() {
         }
     };
 
-    const showTestDetails = (test) => {
-        setModal({
-            open: true,
-            title: test.name,
-            content: <TestDetails currentRepo={currentRepo} test={test} dependencies={[]} externalPackages={[]}/>,
-        });
+    const showTestDetails = async (testId, runId) => {
+        try {
+            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/test/${testId}`, {credentials: "include"});
+            const data = await resp.json();
+
+            setModal({
+                open: true,
+                title: data.test.name,
+                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies} externalPackages={data.external_packages}/>,
+            });
+        } catch (err) {
+            console.error(err);
+            toast.error("Failed to load test details. Please try again later.");
+        }
     };
 
     const showFileDetails = async (filename, runId) => {
