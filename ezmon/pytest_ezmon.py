@@ -594,7 +594,6 @@ def pytest_unconfigure(config):
     if running_as in ("single", "controller"):
         _timing_log(config, "controller_unconfigure_end")
 
-
 class TestmonCollect:
     """Collects test dependencies during test execution.
 
@@ -841,11 +840,6 @@ class TestmonCollect:
         outcome["duration"] += getattr(report, "duration", 0.0) or 0.0
         if report.outcome == "failed":
             outcome["failed"] = True
-            if hasattr(report, "longrepr") and report.longrepr:
-                outcome["longrepr"] = str(report.longrepr)
-                reprcrash = getattr(report.longrepr, "reprcrash", None)
-                if reprcrash:
-                    outcome["error_message"] = reprcrash.message
         if "forced" not in outcome:
             forced_nodeids = getattr(self, "_forced_nodeids", set())
             outcome["forced"] = 1 if report.nodeid in forced_nodeids else 0
@@ -1282,67 +1276,6 @@ class TestmonCollect:
             _flush_timing_logs(timing_dir)
         self.testmon.close()
 
-        if self._running_as in ("single", "controller"):
-            self._write_test_report(session)
-
-    def _write_test_report(self, session):
-        """Build a JSON test report (run + deselected) and write to test-report.json."""
-        select_plugin = session.config.pluginmanager.get_plugin("TestmonSelect")
-        deselected_nodeids = getattr(select_plugin, "_deselected_nodeids", []) if select_plugin else []
-        item_locations = getattr(select_plugin, "_item_locations", {}) if select_plugin else {}
-
-        # Also include tests known to the DB but skipped via pytest_ignore_collect
-        # (entire stable files that never entered collection at all)
-        ran_or_collected = set(self._outcomes.keys()) | {e["nodeid"] for e in deselected_nodeids}
-        nocollect_deselected = [
-            {"nodeid": name, "lineno": None}
-            for name in (self.testmon_data.all_tests or {})
-            if name not in ran_or_collected
-        ]
-        deselected_nodeids = deselected_nodeids + nocollect_deselected
-
-        tests = []
-        for nodeid, outcome in self._outcomes.items():
-            entry = {
-                "nodeid": nodeid,
-                "outcome": "failed" if outcome.get("failed") else "passed",
-                "duration": outcome.get("duration", 0.0),
-            }
-            if nodeid in item_locations:
-                entry["lineno"] = item_locations[nodeid]
-            if outcome.get("longrepr"):
-                entry["longrepr"] = outcome["longrepr"]
-            if outcome.get("error_message"):
-                entry["error_message"] = outcome["error_message"]
-            tests.append(entry)
-        for entry in deselected_nodeids:
-            tests.append({
-                "nodeid": entry["nodeid"],
-                "lineno": entry["lineno"],
-                "outcome": "deselected",
-                "duration": 0.0,
-            })
-
-        summary = {
-            "total": len(tests),
-            "passed": sum(1 for t in tests if t["outcome"] == "passed"),
-            "failed": sum(1 for t in tests if t["outcome"] == "failed"),
-            "deselected": len(deselected_nodeids),
-        }
-        report = {
-            "tests": tests,
-            "summary": summary,
-            "commit_id": os.environ.get("GITHUB_SHA", ""),
-            "repo_id": os.environ.get("GITHUB_REPOSITORY", ""),
-        }
-
-        report_path = "test-report.json"
-        try:
-            with open(report_path, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2)
-            logger.info(f"Test report written to {report_path}")
-        except OSError as e:
-            logger.warning(f"Could not write test report: {e}")
 
     def _handle_worker_output(self, workeroutput, worker_id):
         _timing_log_for_actor("controller", "controller_receive_start", worker_id=worker_id)
@@ -1717,7 +1650,6 @@ class TestmonSelect:
         )
 
         self._interrupted = False
-        self._deselected_nodeids = []
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), config.rootdir.strpath)
@@ -1742,7 +1674,6 @@ class TestmonSelect:
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
         _timing_log(config, "selection_start", item_count=len(items))
-        self._item_locations = {item.nodeid: item.location[1] for item in items}
         always_run_files = getattr(config, "always_run_files", [])
         prioritized_files = getattr(config, "prioritized_files", [])
 
@@ -1827,8 +1758,6 @@ class TestmonSelect:
         selected = forced + prioritized + normal_selected
         self._forced_nodeids = {item.nodeid for item in forced}
 
-
-
         if self.config.testmon_config.select:
             items[:] = selected
             session.config.hook.pytest_deselected(
@@ -1844,10 +1773,6 @@ class TestmonSelect:
             if not no_reorder:
                 sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
-        self._deselected_nodeids = [
-            {"nodeid": item.nodeid, "lineno": item.location[1]}
-            for item in deselected
-        ]
         _timing_log(
             config,
             "selection_end",

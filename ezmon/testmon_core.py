@@ -50,7 +50,6 @@ DB_FILENAME = ".testmondata"
 
 logger = get_logger(__name__)
 
-# comment to trigger dependency installation
 
 def _core_timing_log(event, **fields):
     timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")

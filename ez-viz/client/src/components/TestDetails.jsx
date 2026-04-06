@@ -65,10 +65,6 @@ function TestDetails({ currentRepo, test, dependencies, externalPackages, branch
           <div key={idx} className="dependency-card">
             <div className="dependency-filename">📄 {dep.filename}</div>
             <div className="external-packages">External Packages: {externalPackages.join(", ")}</div>
-            <div className="dependency-meta">
-              <span><span className="font-medium">SHA:</span> {dep.fsha ? dep.fsha.substring(0, 8) : "N/A"}</span>
-              <span><span className="font-medium">Checksum:</span> {dep.checksum}</span>
-            </div>
             {currentRepo && (
               <div className="mt-2">
                 <button
