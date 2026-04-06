@@ -1406,7 +1406,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
         return jsonify({"error": "Failed to read test details"}), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/files", methods=["GET"])
-def get_files(repo_id: str, job_id: str ,run_id:str):
+def get_files(repo_id: str, job_id: str, run_id: str):
     g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
@@ -1416,47 +1416,53 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
     try:
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
+
+        # 1. Fetch the commit_id (optional now, but keeps your payload consistent)
+        run_row = conn.execute(
             "SELECT commit_id FROM runs WHERE id = ?",
             (run_id,)
         ).fetchone()
-        conn.close()
 
-        if not row or not row["commit_id"]:
+        if not run_row or not run_row["commit_id"]:
+            conn.close()
             return jsonify({"error": "No commit found for this run"}), 404
 
-        commit_sha = row["commit_id"]
+        commit_sha = run_row["commit_id"]
 
-    except Exception:
-        log_exception("run_commit_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read run info"}), 500
+        # 2. Time-travel query: Get all files active at this specific run_id
+        # We partition by file_id, order by run_id descending, and take the latest state.
+        # If the latest state's checksum IS NULL, it means the file was deleted, so we exclude it.
+        snapshot_query = """
+            SELECT path
+            FROM (
+                SELECT path, checksum,
+                       ROW_NUMBER() OVER(PARTITION BY file_id ORDER BY run_id DESC) as rn
+                FROM files_history
+                WHERE run_id <= ?
+            )
+            WHERE rn = 1 AND checksum IS NOT NULL
+            ORDER BY path;
+        """
 
-    try:
-        token = session.get("github_token")
-        gh = Github(token) if token else Github()
-        print(f"Repo ID: {repo_id}")
-        repo = gh.get_repo(repo_id)
-        tree = repo.get_git_tree(commit_sha, recursive=True)
+        rows = conn.execute(snapshot_query, (run_id,)).fetchall()
+        conn.close()
 
-        files = [
-            {"path": item.path}
-            for item in tree.tree
-            if item.type == "blob"
-        ]
+        # Format the output to match your old GitHub API response
+        files = [{"path": row["path"]} for row in rows]
 
-        log.info("files_list_success commit=%s count=%s", commit_sha, len(files))
+        # log.info("files_list_success commit=%s count=%s", commit_sha, len(files))
         return jsonify({
             "run_id": run_id,
             "commit_id": commit_sha,
             "files": files
         })
 
-    except GithubException as e:
-        log.warning("github_tree_fetch_failed commit=%s error=%s", commit_sha, e)
-        return jsonify({"error": "Failed to fetch files from GitHub", "detail": str(e)}), 502
-    except Exception:
-        log_exception("github_tree_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to fetch files"}), 500
+    except Exception as e:
+        # log_exception("db_files_snapshot_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({
+            "error": "Failed to fetch files from database snapshot",
+            "detail": str(e)
+        }), 500
 
 
 @app.route( "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>", methods=["GET"])
