@@ -229,6 +229,26 @@ class DepStore:
             ),
         )
 
+    def emit_test_tombstone(self, name: str) -> None:
+        """Queue a tombstone row (-1) to mark a test as deleted."""
+        if not self._versioning_enabled or self._run_id is None:
+            return
+        entry = self._tests.get(name)
+        if entry is None:
+            return
+
+        self._queue_history(
+            "tests_failed_history",
+            pk=(entry.id, self._run_id),
+            values=(
+                entry.id,
+                self._run_id,
+                name,
+                entry.test_file,
+                -1,
+            ),
+        )
+
     def _maybe_emit_test_failed_history(self, name: str) -> None:
         """Queue a tests_failed_history row if the failed flag flipped.
 

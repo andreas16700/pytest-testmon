@@ -500,6 +500,14 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 self.save_test_deps_bitmap(test_executions_fingerprints)
 
         to_delete = list(set(self.all_tests) - collected)
+
+        if self.dep_store and to_delete:
+            for test_name in to_delete:
+                self.dep_store.emit_test_tombstone(test_name)
+            # Force flush the history rows to the DB immediately
+            with self.db.con:
+                self.dep_store._flush_history_ops()
+
         with self.db as database:
             database.delete_test_executions(to_delete)
 

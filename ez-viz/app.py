@@ -1309,14 +1309,13 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
 
-        # Use a CTE with a window function to get the state of the test
-        # at the time of the requested run_id, inheriting from previous runs if skipped.
         query = """
             WITH RankedHistory AS (
                 SELECT 
                     test_id,
                     name,
                     failed,
+                    test_file,
                     ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
                 FROM tests_failed_history
                 WHERE run_id <= ?
@@ -1327,10 +1326,12 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
                 rh.failed,
                 t.duration,
                 t.forced,
-                t.test_file
+                COALESCE(t.test_file, rh.test_file) AS test_file
             FROM RankedHistory rh
-            INNER JOIN tests t ON rh.test_id = t.id
-            WHERE rh.rn = 1
+            -- Use LEFT JOIN so we don't lose tests that were deleted in later runs
+            LEFT JOIN tests t ON rh.test_id = t.id
+            -- Ensure we only look at the most recent state, and filter out tombstones (-1)
+            WHERE rh.rn = 1 AND rh.failed != -1
             ORDER BY rh.name
         """
 
