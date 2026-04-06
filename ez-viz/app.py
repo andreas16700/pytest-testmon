@@ -1309,26 +1309,32 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
 
-        # We now query tests_failed_history to get the point-in-time state.
-        # We join with the main 'tests' table to get metadata (like duration)
-        # that might be stored there, or use COALESCE if duration was added to history.
-        tests = conn.execute(
-            """
-            SELECT
-                h.test_id AS id,
-                h.name,
-                h.failed,
+        # Use a CTE with a window function to get the state of the test
+        # at the time of the requested run_id, inheriting from previous runs if skipped.
+        query = """
+            WITH RankedHistory AS (
+                SELECT 
+                    test_id,
+                    name,
+                    failed,
+                    ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
+                FROM tests_failed_history
+                WHERE run_id <= ?
+            )
+            SELECT 
+                rh.test_id AS id,
+                rh.name,
+                rh.failed,
                 t.duration,
                 t.forced,
                 t.test_file
-            FROM tests_failed_history h
-            LEFT JOIN tests t ON h.test_id = t.id
-            WHERE h.run_id = ?
-            ORDER BY h.name
-            """,
-            (run_id,)
-        ).fetchall()
+            FROM RankedHistory rh
+            INNER JOIN tests t ON rh.test_id = t.id
+            WHERE rh.rn = 1
+            ORDER BY rh.name
+        """
 
+        tests = conn.execute(query, (run_id,)).fetchall()
         conn.close()
 
         return jsonify({
