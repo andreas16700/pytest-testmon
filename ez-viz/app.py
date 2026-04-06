@@ -1309,28 +1309,37 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
 
+        # We now query tests_failed_history to get the point-in-time state.
+        # We join with the main 'tests' table to get metadata (like duration)
+        # that might be stored there, or use COALESCE if duration was added to history.
         tests = conn.execute(
             """
             SELECT
-                t.id,
-                t.name,
+                h.test_id AS id,
+                h.name,
+                h.failed,
                 t.duration,
-                t.failed,
-                t.forced
-            FROM tests t
-            WHERE t.run_id = ?
-            ORDER BY t.name
+                t.forced,
+                t.test_file
+            FROM tests_failed_history h
+            LEFT JOIN tests t ON h.test_id = t.id
+            WHERE h.run_id = ?
+            ORDER BY h.name
             """,
             (run_id,)
         ).fetchall()
-        print(f"Tests {tests}")
+
         conn.close()
 
-        return jsonify({"run_id": run_id, "tests": [dict(test) for test in tests]})
+        return jsonify({
+            "run_id": run_id,
+            "tests": [dict(test) for test in tests],
+            "count": len(tests)
+        })
 
     except Exception:
         log_exception("tests_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read tests"}), 500
+        return jsonify({"error": "Failed to read tests from history"}), 500
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/test/<int:test_id>", methods=["GET"])
 def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
@@ -1417,22 +1426,7 @@ def get_files(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
 
-        # 1. Fetch the commit_id (optional now, but keeps your payload consistent)
-        run_row = conn.execute(
-            "SELECT commit_id FROM runs WHERE id = ?",
-            (run_id,)
-        ).fetchone()
-
-        if not run_row or not run_row["commit_id"]:
-            conn.close()
-            return jsonify({"error": "No commit found for this run"}), 404
-
-        commit_sha = run_row["commit_id"]
-
-        # 2. Time-travel query: Get all files active at this specific run_id
-        # We partition by file_id, order by run_id descending, and take the latest state.
-        # If the latest state's checksum IS NULL, it means the file was deleted, so we exclude it.
-        snapshot_query = """
+        query = """
             SELECT path
             FROM (
                 SELECT path, checksum,
@@ -1444,21 +1438,17 @@ def get_files(repo_id: str, job_id: str, run_id: str):
             ORDER BY path;
         """
 
-        rows = conn.execute(snapshot_query, (run_id,)).fetchall()
+        rows = conn.execute(query, (run_id,)).fetchall()
         conn.close()
 
-        # Format the output to match your old GitHub API response
         files = [{"path": row["path"]} for row in rows]
 
-        # log.info("files_list_success commit=%s count=%s", commit_sha, len(files))
         return jsonify({
             "run_id": run_id,
-            "commit_id": commit_sha,
             "files": files
         })
 
     except Exception as e:
-        # log_exception("db_files_snapshot_query", repo_id=repo_id, job_id=job_id)
         return jsonify({
             "error": "Failed to fetch files from database snapshot",
             "detail": str(e)

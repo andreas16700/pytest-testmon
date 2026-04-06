@@ -23,7 +23,6 @@ function App() {
     const [summary, setSummary] = useState([]);
     const [allTests, setAllTests] = useState([]);
     const [allFiles, setAllFiles] = useState([]);
-    const [allPytestTests, setAllPytestTests] = useState([]);
     const [isPopupWindowOpen, setIsPopupWindowOpen] = useState(false);
     const [workflowFile, setWorkflowFile] = useState("");
     const [originalWorkflowFile, setOriginalWorkflowFile] = useState("");
@@ -57,7 +56,6 @@ function App() {
     useEffect(() => {
         setAllTests([]);
         setAllFiles([]);
-        setAllPytestTests([]);
     }, [currentRepo, currentJob]);
 
     const fetchUser = async () => {
@@ -136,30 +134,14 @@ function App() {
         if (isAdded) {
             try {
                 const lastRunId = currentRuns[currentRuns.length - 1];
-                const repoObj = repos.find(r => r.id === currentRepo);
-                const jobObj = repoObj?.jobs.find(j => j.id == currentJob || j.name == currentJob);
-                const runObj = jobObj?.runs.find(r => r.id == lastRunId);
-                const commitId = runObj?.commit_id;
-                const pytestUrl = commitId
-                    ? `/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests?commit_id=${commitId}`
-                    : `/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests`;
-
-                const [summaryData, testsData, filesData, pytestData] = await Promise.all([
+                const [summaryData, testsData, filesData] = await Promise.all([
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/summary`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/tests`, {credentials: "include"}).then((r) => r.json()),
-                    fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/files`, {credentials: "include"}).then((r) => r.json()),
-                    fetch(pytestUrl, {credentials: "include"}).then((r) => r.ok ? r.json() : null).catch(() => null),
+                    fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/files`, {credentials: "include"}).then((r) => r.json())
                 ]);
                 setSummary((prev) => [...prev, summaryData]);
                 setAllTests((prev) => [...prev, testsData]);
                 setAllFiles((prev) => [...prev, filesData]);
-                if (pytestData?.tests) {
-                    setAllPytestTests((prev) => [...prev, { run_id: lastRunId, tests: pytestData.tests }]);
-                }
-                console.log("Summary", summaryData);
-                console.log("Tests", testsData);
-                console.log("Files", filesData);
-                console.log("PytestTests", pytestData);
                 setActiveTab("summary");
             } catch (err) {
                 setError("Failed to load testmon data: " + err.message);
@@ -251,7 +233,6 @@ function App() {
                                 setSummary={setSummary}
                                 setAllTests={setAllTests}
                                 setAllFiles={setAllFiles}
-                                setAllPytestTests={setAllPytestTests}
                                 selectedRunId={selectedRunId}
                                 setSelectedRunId={setSelectedRunId}
                                 userOtherRepos={userOtherRepos}
@@ -323,7 +304,6 @@ function App() {
                                 summary={summary}
                                 allTests={allTests}
                                 allFiles={allFiles}
-                                pytestTests={allPytestTests}
                                 activeTab={activeTab}
                                 setActiveTab={setActiveTab}
                                 testSearch={testSearch}
@@ -337,6 +317,7 @@ function App() {
                                 currentRuns={currentRuns}
                                 selectedRunId={selectedRunId}
                                 setSelectedRunId={setSelectedRunId}
+                                repos={repos}
                             />
                         </div>
                     )}

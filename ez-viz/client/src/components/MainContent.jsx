@@ -11,7 +11,6 @@ function MainContent({
                          summary,
                          allTests,
                          allFiles,
-                         pytestTests,
                          activeTab,
                          setActiveTab,
                          testSearch,
@@ -25,6 +24,7 @@ function MainContent({
                          currentRuns,
                          selectedRunId,
                          setSelectedRunId,
+                         repos
                      }) {
 
     if (loading) {
@@ -64,9 +64,7 @@ function MainContent({
         );
     }
 
-    const totalTests = pytestTests
-        ? pytestTests.reduce((total, run) => total + (run.tests?.length || 0), 0)
-        : 0;
+    const totalTests = allTests.reduce((total, run) => total + (run.tests?.length || 0), 0);
     const totalFiles = allFiles.reduce((total, run) => total + (run.files?.length || 0), 0);
 
     return (
@@ -91,7 +89,7 @@ function MainContent({
 
                 {activeTab === "tests" && (
                     <TestsTab
-                        pytestTests={pytestTests}
+                        allTests={allTests}
                         search={testSearch}
                         setSearch={setTestSearch}
                         showTestDetails={showTestDetails}
@@ -112,10 +110,9 @@ function MainContent({
 
                 {activeTab === "management" && (
                     <TestManagementTab
+                        repos={repos}
                         currentRepo={currentRepo}
                         currentJob={currentJob}
-                        currentRuns={currentRuns}
-                        pytestTests={pytestTests}
                     />
                 )}
             </main>

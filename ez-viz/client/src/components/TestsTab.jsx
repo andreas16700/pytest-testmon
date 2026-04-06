@@ -1,118 +1,182 @@
-import { useState, useMemo } from "react";
+import React, { useState, useMemo } from "react";
 import TestItem from "./TestItem.jsx";
 import SearchBox from "./SearchBox.jsx";
 
-function TestsTab({ pytestTests, search, setSearch, showTestDetails }) {
+function TestsTab({ allTests, search, setSearch, showTestDetails }) {
   const [sortByStatus, setSortByStatus] = useState(false);
   const [sortByRuntime, setSortByRuntime] = useState(false);
 
   const [statusFilter, setStatusFilter] = useState({
-    passed: true,
     failed: true,
     skipped: true,
+    executed: true,
+    forced: true,
   });
 
-  const toggleStatusFilter = (key) => {
-    setStatusFilter((prev) => ({ ...prev, [key]: !prev[key] }));
+  // The function should be refactored to adapt the new database structure
+  const getStatusKey = (test) => {
+    if (test.failed) return "failed";
+    if (test.forced !== 0 && test.forced !== 1) return "skipped";
+    if (test.forced === 0) return "executed";
+    if (test.forced === 1) return "forced";
+    return "skipped";
   };
 
-  const filterKey = (status) => {
-    if (status === "error") return "failed";
-    if (status === "deselected") return "skipped";
-    return status;
-  };
-
-  const getStatusOrder = (status) => {
-    switch (status) {
+  const getStatusOrder = (test) => {
+    const key = getStatusKey(test);
+    switch (key) {
       case "failed":
-      case "error":      return 0;
+        return 0;
       case "skipped":
-      case "deselected": return 1;
-      case "passed":     return 2;
-      default:           return 99;
+        return 1;
+      case "executed":
+        return 2;
+      case "forced":
+        return 3;
+      default:
+        return 99;
     }
   };
 
-  const tests = useMemo(() => {
-    if (!pytestTests || pytestTests.length === 0) return [];
+  const toggleStatusFilter = (key) => {
+    setStatusFilter((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
 
-    let flat = pytestTests.flatMap(({ run_id, tests: runTests }) =>
-      runTests.map((t) => ({
-        name: t.nodeid,
-        status: t.outcome,
-        duration: t.duration || 0,
-        lineno: t.lineno ?? null,
-        error_message: t.error_message || null,
-        longrepr: t.longrepr || null,
-        run_id,
-      }))
+  const handleSortByStatus = () => {
+    setSortByStatus((prev) => !prev);
+  };
+
+  const handleSortByRuntime = () => {
+    setSortByRuntime((prev) => !prev);
+  };
+
+  const tests = useMemo(() => {
+    let flat = allTests.flatMap((runData) =>
+        runData.tests.map((test) => ({
+          ...test,
+          run_id: runData.run_id,
+        }))
     );
 
-    flat = flat.filter((t) => t.name.toLowerCase().includes(search.toLowerCase()));
-    flat = flat.filter((t) => statusFilter[filterKey(t.status)]);
+    flat = flat.filter((t) =>
+        t.name.toLowerCase().includes(search.toLowerCase())
+    );
+
+    flat = flat.filter((t) => statusFilter[getStatusKey(t)]);
 
     if (sortByStatus && sortByRuntime) {
+      // Sort by status first, then by runtime within each status group
       flat = [...flat].sort((a, b) => {
-        const d = getStatusOrder(a.status) - getStatusOrder(b.status);
-        return d !== 0 ? d : (b.duration || 0) - (a.duration || 0);
+        const statusDiff = getStatusOrder(a) - getStatusOrder(b);
+        if (statusDiff !== 0) return statusDiff;
+        return (b.duration || 0) - (a.duration || 0);
       });
     } else if (sortByStatus) {
-      flat = [...flat].sort((a, b) => getStatusOrder(a.status) - getStatusOrder(b.status));
+      flat = [...flat].sort((a, b) => getStatusOrder(a) - getStatusOrder(b));
     } else if (sortByRuntime) {
       flat = [...flat].sort((a, b) => (b.duration || 0) - (a.duration || 0));
     }
 
     return flat;
-  }, [pytestTests, search, sortByStatus, sortByRuntime, statusFilter]);
+  }, [allTests, search, sortByStatus, sortByRuntime, statusFilter]);
 
   return (
-    <div className="tests-tab-container">
-      <div className="tests-search-wrapper">
-        <SearchBox value={search} onChange={setSearch} placeholder="🔍 Search tests..." />
-      </div>
+      <div className="tests-tab-container">
+        {/* Search Bar TOP */}
+        <div className="tests-search-wrapper">
+          <SearchBox
+              value={search}
+              onChange={setSearch}
+              placeholder="🔍 Search tests..."
+          />
+        </div>
 
-      <div className="tests-controls-bar">
-        <label className="sort-control-label">
-          <input type="checkbox" checked={sortByStatus} onChange={() => setSortByStatus((p) => !p)} className="sort-checkbox-input" />
-          <span className="sort-label-text">Order by status</span>
-        </label>
+        {/* Controls Bar */}
+        <div className="tests-controls-bar">
+          {/* Sort Box */}
+          <label className="sort-control-label">
+            <input
+                type="checkbox"
+                checked={sortByStatus}
+                onChange={handleSortByStatus}
+                className="sort-checkbox-input"
+            />
+            <span className="sort-label-text">Order by status</span>
+          </label>
 
-        <label className="sort-control-label">
-          <input type="checkbox" checked={sortByRuntime} onChange={() => setSortByRuntime((p) => !p)} className="sort-checkbox-input" />
-          <span className="sort-label-text">Order by runtime</span>
-        </label>
+          <label className="sort-control-label">
+            <input
+                type="checkbox"
+                checked={sortByRuntime}
+                onChange={handleSortByRuntime}
+                className="sort-checkbox-input"
+            />
+            <span className="sort-label-text">Order by runtime</span>
+          </label>
 
-        <div className="status-filter-panel">
-          <span className="filter-panel-title">Visible statuses</span>
-          <div className="filter-badges-group">
-            <label className="status-badge-filter status-badge-failed">
-              <input type="checkbox" checked={statusFilter.failed} onChange={() => toggleStatusFilter("failed")} className="filter-checkbox-small" />
-              <span className="font-medium">Failed</span>
-            </label>
+          {/* Status Filters Panel */}
+          <div className="status-filter-panel">
+            <span className="filter-panel-title">Visible statuses</span>
 
-            <label className="status-badge-filter status-badge-skipped">
-              <input type="checkbox" checked={statusFilter.skipped} onChange={() => toggleStatusFilter("skipped")} className="filter-checkbox-small" />
-              <span className="font-medium">Skipped</span>
-            </label>
-            <label className="status-badge-filter status-badge-executed">
-              <input type="checkbox" checked={statusFilter.passed} onChange={() => toggleStatusFilter("passed")} className="filter-checkbox-small" />
-              <span className="font-medium">Passed</span>
-            </label>
+            <div className="filter-badges-group">
+              <label className="status-badge-filter status-badge-failed">
+                <input
+                    type="checkbox"
+                    checked={statusFilter.failed}
+                    onChange={() => toggleStatusFilter("failed")}
+                    className="filter-checkbox-small accent-red-600"
+                />
+                <span className="font-medium">Failed</span>
+              </label>
+
+              <label className="status-badge-filter status-badge-skipped">
+                <input
+                    type="checkbox"
+                    checked={statusFilter.skipped}
+                    onChange={() => toggleStatusFilter("skipped")}
+                    className="filter-checkbox-small accent-yellow-500"
+                />
+                <span className="font-medium">Skipped</span>
+              </label>
+
+              <label className="status-badge-filter status-badge-executed">
+                <input
+                    type="checkbox"
+                    checked={statusFilter.executed}
+                    onChange={() => toggleStatusFilter("executed")}
+                    className="filter-checkbox-small accent-green-600"
+                />
+                <span className="font-medium">Executed</span>
+              </label>
+
+              <label className="status-badge-filter status-badge-forced">
+                <input
+                    type="checkbox"
+                    checked={statusFilter.forced}
+                    onChange={() => toggleStatusFilter("forced")}
+                    className="filter-checkbox-small accent-purple-600"
+                />
+                <span className="font-medium">Forced</span>
+              </label>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div className="test-list-grid">
-        {tests.map((test, idx) => (
-          <TestItem
-            key={`${test.run_id}-${idx}`}
-            runId={test.run_id}
-            test={test}
-            onClick={() => showTestDetails(test)}
-          />
-        ))}
+        {/* Test List */}
+        <div className="test-list-grid">
+          {tests.map((test) => (
+              <TestItem
+                  key={`${test.id}-${test.run_id}`}
+                  runId={test.run_id}
+                  test={test}
+                  onClick={() => showTestDetails(test.id, test.run_id)}
+              />
+          ))}
+        </div>
       </div>
-    </div>
   );
 }
 
