@@ -1205,14 +1205,12 @@ class TestmonCollect:
                 for name, outcome in self._outcomes.items()
                 if outcome.get("failed")
             ]
+            ds = self.testmon_data.dep_store
             if failed_tests_for_db:
-                ds = self.testmon_data.dep_store
                 if ds:
                     ds.ensure_tests_batch(
                         self.testmon_data.run_id, failed_tests_for_db
                     )
-                    with self.testmon_data.db.con:
-                        ds.save_batch([])  # flush dirty test metadata, no deps to write
                 else:
                     for name, test_file, dur, _failed in failed_tests_for_db:
                         self.testmon_data.db.get_or_create_test_id(
@@ -1220,6 +1218,14 @@ class TestmonCollect:
                             test_file=test_file,
                             run_id=self.testmon_data.run_id,
                         )
+            # Always flush once per session so dirty test metadata AND
+            # any queued versioning history rows land in the DB. Without
+            # this unconditional flush, file-change history and tombstones
+            # recorded during determine_stable() would be dropped if no
+            # test deps were written in this session.
+            if ds:
+                with self.testmon_data.db.con:
+                    ds.save_batch([])
             _timing_log(session.config, "controller_save_deps_start")
             duration = time.time() - self._sessionstarttime
             run_stats = self.testmon_data.db.fetch_current_run_stats()

@@ -236,7 +236,10 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.system_packages_change = bool(self.changed_packages)
         self.run_id = self.db.create_run(self.commit_id, system_packages, python_version)
         from ezmon.dep_store import DepStore
-        self.dep_store = DepStore(self.db)
+        # Pass run_id so DepStore's history-capture emits can tag rows
+        # with the active run. versioning_enabled defaults to reading
+        # the EZMON_VERSIONING env var inside DepStore.__init__.
+        self.dep_store = DepStore(self.db, run_id=self.run_id)
         self.files_of_interest = self.dep_store.all_filenames()
 
         self.expected_files_list = []
@@ -589,6 +592,14 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
             if is_deleted:
                 git_affected.add(path)
+                # Emit a NULL-valued history row so point-in-time queries
+                # can distinguish "this file has not been modified since
+                # run N" from "this file was deleted after run N". This
+                # is the only place NULL checksum/fsha rows get written
+                # to files_history; the regular emit path skips NULL
+                # values to avoid looking like tombstones.
+                if ds is not None:
+                    ds.emit_file_tombstone(path)
                 continue
 
             if is_python:
