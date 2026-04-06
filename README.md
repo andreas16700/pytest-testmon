@@ -129,6 +129,59 @@ If `TESTMON_SERVER` points at the ezmon public backend, the plugin stays local a
 - May run more tests than strictly necessary (conservative approach)
  - Only git-tracked non-Python files are tracked
 
+## Version History (opt-in)
+
+Enable change-history tracking to debug test selection decisions and analyze fingerprint churn:
+
+```bash
+# Via environment variable
+EZMON_VERSIONING=1 pytest --ezmon
+
+# Or in pytest.ini / pyproject.toml [tool.pytest.ini_options]
+# ezmon_versioning = true
+```
+
+The env var takes precedence over the ini setting. Default is **off** — zero runtime cost when disabled.
+
+When enabled, every file checksum change, test failure-flag flip, and dependency bitmap change is recorded in append-only history tables alongside the current-state data. Query the history programmatically:
+
+```python
+from ezmon.db import DB
+from ezmon.history import explain_selection, file_churn
+
+db = DB(".testmondata", readonly=True)
+
+# "Why was test_foo selected in run 5?"
+exp = explain_selection(db, "tests/test_foo.py::test_case", run_id=5)
+print(exp.triggering_files)  # ['src/utils.py']
+
+# "Which files change most often?"
+for entry in file_churn(db):
+    print(f"{entry['path']}: {entry['versions']} versions")
+
+db.close()
+```
+
+### Pruning
+
+History grows with each run. Prune old entries to control DB size:
+
+```python
+from ezmon.db import DB
+from ezmon.history import prune_history_before_run
+
+db = DB(".testmondata")
+stats = prune_history_before_run(db, keep_from_run_id=10)
+print(f"Deleted: {stats.files_deleted} file versions, "
+      f"{stats.test_deps_deleted} dep versions")
+db.con.commit()
+db.close()
+```
+
+Recommended retention policies:
+- **CI benchmark DBs**: keep full history (for analysis)
+- **Developer DBs**: prune to last 20 runs periodically
+
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed technical documentation
