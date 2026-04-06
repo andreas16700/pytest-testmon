@@ -452,6 +452,92 @@ class TestV19ToV20:
 
         database.close()
 
+    def test_remote_v20_upgrades_to_v21(self, tmp_db_path):
+        """A remote-variant v20 DB (forced + tests_failed, no history) upgrades.
+
+        This is the exact merge-risk scenario: a teammate's DB at v20 has
+        runs.tests_failed and tests.forced columns but NO history tables.
+        Opening it with our merged code should apply _migrate_20_to_21
+        (adding history tables) and land at v21, preserving all data.
+        """
+        con = sqlite3.connect(tmp_db_path)
+        con.executescript("""
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY,
+                commit_id TEXT,
+                packages TEXT,
+                python_version TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                duration REAL,
+                tests_selected INTEGER DEFAULT 0,
+                tests_deselected INTEGER DEFAULT 0,
+                tests_failed INTEGER DEFAULT 0,
+                tests_all INTEGER DEFAULT 0,
+                time_saved REAL DEFAULT 0,
+                time_all REAL DEFAULT 0
+            );
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER REFERENCES runs(id),
+                path TEXT NOT NULL UNIQUE,
+                file_type TEXT DEFAULT 'python',
+                checksum INTEGER,
+                fsha TEXT
+            );
+            CREATE TABLE tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER REFERENCES runs(id),
+                name TEXT NOT NULL UNIQUE,
+                test_file TEXT,
+                duration REAL,
+                failed INTEGER DEFAULT 0,
+                forced INTEGER DEFAULT NULL
+            );
+            CREATE TABLE test_deps (
+                test_id INTEGER PRIMARY KEY,
+                file_bitmap BLOB NOT NULL,
+                external_packages TEXT,
+                FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+            );
+        """)
+        # Populate with sentinel data including remote-specific columns
+        con.execute(
+            "INSERT INTO runs (commit_id, packages, python_version, tests_failed) "
+            "VALUES ('abc', 'pkgs', '3.11', 2)"
+        )
+        con.execute(
+            "INSERT INTO tests (name, test_file, duration, failed, forced) "
+            "VALUES ('test_x', 'src/test_x.py', 0.5, 1, 1)"
+        )
+        con.execute("PRAGMA user_version = 20")
+        con.commit()
+        con.close()
+
+        assert _read_user_version(tmp_db_path) == 20
+
+        # Open with our merged code — should migrate 20→21
+        database = DB(tmp_db_path)
+        assert database.file_created is False
+        assert _read_user_version(tmp_db_path) == 21
+
+        # Remote-specific data intact
+        run = database.con.execute("SELECT tests_failed FROM runs").fetchone()
+        assert run["tests_failed"] == 2
+        test = database.con.execute(
+            "SELECT failed, forced FROM tests WHERE name = 'test_x'"
+        ).fetchone()
+        assert test["failed"] == 1
+        assert test["forced"] == 1
+
+        # History tables now exist and are empty
+        for tbl in ("files_history", "tests_failed_history", "test_deps_history"):
+            count = database.con.execute(
+                f"SELECT COUNT(*) FROM {tbl}"
+            ).fetchone()[0]
+            assert count == 0
+        database.close()
+
     def test_v19_to_v21_migration_is_idempotent(self, tmp_db_path, monkeypatch):
         """Running the 19->20 migration twice does not error and adds nothing."""
         from ezmon.db import _migrate_19_to_20

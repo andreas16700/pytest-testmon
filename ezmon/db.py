@@ -116,21 +116,26 @@ def _migrate_20_to_21(connection: sqlite3.Connection) -> None:
     executescript() implicitly commits any open transaction, which would
     break the BEGIN IMMEDIATE / ROLLBACK guarantee in _apply_migrations.
     """
-    # Add tests_failed column to runs table (remote's v20 feature)
+    # Add tests_failed column to runs table (remote's v20 feature).
+    # Only swallow "duplicate column name" — any other OperationalError
+    # (no such table, malformed DB, etc.) must propagate so the migration
+    # framework rolls back and raises IncompatibleDatabaseError.
     try:
         connection.execute(
             "ALTER TABLE runs ADD COLUMN tests_failed INTEGER DEFAULT 0"
         )
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
 
     # Add forced column to tests table (remote's v20 feature)
     try:
         connection.execute(
             "ALTER TABLE tests ADD COLUMN forced INTEGER DEFAULT NULL"
         )
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
 
     # Create history tables (our v20 feature) — idempotent via IF NOT EXISTS
     for stmt in _HISTORY_DDL_STATEMENTS:

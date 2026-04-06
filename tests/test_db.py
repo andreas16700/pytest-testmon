@@ -395,7 +395,7 @@ class TestSchemaIntegrity:
         os.unlink(db_path)
 
     def test_eight_tables_created(self, temp_db):
-        """v20 schema: 5 core tables + 3 history tables = 8 user tables."""
+        """v21 schema: 5 core tables + 3 history tables = 8 user tables."""
         tables = temp_db.con.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()
