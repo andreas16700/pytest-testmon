@@ -2,99 +2,86 @@ import React from "react";
 import EnvItem from "./EnvItem.jsx";
 import { formatDuration } from "./utils.jsx";
 
-function TestDetails({ currentRepo, test, dependencies, coverage, branch = "main" }) {
-  // Safety defaults
+function TestDetails({ currentRepo, test, dependencies, externalPackages, branch = "main" }) {
   const deps = dependencies || [];
-  const cov = coverage || {};
 
-  const navigateToGithub = (e, filename, lines) => {
+  const navigateToGithub = (e, filename) => {
     e.stopPropagation();
-    if (!currentRepo || !filename || !lines || lines.length === 0) return;
-
-    const sorted = [...lines].sort((a, b) => a - b);
-    const first = sorted[0];
-    const last = sorted[sorted.length - 1];
-
-    let anchor = `#L${first}`;
-    if (sorted.length > 1 && last !== first) {
-      anchor = `#L${first}-L${last}`;
-    }
-
+    if (!currentRepo || !filename) return;
     const cleanPath = filename.startsWith("./") ? filename.slice(2) : filename;
-    const url = `https://github.com/${currentRepo}/blob/${branch}/${cleanPath}${anchor}`;
-
-    window.open(url, "_blank", "noopener,noreferrer");
+    window.open(`https://github.com/${currentRepo}/blob/${branch}/${cleanPath}`, "_blank", "noopener,noreferrer");
   };
+
+  const status = test?.status
+    ? test.status.charAt(0).toUpperCase() + test.status.slice(1)
+    : test?.failed ? "Failed" : "Executed";
+
+  const testFile = test?.name?.split("::")[0];
+  const ghUrl = currentRepo && testFile
+    ? `https://github.com/${currentRepo}/blob/${branch}/${testFile}${test?.lineno ? `#L${test.lineno + 1}` : ""}`
+    : null;
 
   return (
     <>
-      {/* Status + duration */}
+      {/* Status + Duration */}
       <div className="test-details-env-section">
-        <EnvItem
-          label="Status"
-          value={
-            test?.failed
-              ? "Failed"
-              : test?.forced === 0
-              ? "Executed"
-              : test?.forced === 1
-              ? "Forced"
-              : "Skipped"
-          }
-        />
-
-        <EnvItem
-          label="Duration"
-          value={formatDuration(test?.duration ?? 0)}
-        />
+        <EnvItem label="Status" value={status} />
+        <EnvItem label="Duration" value={formatDuration(test?.duration ?? 0)} />
       </div>
 
-      {/* Dependencies + coverage lines */}
+      {/* Line No + View on GitHub */}
+      {test?.lineno != null && (
+        <div className="test-details-location-row">
+          <span className="test-location-label">Line No:</span>
+          <span className="test-location-value">{test.lineno + 1}</span>
+          {ghUrl && (
+            <a
+              href={ghUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="test-github-link"
+            >
+              View on GitHub ↗
+            </a>
+          )}
+        </div>
+      )}
+
+      {/* Error details */}
+      {test?.error_message && (
+        <div className="test-details-error-section">
+          <h3 className="dependencies-heading">Error</h3>
+          <div className="dependency-card">
+            <pre className="text-sm text-red-600 font-mono whitespace-pre-wrap">{test.longrepr || test.error_message}</pre>
+          </div>
+        </div>
+      )}
+
+      {/* Dependencies */}
       <div className="test-details-dependencies-section">
-        <h3 className="dependencies-heading">
-          Dependencies ({deps.length})
-        </h3>
+        <h3 className="dependencies-heading">Dependencies ({deps.length})</h3>
 
-        {deps.map((dep, idx) => {
-          const linesForFile = cov[dep.filename] || [];
-
-          return (
-            <div key={idx} className="dependency-card">
-              <div className="dependency-filename">📄 {dep.filename}</div>
-
-              <div className="dependency-meta">
-                <span>
-                  SHA: {dep.fsha ? dep.fsha.substring(0, 8) : "N/A"}
-                </span>
-                <span>{dep.checksums?.length ?? 0} blocks</span>
-              </div>
-
-              {/* Covered lines */}
-              <div className="dependency-checksums">
-                {linesForFile.length > 0 ? (
-                  <>Lines: [{linesForFile.join(", ")}]</>
-                ) : (
-                  <span className="text-gray-500">
-                    No coverage lines recorded for this file in this test
-                  </span>
-                )}
-              </div>
-
-              {/* View on GitHub button if we have repo + coverage lines */}
-              {currentRepo && linesForFile.length > 0 && (
-                <div className="mt-2">
-                  <button
-                    type="button"
-                    className="px-3 py-1 text-sm rounded-md border border-blue-500 text-blue-600 hover:bg-blue-50 transition"
-                    onClick={(e) => navigateToGithub(e, dep.filename, linesForFile)}
-                  >
-                    View on GitHub
-                  </button>
-                </div>
-              )}
+        {deps.map((dep, idx) => (
+          <div key={idx} className="dependency-card">
+            <div className="dependency-filename">📄 {dep.filename}</div>
+            <div className="external-packages">External Packages: {externalPackages.join(", ")}</div>
+            <div className="dependency-meta">
+              <span><span className="font-medium">SHA:</span> {dep.fsha ? dep.fsha.substring(0, 8) : "N/A"}</span>
+              <span><span className="font-medium">Checksum:</span> {dep.checksum}</span>
             </div>
-          );
-        })}
+            {currentRepo && (
+              <div className="mt-2">
+                <button
+                  type="button"
+                  className="px-3 py-1 text-sm rounded-md border border-blue-500 text-blue-600 hover:bg-blue-50 transition"
+                  onClick={(e) => navigateToGithub(e, dep.filename)}
+                >
+                  View on GitHub
+                </button>
+              </div>
+            )}
+          </div>
+        ))}
       </div>
     </>
   );

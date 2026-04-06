@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
-    <data-source source="LOCAL" name=".testmondata" uuid="9ba661f1-43d2-40ca-b9d5-754860f0cf48">
+    <data-source source="LOCAL" name=".testmondata" uuid="f4c0ccef-2b2b-4d7c-9668-0b49225353e7">
       <driver-ref>sqlite.xerial</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.sqlite.JDBC</jdbc-driver>
-      <jdbc-url>jdbc:sqlite:$PROJECT_DIR$/ez-viz/testmon_data/95998b0e4981a5c0/emir_job2/.testmondata</jdbc-url>
+      <jdbc-url>jdbc:sqlite:$PROJECT_DIR$/testmon_data/dfc8ee3275f8c104/local-test/.testmondata</jdbc-url>
       <jdbc-additional-properties>
         <property name="com.intellij.clouds.kubernetes.db.enabled" value="false" />
       </jdbc-additional-properties>

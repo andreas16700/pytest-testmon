@@ -44,6 +44,7 @@ class TestEntry:
     duration: Optional[float]
     failed: bool
     run_id: Optional[int]
+    forced: Optional[int] = None
     dirty: bool = False
     # Session baseline for versioning capture. ``None`` on entries
     # created during this session (no previous state) so the first
@@ -121,13 +122,14 @@ class DepStore:
             )
 
         for row in con.execute(
-            "SELECT id, name, test_file, duration, failed, run_id FROM tests"
+            "SELECT id, name, test_file, duration, failed, forced, run_id FROM tests"
         ):
             entry = TestEntry(
                 id=row["id"],
                 test_file=row["test_file"],
                 duration=row["duration"],
                 failed=bool(row["failed"]),
+                forced=row["forced"],
                 run_id=row["run_id"],
                 _base_failed=bool(row["failed"]),
             )
@@ -330,6 +332,7 @@ class DepStore:
         checksum: int = None,
         fsha: str = None,
         file_type: str = "python",
+        run_id: int = None,
     ) -> int:
         """Dict lookup. If new file, INSERT into DB and add to cache. O(1) for known files."""
         entry = self._files.get(path)
@@ -339,8 +342,8 @@ class DepStore:
         # New file -- INSERT into DB immediately
         cursor = self._db.con.cursor()
         cursor.execute(
-            "INSERT INTO files (path, checksum, fsha, file_type) VALUES (?, ?, ?, ?)",
-            (path, checksum, fsha, file_type),
+            "INSERT INTO files (path, checksum, fsha, file_type, run_id) VALUES (?, ?, ?, ?, ?)",
+            (path, checksum, fsha, file_type, run_id),
         )
         file_id = cursor.lastrowid
         # New files have no session baseline; _base_* stays None so the
@@ -351,7 +354,7 @@ class DepStore:
             checksum=checksum,
             fsha=fsha,
             file_type=file_type,
-            run_id=None,
+            run_id=run_id,
             _base_checksum=None,
             _base_fsha=None,
         )
@@ -381,27 +384,28 @@ class DepStore:
         # history after the in-memory updates (or bulk inserts) settle.
         changed_names: List[str] = []
 
-        for name, test_file, duration, failed in tests:
+        for name, test_file, duration, failed, forced in tests:
             entry = self._tests.get(name)
             if entry is not None:
                 entry.test_file = test_file or entry.test_file
                 entry.duration = duration if duration is not None else entry.duration
                 entry.failed = failed
+                entry.forced = forced
                 entry.run_id = run_id
                 entry.dirty = True
                 result[name] = entry.id
                 changed_names.append(name)
             else:
-                new_tests.append((name, test_file, duration, failed))
+                new_tests.append((name, test_file, duration, failed, forced))
 
         if new_tests:
             cursor = self._db.con.cursor()
             cursor.executemany(
-                "INSERT OR IGNORE INTO tests (name, test_file, duration, failed, run_id)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO tests (name, test_file, duration, failed, forced, run_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (n, tf, d, 1 if f else 0, run_id)
-                    for n, tf, d, f in new_tests
+                    (n, tf, d, 1 if f else 0, forced, run_id)
+                    for n, tf, d, f, forced in new_tests
                 ],
             )
 
@@ -412,7 +416,7 @@ class DepStore:
                 chunk = new_names[i : i + chunk_size]
                 placeholders = ",".join("?" * len(chunk))
                 rows = cursor.execute(
-                    f"SELECT id, name, test_file, duration, failed, run_id"
+                    f"SELECT id, name, test_file, duration, failed, forced, run_id"
                     f" FROM tests WHERE name IN ({placeholders})",
                     chunk,
                 ).fetchall()
@@ -425,6 +429,7 @@ class DepStore:
                         test_file=row["test_file"],
                         duration=row["duration"],
                         failed=bool(row["failed"]),
+                        forced=row["forced"],
                         run_id=row["run_id"],
                         _base_failed=None,
                     )
@@ -467,13 +472,13 @@ class DepStore:
 
         # Flush dirty tests
         dirty_tests = [
-            (e.duration, 1 if e.failed else 0, e.test_file, e.run_id, e.id)
+            (e.duration, 1 if e.failed else 0, e.forced, e.test_file, e.run_id, e.id)
             for e in self._tests.values()
             if e.dirty
         ]
         if dirty_tests:
             con.executemany(
-                "UPDATE tests SET duration = COALESCE(?, duration), failed = ?,"
+                "UPDATE tests SET duration = COALESCE(?, duration), failed = ?, forced = ?,"
                 " test_file = COALESCE(?, test_file),"
                 " run_id = COALESCE(?, run_id) WHERE id = ?",
                 dirty_tests,
@@ -552,7 +557,7 @@ class DepStore:
             name: {
                 "duration": e.duration,
                 "failed": e.failed,
-                "forced": None,
+                "forced": e.forced,
             }
             for name, e in self._tests.items()
         }

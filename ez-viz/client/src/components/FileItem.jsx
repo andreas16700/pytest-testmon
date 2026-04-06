@@ -2,15 +2,14 @@ import React from "react";
 import { ExternalLink, Github, Beaker, Fingerprint } from "lucide-react";
 
 function FileItem({ currentRepo, file, runId, onClick, branch = "main" }) {
-    
     // Logic to split path for better styling
-    const pathParts = file.filename.split('/');
+    const pathParts = file.path.split('/');
     const fileName = pathParts.pop();
     const directory = pathParts.join('/');
 
     const navigateToGithub = (e) => {
         e.stopPropagation();
-        const cleanPath = file.filename.startsWith('./') ? file.filename.slice(2) : file.filename;
+        const cleanPath = file.path.startsWith('./') ? file.path.slice(2) : file.path;
         const url = `https://github.com/${currentRepo}/blob/${branch}/${cleanPath}`;
         window.open(url, "_blank", "noopener,noreferrer");
     };
@@ -40,17 +39,19 @@ function FileItem({ currentRepo, file, runId, onClick, branch = "main" }) {
                 </button>
             </div>
 
-            <div className="flex gap-6 pt-1">
-                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
-                    <Beaker size={14} className="text-indigo-500" />
-                    <span>{file.test_count} tests impacted</span>
-                </div>
-                
-                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
-                    <Fingerprint size={14} className="text-purple-500" />
-                    <span>{file.fingerprint_count} fingerprints</span>
-                </div>
-            </div>
+            {/* Will be refactored! */}
+
+            {/*<div className="flex gap-6 pt-1">*/}
+            {/*    <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">*/}
+            {/*        <Beaker size={14} className="text-indigo-500" />*/}
+            {/*        <span>{file.test_count} tests impacted</span>*/}
+            {/*    </div>*/}
+            {/*    */}
+            {/*    <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500">*/}
+            {/*        <Fingerprint size={14} className="text-purple-500" />*/}
+            {/*        <span>{file.fingerprint_count} fingerprints</span>*/}
+            {/*    </div>*/}
+            {/*</div>*/}
         </div>
     );
 }

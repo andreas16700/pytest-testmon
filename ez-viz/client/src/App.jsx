@@ -6,6 +6,7 @@ import MainContent from "./components/MainContent.jsx";
 import TestDetails from "./components/TestDetails.jsx";
 import FileDetails from "./components/FileDetails.jsx";
 import WorkflowFilePopup from "./components/WorkflowFilePopup.jsx";
+import {Toaster, toast} from "react-hot-toast";
 
 function App() {
     const [user, setUser] = useState(null);
@@ -22,6 +23,7 @@ function App() {
     const [summary, setSummary] = useState([]);
     const [allTests, setAllTests] = useState([]);
     const [allFiles, setAllFiles] = useState([]);
+    const [allPytestTests, setAllPytestTests] = useState([]);
     const [isPopupWindowOpen, setIsPopupWindowOpen] = useState(false);
     const [workflowFile, setWorkflowFile] = useState("");
     const [originalWorkflowFile, setOriginalWorkflowFile] = useState("");
@@ -55,6 +57,7 @@ function App() {
     useEffect(() => {
         setAllTests([]);
         setAllFiles([]);
+        setAllPytestTests([]);
     }, [currentRepo, currentJob]);
 
     const fetchUser = async () => {
@@ -96,15 +99,15 @@ function App() {
                 },
                 body: JSON.stringify({content: content}),
             });
-            if (!aiResponse.ok) {
-                throw new Error(`Server error: ${aiResponse.status}`);
-            }
-
             const data = await aiResponse.json();
+            if (!aiResponse.ok) {
+                throw new Error(data.error || `Server error: ${aiResponse.status}`);
+            }
             setWorkflowFile(data.content);
             setIsPopupWindowOpen(true);
         } catch (err) {
             console.error(err);
+            toast.error("The AI service encountered an internal error. Try again later!");
         }
     };
 
@@ -133,14 +136,30 @@ function App() {
         if (isAdded) {
             try {
                 const lastRunId = currentRuns[currentRuns.length - 1];
-                const [summaryData, testsData, filesData] = await Promise.all([
+                const repoObj = repos.find(r => r.id === currentRepo);
+                const jobObj = repoObj?.jobs.find(j => j.id == currentJob || j.name == currentJob);
+                const runObj = jobObj?.runs.find(r => r.id == lastRunId);
+                const commitId = runObj?.commit_id;
+                const pytestUrl = commitId
+                    ? `/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests?commit_id=${commitId}`
+                    : `/api/data/${currentRepo}/${currentJob}/${lastRunId}/pytest-tests`;
+
+                const [summaryData, testsData, filesData, pytestData] = await Promise.all([
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/summary`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/tests`, {credentials: "include"}).then((r) => r.json()),
                     fetch(`/api/data/${currentRepo}/${currentJob}/${lastRunId}/files`, {credentials: "include"}).then((r) => r.json()),
+                    fetch(pytestUrl, {credentials: "include"}).then((r) => r.ok ? r.json() : null).catch(() => null),
                 ]);
                 setSummary((prev) => [...prev, summaryData]);
                 setAllTests((prev) => [...prev, testsData]);
                 setAllFiles((prev) => [...prev, filesData]);
+                if (pytestData?.tests) {
+                    setAllPytestTests((prev) => [...prev, { run_id: lastRunId, tests: pytestData.tests }]);
+                }
+                console.log("Summary", summaryData);
+                console.log("Tests", testsData);
+                console.log("Files", filesData);
+                console.log("PytestTests", pytestData);
                 setActiveTab("summary");
             } catch (err) {
                 setError("Failed to load testmon data: " + err.message);
@@ -153,33 +172,30 @@ function App() {
         }
     };
 
-    const showTestDetails = async (testId, run_id) => {
-        try {
-            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/test/${testId}`, {credentials: "include"});
-            const data = await resp.json();
-
-            setModal({
-                open: true,
-                title: data.test.test_name,
-                content: <TestDetails currentRepo={currentRepo} test={data.test} dependencies={data.dependencies}
-                                      coverage={data.coverage}/>,
-            });
-        } catch (err) {
-            alert("Failed to load test details: " + err.message);
-        }
+    const showTestDetails = (test) => {
+        setModal({
+            open: true,
+            title: test.name,
+            content: <TestDetails currentRepo={currentRepo} test={test} dependencies={[]} externalPackages={[]}/>,
+        });
     };
 
-    const showFileDetails = async (filename, run_id) => {
+    const showFileDetails = async (filename, runId) => {
         try {
-            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${run_id}/fileDetails/${filename}`, {credentials: "include"});
+            const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/fileDetails/${filename}`, {credentials: "include"});
+            if (!resp.ok) {
+                toast.error(`Details for "${filename}" are not available.`);
+                return;
+            }
             const data = await resp.json();
             setModal({
                 open: true,
                 title: filename,
-                content: <FileDetails filename={filename} files={data.files}/>,
+                content: <FileDetails filename={filename} affectedTests={data.affectedTests}/>,
             });
         } catch (err) {
-            alert("Failed to load file details : " + err.message);
+            console.error(err);
+            toast.error("Failed to load file details. Please try again later.");
         }
     };
 
@@ -197,6 +213,7 @@ function App() {
 
     return (
         <div className="app-root-container">
+            <Toaster />
             <Header user={user} handleLogout={handleLogout}/>
 
             <div className="app-main-layout flex h-screen overflow-hidden relative">
@@ -234,6 +251,7 @@ function App() {
                                 setSummary={setSummary}
                                 setAllTests={setAllTests}
                                 setAllFiles={setAllFiles}
+                                setAllPytestTests={setAllPytestTests}
                                 selectedRunId={selectedRunId}
                                 setSelectedRunId={setSelectedRunId}
                                 userOtherRepos={userOtherRepos}
@@ -305,6 +323,7 @@ function App() {
                                 summary={summary}
                                 allTests={allTests}
                                 allFiles={allFiles}
+                                pytestTests={allPytestTests}
                                 activeTab={activeTab}
                                 setActiveTab={setActiveTab}
                                 testSearch={testSearch}
@@ -318,7 +337,6 @@ function App() {
                                 currentRuns={currentRuns}
                                 selectedRunId={selectedRunId}
                                 setSelectedRunId={setSelectedRunId}
-                                repos={repos}
                             />
                         </div>
                     )}

@@ -50,6 +50,7 @@ DB_FILENAME = ".testmondata"
 
 logger = get_logger(__name__)
 
+# comment to trigger dependency installation
 
 def _core_timing_log(event, **fields):
     timing_dir = os.environ.get("EZMON_XDIST_TIMING_LOG_DIR")
@@ -418,9 +419,6 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
             outcome = outcomes.get(context, {"failed": False, "duration": 0.0})
             deps_n_outcomes.update(outcome)
-            deps_n_outcomes["forced"] = context in self.stable_test_names and (
-                context not in self.failing_tests
-            )
             test_executions_fingerprints[context] = deps_n_outcomes
         return test_executions_fingerprints
 
@@ -802,6 +800,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     test_name, test_file,
                     deps_n_outcomes.get("duration"),
                     deps_n_outcomes.get("failed", False),
+                    deps_n_outcomes.get("forced", None),
                 ))
 
             if ds:
@@ -827,13 +826,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
                     if ds:
                         file_id = ds.get_file_id(
-                            filename, checksum=checksum, fsha=fsha, file_type='python'
+                            filename, checksum=checksum, fsha=fsha, file_type='python', run_id=self.run_id
                         )
                     else:
                         file_id = self._file_id_cache.get(filename)
                         if file_id is None:
                             file_id = self.db.get_or_create_file_id(
-                                filename, checksum=checksum, fsha=fsha, file_type='python'
+                                filename, checksum=checksum, fsha=fsha, file_type='python', run_id=self.run_id
                             )
                             if file_id is not None:
                                 self._file_id_cache[filename] = file_id
@@ -848,13 +847,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
 
                     if ds:
                         file_id = ds.get_file_id(
-                            filename, checksum=checksum, fsha=sha, file_type='data'
+                            filename, checksum=checksum, fsha=sha, file_type='data', run_id=self.run_id
                         )
                     else:
                         file_id = self._file_id_cache.get(filename)
                         if file_id is None:
                             file_id = self.db.get_or_create_file_id(
-                                filename, checksum=checksum, fsha=sha, file_type='data'
+                                filename, checksum=checksum, fsha=sha, file_type='data', run_id=self.run_id
                             )
                             if file_id is not None:
                                 self._file_id_cache[filename] = file_id
@@ -966,7 +965,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
             for test_name in nodes_files_lines:
                 outcome = outcomes.get(test_name, {"failed": False, "duration": 0.0})
                 test_file = test_name.split("::")[0] if "::" in test_name else test_name
-                tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False)))
+                tests_for_db.append((test_name, test_file, outcome.get("duration"), outcome.get("failed", False), outcome.get("forced", None)))
 
             _tlog("save_raw_bulk_test_ids_start", n_tests=len(tests_for_db))
             test_id_map = ds.ensure_tests_batch(self.run_id, tests_for_db)

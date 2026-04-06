@@ -32,6 +32,9 @@ from functools import wraps
 import traceback
 from urllib.parse import urlencode
 import array
+import zipfile
+import io
+import re
 from github import Github, GithubException
 
 # Ensure repo root is on sys.path so ezmon modules are importable.
@@ -137,7 +140,7 @@ CORS(
     methods=["GET", "POST", "OPTIONS"],
 )
 
-BASE_DATA_DIR = Path(os.getenv("TESTMON_DATA_DIR", "./testmon_data"))
+BASE_DATA_DIR = Path(os.getenv("TESTMON_DATA_DIR", "../testmon_data"))
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 METADATA_FILE = BASE_DATA_DIR / "metadata.json"
 
@@ -227,6 +230,25 @@ def save_metadata(metadata: Dict):
         )
     except Exception:
         log_exception("metadata_write", path=str(METADATA_FILE))
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def _decode_bitmap(blob) -> set:
+    try:
+        import zstandard as zstd
+        raw = zstd.ZstdDecompressor().decompress(blob)
+    except ImportError:
+        import gzip
+        raw = gzip.decompress(blob)
+
+    try:
+        from pyroaring import BitMap
+        return set(BitMap.deserialize(raw))
+    except ImportError:
+        import pickle
+        return pickle.loads(raw)
 
 # -----------------------------------------------------------------------------
 # Path helpers with logging
@@ -445,7 +467,7 @@ def register_repo_job(repo_id: str, job_id: str, repo_name: Optional[str] = None
 @app.route("/api/ask_ai", methods=["POST"])
 def leverage_ai_model():
     if not OPENAI_AVAILABLE:
-        return jsonify({"error": "OpenAI not available. Install with: pip install openai"}), 503
+        return jsonify({"error": "OpenAI library is not installed on the server. Install with: pip install openai"}), 503
 
     data = request.get_json()
     content = data.get("content")
@@ -453,8 +475,9 @@ def leverage_ai_model():
         return jsonify({"error": "No content provided"}), 400
     api_key = os.getenv("AI_GITHUB_TOKEN")
     if not api_key:
-        print("Error: AI_GITHUB_TOKEN environment variable not set.")
-        return
+        error_message = "Server configuration error: AI_GITHUB_TOKEN is missing."
+        print(f"Error: {error_message}")
+        return jsonify({"error": error_message}), 500
 
     client = OpenAI(
         base_url="https://models.inference.ai.azure.com",
@@ -462,11 +485,45 @@ def leverage_ai_model():
     )
 
     print(f"--- Using {CURRENT_MODEL}")
-
     user_prompt = (
-        "You are an expert GitHub Actions engineer. Update the following workflow file "
-        "to include a step that runs the 'testmon' plugin using the command: 'pytest --ezmon'. "
-        "Return ONLY the updated YAML content. Do not include markdown formatting (```yaml) or explanations.\n\n"
+        "You are an expert GitHub Actions engineer. Update the following workflow file to integrate 'ezmon', "
+        "an improved version of the testmon plugin for intelligent test selection.\n\n"
+
+        "CRITICAL REQUIREMENTS:\n"
+        "1. Add ezmon environment variables at the workflow or job level:\n"
+        "   TESTMON_NET_ENABLED: \"true\"\n"
+        "   TESTMON_SERVER: \"https://ezmon.aloiz.ch\"\n"
+        "   TESTMON_AUTH_TOKEN: ${{ secrets.EZMON_AUTH_TOKEN }}\n"
+        "   REPO_ID: ${{ github.repository }}\n"
+        "   RUN_ID: ${{ github.run_id }}\n\n"
+
+        "2. MANDATORY: Add a step to install the ezmon fork AFTER all other Python dependencies are installed.\n"
+        "   This step must include:\n"
+        "   pip install \"git+https://github.com/andreas16700/pytest-testmon@main\"\n"
+        "   pip install networkx pyvis\n"
+        "   Name this step 'Install ezmon plugin' or similar.\n"
+        "   IMPORTANT: Keep all existing dependency installation commands (requirements.txt, setup.py, etc.)\n\n"
+
+        "3. In the pytest execution step:\n"
+        "   a. Add JOB_ID environment variable: JOB_ID=\"python-${{ matrix.python-version }}-${{ matrix.os }}\"\n"
+        "      (or create a unique identifier combining OS and Python version for non-matrix builds)\n"
+        "   b. Modify the pytest command to use: pytest --ezmon -v\n"
+        "      If there are existing pytest flags, keep them and add --ezmon\n"
+        "   If there's an existing pytest step, update it. If not, add a new step named 'Run tests with ezmon'.\n\n"
+
+        "GUIDELINES:\n"
+        "- Preserve all existing steps and configuration that don't conflict with ezmon\n"
+        "- If the workflow has multiple jobs, apply changes to the primary test job\n"
+        "- Keep existing Python version, OS, and other configurations unchanged\n"
+        "- Maintain the workflow's existing structure and formatting style\n"
+        "- Do not remove any existing environment variables or steps\n"
+        "- For matrix builds with multiple OS/Python combinations, ensure each job gets a unique JOB_ID\n\n"
+
+        "OUTPUT FORMAT:\n"
+        "Return ONLY the complete updated YAML content. Do not include markdown code blocks (```yaml), "
+        "explanations, or comments about what was changed.\n\n"
+
+        "EXISTING WORKFLOW FILE:\n"
         f"{content}"
     )
     print(f"\nConnecting to {CURRENT_MODEL}... \n")
@@ -650,30 +707,29 @@ def get_run_infos(db_path):
         # Get run data with stats from run_infos table
         cursor.execute("""
             SELECT
-                ru.id,
-                ru.repo_run_id,
-                ru.create_date,
-                ri.tests_all,
-                ri.tests_saved,
-                ri.run_time_all,
-                ri.run_time_saved
-            FROM run_uid ru
-            LEFT JOIN run_infos ri ON ru.id = ri.run_uid
-            ORDER BY ru.create_date DESC
+                r.id,
+                r.created_at,
+                r.tests_all,
+                r.tests_selected,
+                r.tests_deselected,
+                r.time_all,
+                r.time_saved,
+                r.commit_id
+            FROM runs r
+            ORDER BY r.created_at DESC
         """)
         rows = cursor.fetchall()
 
-        # Always use internal id for uniqueness (handles matrix jobs with same repo_run_id)
-        # Include repo_run_id for display/reference when available
         runs = [
             {
-                "id": row[0],  # Always use internal id for uniqueness
-                "repo_run_id": row[1],  # External ID for reference (may be shared across matrix jobs)
-                "created": row[2],
-                "tests_total": row[3],  # Total tests in this run
-                "tests_skipped": row[4],  # Tests skipped (saved) by ezmon
-                "time_total": row[5],  # Total test time
-                "time_saved": row[6],  # Time saved by skipping
+                "id": row[0],
+                "created_at": row[1],
+                "tests_all": row[2],
+                "tests_selected": row[3],
+                "tests_deselected": row[4],
+                "time_all": row[5],
+                "time_saved": row[6],
+                "commit_id": row[7],
             }
             for row in rows
         ]
@@ -1154,58 +1210,28 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        env = cursor.execute(
-            """
-            SELECT environment_name, python_version, system_packages
-            FROM environment
-            LIMIT 1;
-        """
-        ).fetchone()
 
-        test_count_row = cursor.execute("SELECT tests_all FROM run_infos Where run_uid = (Select id from run_uid Where repo_run_id=?)", (run_id,)).fetchone()
-        test_count = test_count_row[0] if test_count_row else 0
-        file_count = cursor.execute(
-            "SELECT COUNT(DISTINCT filename) FROM file_fp_infos WHERE run_uid = (Select id from run_uid Where repo_run_id=?) ",
-            (run_id,)
-        ).fetchone()[0]
-       
-        test_savings = cursor.execute(
-            "SELECT tests_saved FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
+        run_info_row = cursor.execute(
+            "SELECT tests_all, tests_deselected, tests_failed, time_saved, time_all, created_at FROM runs WHERE id = ?",
             (run_id,)
         ).fetchone()
-
-        time_savings = cursor.execute(
-            "SELECT run_time_saved FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
-            (run_id,)
-        ).fetchone()
-
-        time_all = cursor.execute(
-            "SELECT run_time_all FROM run_infos WHERE run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)",
-            (run_id,)
-        ).fetchone()
-
-        row = cursor.execute(
-            "SELECT create_date FROM run_uid WHERE repo_run_id = ?",
-            (run_id,)
-        ).fetchone()
-
-        create_date = row[0] if row else None
 
         savings = {}
-        if test_savings and test_savings[0] is not None:
-            savings["tests_saved"] = test_savings[0]
-        if time_savings and time_savings[0] is not None:
-            savings["time_saved"] = time_savings[0]     
-        if time_all and time_all[0] is not None:
-            savings["time_all"] = time_all[0]     
+        if run_info_row:
+            if run_info_row["tests_deselected"] is not None:
+                savings["tests_saved"] = run_info_row["tests_deselected"]
+            if run_info_row["time_saved"] is not None:
+                savings["time_saved"] = run_info_row["time_saved"]
+            if run_info_row["time_all"] is not None:
+                savings["time_all"] = run_info_row["time_all"]
+
+            test_count = run_info_row["tests_all"]
+            tests_failed = run_info_row["tests_failed"] or 0
+            create_date = run_info_row["created_at"]
     
 
         conn.close()
-        log.info(
-            "summary_success tests=%s files=%s",
-            test_count,
-            file_count,
-        )
+        log.info("summary_success tests=%s",test_count)
 
         return jsonify(
             {
@@ -1214,14 +1240,7 @@ def get_summary(repo_id: str, job_id: str, run_id: str):
                 "run_id": run_id,
                 "create_date": create_date,
                 "test_count": test_count,
-                "file_count": file_count,
-                "environment": {
-                    "name": env["environment_name"] if env else "default",
-                    "python_version": env["python_version"] if env else "unknown",
-                    "packages": (env["system_packages"][:100] + "...")
-                    if env and env["system_packages"]
-                    else "",
-                },
+                "tests_failed": tests_failed,
                 "savings": savings,
             }
         )
@@ -1247,36 +1266,30 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
             """
             SELECT
                 CASE 
-                    WHEN instr(te.test_name, '::') > 0 
-                        THEN substr(te.test_name, 1, instr(te.test_name, '::') - 1)
-                    ELSE te.test_name
+                    WHEN instr(t.name, '::') > 0 
+                        THEN substr(t.name, 1, instr(t.name, '::') - 1)
+                    ELSE t.name
                 END AS file_name,
                 COUNT(*) AS test_count,
-                SUM(te.duration) AS total_duration,
-                SUM(CASE WHEN te.failed = 1 THEN 1 ELSE 0 END) AS failed_count,
-                SUM(CASE WHEN te.forced = 1 THEN 1 ELSE 0 END) AS forced_count,
-                COUNT(DISTINCT tef.fingerprint_id) AS dependency_count,
+                SUM(t.duration) AS total_duration,
+                SUM(CASE WHEN t.failed = 1 THEN 1 ELSE 0 END) AS failed_count,
                 GROUP_CONCAT(
                     DISTINCT
                     CASE 
-                        WHEN instr(te.test_name, '::') > 0 
-                            THEN substr(te.test_name, instr(te.test_name, '::') + 2)
+                        WHEN instr(t.name, '::') > 0 
+                            THEN substr(t.name, instr(t.name, '::') + 2)
                         ELSE NULL
                     END
                 ) AS test_methods
-            FROM test_infos te
-            LEFT JOIN test_execution_file_fp_infos tef
-                ON te.id = tef.test_execution_id     
-            WHERE te.run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)                      
+            FROM tests t 
+            WHERE t.run_id = ?                      
             GROUP BY file_name
             ORDER BY file_name;
             """,
             (run_id,),
         ).fetchall()
 
-
         conn.close()
-       
 
         return jsonify({"test_files": [dict(test) for test in test_files]})
 
@@ -1298,30 +1311,20 @@ def get_tests(repo_id: str, job_id: str, run_id: str):
 
         tests = conn.execute(
             """
-            SELECT 
-                te.id,
-                te.test_name,
-                te.duration,
-                te.failed,
-                te.forced,
-                COUNT(DISTINCT tef.fingerprint_id) AS dependency_count
-            FROM test_infos te
-            LEFT JOIN test_execution_file_fp_infos tef 
-                ON te.test_execution_id = tef.test_execution_id
-                AND tef.run_uid = (
-                    SELECT id FROM run_uid WHERE repo_run_id=?
-                )
-            WHERE te.run_uid = (
-                    SELECT id FROM run_uid WHERE repo_run_id=?
-                )
-            GROUP BY te.id, te.test_name, te.duration, te.failed, te.forced
-            ORDER BY te.test_name
+            SELECT
+                t.id,
+                t.name,
+                t.duration,
+                t.failed,
+                t.forced
+            FROM tests t
+            WHERE t.run_id = ?
+            ORDER BY t.name
             """,
-            (run_id, run_id)
-).fetchall()
-
+            (run_id,)
+        ).fetchall()
+        print(f"Tests {tests}")
         conn.close()
-        #log.info("tests_list_success count=%s", len(tests))
 
         return jsonify({"run_id": run_id, "tests": [dict(test) for test in tests]})
 
@@ -1342,83 +1345,61 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
         conn.row_factory = sqlite3.Row
 
         test = conn.execute(
-            "SELECT * FROM test_infos WHERE id = ?", (test_id,)
+            "SELECT * FROM tests WHERE id = ?", (test_id,)
         ).fetchone()
         if not test:
             conn.close()
             log.warning("test_not_found test_id=%s", test_id)
             return jsonify({"error": "Test not found"}), 404
 
-        deps = conn.execute(
-            """
-            SELECT 
-                fp.filename,
-                fp.fsha,
-                fp.method_checksums,
-                fp.mtime
-            FROM test_infos ti
-            JOIN run_uid r
-                ON ti.run_uid = r.id
-            JOIN test_execution_file_fp_infos tef
-                ON tef.test_execution_id = ti.test_execution_id
-            AND tef.run_uid = r.id
-            JOIN file_fp_infos fp
-                ON fp.fingerprint_id = tef.fingerprint_id
-            AND fp.run_uid = r.id
-            WHERE ti.id = ?
-            AND r.repo_run_id = ?
-            """,
-            (test_id, run_id)
-        ).fetchall()
-        coverage_rows = conn.execute(
-            """
-                SELECT filename, lines
-                FROM test_execution_coverage
-                WHERE run_uid=(
-                    Select id
-                    From run_uid
-                    Where repo_run_id=?
-                )
-                AND test_execution_id = (
-                    Select test_execution_id 
-                    From test_infos
-                    WHERE id=? 
-                )
-                
-            """,
-            (run_id,test_id)
-        ).fetchall()
+        dependency_row = conn.execute(
+            "SELECT file_bitmap, external_packages FROM test_deps WHERE test_id = ?",(test_id,)
+        ).fetchone()
 
-        # lines is stored as JSON string, so decode it
-        coverage = {
-            row["filename"]: json.loads(row["lines"])
-            for row in coverage_rows
-        }
+        dependencies = []
+        external_packages = []
 
+        if dependency_row:
+            # Decode the bitmap to get file IDs
+            file_ids = _decode_bitmap(dependency_row["file_bitmap"])
+
+            if file_ids:
+                # Fetch file metadata for all dependency IDs in one query
+                placeholders = ",".join("?" * len(file_ids))
+                ids = [i for i in file_ids]
+                file_rows = conn.execute(
+                    f"SELECT id, path, checksum, fsha, file_type FROM files WHERE id IN ({placeholders})",
+                    ids
+                ).fetchall()
+
+                for f in file_rows:
+                    dependencies.append({
+                        "filename": f["path"],
+                        "fsha": f["fsha"],
+                        "checksum": f["checksum"],
+                        "file_type": f["file_type"],
+                    })
+
+            # Parse external packages string e.g. "pytest,numpy==2.2.1"
+            if dependency_row["external_packages"]:
+                external_packages = [
+                    p.strip()
+                    for p in dependency_row["external_packages"].split(",")
+                    if p.strip()
+                ]
 
         conn.close()
 
-        dependencies = []
-        for dep in deps:
-
-            checksums_arr = array.array("i")
-            checksums_arr.frombytes(dep["method_checksums"])
-            dependencies.append(
-                {
-                    "filename": dep["filename"],
-                    "fsha": dep["fsha"],
-                    "mtime": dep["mtime"],
-                    "checksums": checksums_arr.tolist(),
-                }
-            )
-
-
         return jsonify({
-            "test": dict(test),
+            "test": {
+                "id": test["id"],
+                "name": test["name"],
+                "duration": test["duration"],
+                "failed": test["failed"],
+            },
             "dependencies": dependencies,
-            "coverage": coverage,
+            "external_packages": external_packages
         })
-
 
     except Exception:
         log_exception("test_details_query", repo_id=repo_id, job_id=job_id, test_id=test_id)
@@ -1426,7 +1407,7 @@ def get_test_details(repo_id: str, job_id: str, run_id:str, test_id: int):
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/files", methods=["GET"])
 def get_files(repo_id: str, job_id: str ,run_id:str):
-    g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
+    g.repo_id, g.job_id, g.run_id = repo_id, job_id, run_id
 
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
     if resp:
@@ -1435,41 +1416,51 @@ def get_files(repo_id: str, job_id: str ,run_id:str):
     try:
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
-        files = conn.execute(
-            """
-            SELECT 
-                fpi.filename,
-                COUNT(DISTINCT tefi.test_execution_id) AS test_count,
-                COUNT(DISTINCT fpi.fingerprint_id)     AS fingerprint_count
-            FROM file_fp_infos fpi
-            LEFT JOIN test_execution_file_fp_infos tefi
-                ON  fpi.fingerprint_id = tefi.fingerprint_id
-                AND fpi.run_uid  = tefi.run_uid   
-            WHERE 
-                fpi.run_uid = (SELECT id FROM run_uid WHERE repo_run_id=?)
-            GROUP BY 
-                fpi.filename
-            ORDER BY 
-                fpi.filename
-            """,
+        row = conn.execute(
+            "SELECT commit_id FROM runs WHERE id = ?",
             (run_id,)
-        ).fetchall()
-
+        ).fetchone()
         conn.close()
-        log.info("files_list_success count=%s", len(files))
 
-        return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
+        if not row or not row["commit_id"]:
+            return jsonify({"error": "No commit found for this run"}), 404
+
+        commit_sha = row["commit_id"]
 
     except Exception:
-        log_exception("files_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read files"}), 500
+        log_exception("run_commit_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to read run info"}), 500
+
+    try:
+        token = session.get("github_token")
+        gh = Github(token) if token else Github()
+        print(f"Repo ID: {repo_id}")
+        repo = gh.get_repo(repo_id)
+        tree = repo.get_git_tree(commit_sha, recursive=True)
+
+        files = [
+            {"path": item.path}
+            for item in tree.tree
+            if item.type == "blob"
+        ]
+
+        log.info("files_list_success commit=%s count=%s", commit_sha, len(files))
+        return jsonify({
+            "run_id": run_id,
+            "commit_id": commit_sha,
+            "files": files
+        })
+
+    except GithubException as e:
+        log.warning("github_tree_fetch_failed commit=%s error=%s", commit_sha, e)
+        return jsonify({"error": "Failed to fetch files from GitHub", "detail": str(e)}), 502
+    except Exception:
+        log_exception("github_tree_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to fetch files"}), 500
 
 
-@app.route(
-    "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>",
-    methods=["GET"]
-)
-def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
+@app.route( "/api/data/<path:repo_id>/<job_id>/<run_id>/fileDetails/<path:file_name>", methods=["GET"])
+def get_file_details(repo_id: str, job_id: str, run_id: str, file_name: str):
     g.repo_id, g.job_id , g.run_id = repo_id, job_id ,run_id
 
     db_path, resp, code = _open_db_or_404(repo_id, job_id)
@@ -1479,135 +1470,96 @@ def get_file_details(repo_id: str, job_id: str ,run_id:str , file_name:str):
     try:
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
-        files = conn.execute(
-            """
-            SELECT  tei.test_name , tei.duration , tei.failed , tei.forced 
-            FROM file_fp_infos fpi
-            JOIN test_execution_file_fp_infos tefi
-            ON tefi.fingerprint_id = fpi.fingerprint_id
-            AND tefi.run_uid        = fpi.run_uid
-            JOIN test_infos tei
-            ON tei.test_execution_id      = tefi.test_execution_id
-            AND tei.run_uid = fpi.run_uid
-            WHERE fpi.run_uid  = (SELECT id FROM run_uid WHERE repo_run_id = ?)
-            AND fpi.filename = ?
-            ORDER BY tei.test_name
-            """,
-            (run_id, file_name)
 
-        ).fetchall()
-        conn.close()
-        log.info("files_list_success count=%s", len(files))
-
-        return jsonify({"run_id": run_id, "files": [dict(file) for file in files]})
-
-    except Exception:
-        log_exception("files_query", repo_id=repo_id, job_id=job_id)
-        return jsonify({"error": "Failed to read files"}), 500
-
-
-@app.route("/api/data/<path:repo_id>/<job_id>/<int:run_id>/fileDependencies", methods=["GET"])
-def get_file_dependencies(repo_id: str, job_id: str, run_id: int):
-    """Get file dependency graph for visualization.
-
-    This endpoint now uses the dependency_graph table which contains
-    actual import relationships discovered during test execution,
-    rather than the old "co-files" heuristic approach.
-    """
-    db_path, resp, code = _open_db_or_404(repo_id, job_id)
-    if resp:
-        return resp, code
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    # Get the run_uid for this run_id
-    # First try repo_run_id (external CI run ID), then try direct id match
-    # (for local runs without external IDs)
-    run_uid_row = cur.execute(
-        "SELECT id FROM run_uid WHERE repo_run_id = ?", (run_id,)
-    ).fetchone()
-
-    # If not found by repo_run_id, try direct id match
-    if not run_uid_row:
-        run_uid_row = cur.execute(
-            "SELECT id FROM run_uid WHERE id = ?", (run_id,)
+        file = conn.execute(
+            "SELECT * FROM files WHERE path = ?", (file_name,)
         ).fetchone()
 
-    # If still not found, fall back to latest
-    if not run_uid_row:
-        run_uid_row = cur.execute("SELECT MAX(id) as id FROM run_uid").fetchone()
+        if not file:
+            conn.close()
+            log.warning("file_not_found file_name=%s", file_name)
+            return jsonify({"error": "File not found"}), 404
 
-    if not run_uid_row or not run_uid_row["id"]:
+        dependency_rows = conn.execute(
+            "SELECT test_id, file_bitmap FROM test_deps"
+        ).fetchall()
+
+        affected_tests = []
+        for row in dependency_rows:
+            file_ids = _decode_bitmap(row["file_bitmap"])
+            if file["id"] in file_ids:
+                test_id = row["test_id"]
+                test_info = conn.execute(
+                    "SELECT name, duration, failed FROM tests WHERE id = ?",
+                    (test_id,)
+                ).fetchone()
+                if test_info:
+                    log.info("file_test_dependency file_name=%s test_name=%s", file_name, test_info["name"])
+                    affected_tests.append({
+                        "testId": test_id,
+                        "testName": test_info["name"],
+                        "duration": test_info["duration"],
+                        "failed": test_info["failed"],
+                    })
+
         conn.close()
-        return jsonify({"run_id": run_id, "files": []})
 
-    run_uid = run_uid_row["id"]
+        return jsonify({"affectedTests": affected_tests})
 
-    # Check if dependency_graph table exists
-    table_exists = cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='dependency_graph'"
-    ).fetchone()
+    except Exception:
+        log_exception("file_tests_dependency_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to retrieve affected tests"}), 500
 
-    if not table_exists:
-        # Fall back to old co-files approach if new table doesn't exist
+
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/fileDependencies", methods=["GET"])
+def get_file_dependencies(repo_id: str, job_id: str, run_id: str):
+    db_path, resp, code = _open_db_or_404(repo_id, job_id)
+    if resp:
+        return resp, code
+
+    try:
+        conn = get_db_connection(db_path, readonly=True)
+        conn.row_factory = sqlite3.Row
+
+        id_to_path = dict(conn.execute("SELECT id, path FROM files").fetchall())
+
+        dep_rows = conn.execute(
+            "SELECT file_bitmap, external_packages FROM test_deps"
+        ).fetchall()
+
+        file_deps: dict[str, set[str]] = {}
+        file_ext_deps: dict[str, set[str]] = {}
+
+        for row in dep_rows:
+            file_ids = _decode_bitmap(row["file_bitmap"])
+            paths = [id_to_path.get(i) for i in file_ids]
+            paths = [p for p in paths if p]
+
+            for path in paths:
+                file_deps.setdefault(path, set()).update(p for p in paths if p != path)
+
+            if row["external_packages"]:
+                pkgs = [p.strip() for p in row["external_packages"].split(",") if p.strip()]
+                for path in paths:
+                    file_ext_deps.setdefault(path, set()).update(pkgs)
+
         conn.close()
-        return _get_file_dependencies_legacy(repo_id, job_id, run_id)
 
-    # Query the dependency_graph table for actual import relationships
-    deps_map = {}
-    external_deps_map = {}
+        return jsonify({
+            "run_id": run_id,
+            "files": [
+                {
+                    "filename": filename,
+                    "dependencies": sorted(deps),
+                    "external_dependencies": sorted(file_ext_deps.get(filename, set())),
+                }
+                for filename, deps in sorted(file_deps.items())
+            ]
+        })
 
-    cur.execute(
-        """SELECT source_file, target_file, target_package, edge_type
-           FROM dependency_graph
-           WHERE run_uid = ?
-           ORDER BY source_file, target_file, target_package""",
-        (run_uid,),
-    )
-
-    rows = cur.fetchall()
-
-    # If dependency_graph table exists but has no data for this run,
-    # fall back to legacy approach (for runs before graph collection was added)
-    if not rows:
-        conn.close()
-        return _get_file_dependencies_legacy(repo_id, job_id, run_id)
-
-    for row in rows:
-        source = row["source_file"]
-        edge_type = row["edge_type"]
-
-        if source not in deps_map:
-            deps_map[source] = set()
-        if source not in external_deps_map:
-            external_deps_map[source] = set()
-
-        if edge_type == "local" and row["target_file"]:
-            deps_map[source].add(row["target_file"])
-            # Also ensure target file appears in deps_map
-            if row["target_file"] not in deps_map:
-                deps_map[row["target_file"]] = set()
-        elif edge_type == "external" and row["target_package"]:
-            external_deps_map[source].add(row["target_package"])
-
-    conn.close()
-
-    # Build final JSON in the shape the React graph expects
-    files_list = [
-        {
-            "filename": filename,
-            "dependencies": sorted(list(deps)),
-            "external_dependencies": sorted(list(external_deps_map.get(filename, set()))),
-        }
-        for filename, deps in sorted(deps_map.items())
-    ]
-
-    return jsonify({
-        "run_id": run_id,
-        "run_uid": run_uid,
-        "files": files_list
-    })
+    except Exception:
+        log_exception("file_dependencies_query", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Failed to read file dependencies"}), 500
 
 
 def _get_file_dependencies_legacy(repo_id: str, job_id: str, run_id: int):
@@ -1716,8 +1668,8 @@ def upload_test_preferences():
     always_run_tests = data.get("alwaysRunTests", [])  # Array of test file names
     prioritized_tests = data.get("prioritizedTests", [])  # Array of test file names
     
-    log.info("Always run tests", always_run_tests)
-    log.info("Prioritized tests", prioritized_tests)
+    log.info("Always run tests %s", always_run_tests)
+    log.info("Prioritized tests %s", prioritized_tests)
     # Enrich per-request context for logging
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
@@ -1962,12 +1914,7 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
         tests = data.get("tests", [])
 
         # Calculate additional metrics
-        total_duration = sum(
-            t.get("setup", {}).get("duration", 0) +
-            t.get("call", {}).get("duration", 0) +
-            t.get("teardown", {}).get("duration", 0)
-            for t in tests
-        )
+        total_duration = sum(_parse_test_duration(t) for t in tests)
 
         # Group tests by file
         test_files = {}
@@ -1987,8 +1934,8 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
             {
                 "nodeid": t.get("nodeid"),
                 "lineno": t.get("lineno"),
-                "message": t.get("call", {}).get("crash", {}).get("message"),
-                "longrepr": t.get("call", {}).get("longrepr"),
+                "message": t.get("error_message") or t.get("call", {}).get("crash", {}).get("message"),
+                "longrepr": t.get("longrepr") or t.get("call", {}).get("longrepr"),
             }
             for t in tests if t.get("outcome") == "failed"
         ]
@@ -2021,36 +1968,175 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
         return jsonify({"error": "Failed to read pytest summary"}), 500
 
 
-@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-tests", methods=["GET"])
-def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
-    """Get all tests from pytest JSON report"""
-    g.repo_id, g.job_id = repo_id, job_id
+def _gh_headers():
+    """Build GitHub API headers using the session token if available."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = session.get("github_token") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
-    report_path = get_pytest_report_path(repo_id, job_id, run_id)
 
-    if not report_path.exists():
-        log.warning("pytest_tests_not_found path=%s", report_path)
-        return jsonify({"error": "Report not found"}), 404
+def _get_commit_sha_for_run(db_path, run_id: str) -> Optional[str]:
+    """Look up commit_id from the testmon DB for a given run_id."""
+    try:
+        con = sqlite3.connect(str(db_path))
+        row = con.execute(
+            "SELECT commit_id FROM runs WHERE id = ? LIMIT 1", (run_id,)
+        ).fetchone()
+        con.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _parse_test_duration(t: dict) -> float:
+    """Return test duration, supporting both flat and pytest-json-report nested formats."""
+    flat = t.get("duration")
+    if flat is not None:
+        return float(flat)
+    return (
+        t.get("setup", {}).get("duration", 0) +
+        t.get("call", {}).get("duration", 0) +
+        t.get("teardown", {}).get("duration", 0)
+    )
+
+
+def _download_artifact_from_run(repo_id: str, gh_run_id: int, headers: dict) -> Optional[dict]:
+    """Find and download the test-report artifact from a specific GitHub Actions run ID."""
+    artifacts_url = f"https://api.github.com/repos/{repo_id}/actions/runs/{gh_run_id}/artifacts"
+    art_resp = requests.get(artifacts_url, headers=headers, timeout=15)
+    if not art_resp.ok:
+        return None
+    artifacts = art_resp.json().get("artifacts", [])
+    artifact = next((a for a in artifacts if "test-report" in a["name"]), None)
+    if not artifact:
+        log.warning("gh_artifact_not_found repo=%s gh_run_id=%s", repo_id, gh_run_id)
+        return None
+
+    zip_url = f"https://api.github.com/repos/{repo_id}/actions/artifacts/{artifact['id']}/zip"
+    zip_resp = requests.get(zip_url, headers=headers, timeout=30)
+    zip_resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+        json_file = next((n for n in zf.namelist() if n.endswith(".json")), None)
+        if not json_file:
+            return None
+        with zf.open(json_file) as f:
+            data = json.load(f)
+    log.info("gh_artifact_fetched repo=%s gh_run_id=%s artifact=%s", repo_id, gh_run_id, artifact["name"])
+    return data
+
+
+def _fetch_pytest_report_from_github(repo_id: str, commit_sha: str) -> Optional[dict]:
+    """Fetch pytest JSON report artifact from GitHub Actions for a given commit SHA."""
+    try:
+        headers = _gh_headers()
+
+        runs_url = f"https://api.github.com/repos/{repo_id}/actions/runs?head_sha={commit_sha}"
+        runs_resp = requests.get(runs_url, headers=headers, timeout=15)
+        runs_resp.raise_for_status()
+        workflow_runs = runs_resp.json().get("workflow_runs", [])
+        if not workflow_runs:
+            log.warning("gh_artifact_no_runs repo=%s sha=%s", repo_id, commit_sha)
+            return None
+
+        for run in workflow_runs:
+            data = _download_artifact_from_run(repo_id, run["id"], headers)
+            if data:
+                return data
+
+        log.warning("gh_artifact_not_found repo=%s sha=%s", repo_id, commit_sha)
+        return None
+
+    except Exception:
+        log_exception("gh_artifact_fetch", repo_id=repo_id, commit_sha=commit_sha)
+        return None
+
+
+@app.route("/api/pytest-tests-from-url", methods=["GET"])
+def get_pytest_tests_from_url():
+    """Fetch pytest test report directly from a GitHub Actions URL.
+    Query param: url = https://github.com/{owner}/{repo}/actions/runs/{run_id}[/job/{job_id}]
+    """
+    gh_url = request.args.get("url")
+    if not gh_url:
+        return jsonify({"error": "url param required"}), 400
+
+    match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", gh_url)
+    if not match:
+        return jsonify({"error": "Could not parse GitHub Actions URL"}), 400
+
+    repo_id = match.group(1)
+    gh_run_id = int(match.group(2))
 
     try:
-        with open(report_path, "r") as f:
-            data = json.load(f)
+        data = _download_artifact_from_run(repo_id, gh_run_id, _gh_headers())
+        if not data:
+            return jsonify({"error": "No test-report artifact found"}), 404
 
         tests = []
         for t in data.get("tests", []):
-            test_duration = (
-                t.get("setup", {}).get("duration", 0) +
-                t.get("call", {}).get("duration", 0) +
-                t.get("teardown", {}).get("duration", 0)
-            )
+            outcome = t.get("outcome")
+            duration = _parse_test_duration(t)
             tests.append({
                 "nodeid": t.get("nodeid"),
                 "lineno": t.get("lineno"),
-                "outcome": t.get("outcome"),
-                "duration": test_duration,
-                "keywords": t.get("keywords", []),
-                "failed": t.get("outcome") == "failed",
-                "error_message": t.get("call", {}).get("crash", {}).get("message") if t.get("outcome") == "failed" else None,
+                "outcome": outcome,
+                "duration": duration,
+                "error_message": (t.get("error_message") or t.get("call", {}).get("crash", {}).get("message")) if outcome == "failed" else None,
+                "longrepr": (t.get("longrepr") or t.get("call", {}).get("longrepr")) if outcome == "failed" else None,
+            })
+
+        log.info("pytest_tests_from_url repo=%s gh_run_id=%s count=%s", repo_id, gh_run_id, len(tests))
+        return jsonify({
+            "repo_id": repo_id,
+            "gh_run_id": gh_run_id,
+            "summary": data.get("summary", {}),
+            "tests": tests,
+        })
+
+    except Exception:
+        log_exception("pytest_tests_from_url", url=gh_url)
+        return jsonify({"error": "Failed to fetch pytest tests"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-tests", methods=["GET"])
+def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
+    """Get all tests from pytest JSON report fetched from GitHub Actions artifact."""
+    g.repo_id, g.job_id = repo_id, job_id
+
+    try:
+        gh_run_id = request.args.get("gh_run_id")
+        commit_sha = request.args.get("commit_id")
+
+        if gh_run_id:
+            log.info("pytest_tests_direct_gh_run repo=%s gh_run_id=%s", repo_id, gh_run_id)
+            data = _download_artifact_from_run(repo_id, int(gh_run_id), _gh_headers())
+        elif commit_sha:
+            log.info("pytest_tests_commit_sha repo=%s sha=%s", repo_id, commit_sha)
+            data = _fetch_pytest_report_from_github(repo_id, commit_sha)
+        else:
+            # Last resort: look up commit SHA from DB
+            db_path = get_job_db_path(repo_id, job_id)
+            commit_sha = _get_commit_sha_for_run(db_path, run_id) if db_path.exists() else None
+            if not commit_sha:
+                log.warning("pytest_tests_no_commit repo=%s job=%s run=%s", repo_id, job_id, run_id)
+                return jsonify({"error": "No commit SHA found for this run"}), 404
+            data = _fetch_pytest_report_from_github(repo_id, commit_sha)
+        if not data:
+            return jsonify({"error": "No pytest report artifact found on GitHub"}), 404
+
+        tests = []
+        for t in data.get("tests", []):
+            outcome = t.get("outcome")
+            duration = _parse_test_duration(t)
+            tests.append({
+                "nodeid": t.get("nodeid"),
+                "lineno": t.get("lineno"),
+                "outcome": outcome,
+                "duration": duration,
+                "error_message": (t.get("error_message") or t.get("call", {}).get("crash", {}).get("message")) if outcome == "failed" else None,
+                "longrepr": (t.get("longrepr") or t.get("call", {}).get("longrepr")) if outcome == "failed" else None,
             })
 
         log.info("pytest_tests_success count=%s", len(tests))
@@ -2058,12 +2144,13 @@ def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
             "repo_id": repo_id,
             "job_id": job_id,
             "run_id": run_id,
+            "commit_sha": commit_sha,
             "tests": tests,
         })
 
     except Exception:
         log_exception("pytest_tests_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
-        return jsonify({"error": "Failed to read pytest tests"}), 500
+        return jsonify({"error": "Failed to fetch pytest tests"}), 500
 
 
 @app.route("/api/data/<path:repo_id>/<job_id>/runs", methods=["GET"])

@@ -136,7 +136,7 @@ class TestEnsureTestsBatch:
     def test_cached_test_returns_id(self, store):
         s, _, run_id = store
         result = s.ensure_tests_batch(run_id, [
-            ("existing_test", "test_file.py", 2.0, False),
+            ("existing_test", "test_file.py", 2.0, False, None),
         ])
         assert "existing_test" in result
         assert result["existing_test"] == s._tests["existing_test"].id
@@ -144,7 +144,7 @@ class TestEnsureTestsBatch:
     def test_cached_test_updates_metadata(self, store):
         s, _, run_id = store
         s.ensure_tests_batch(run_id, [
-            ("existing_test", "test_file.py", 5.0, True),
+            ("existing_test", "test_file.py", 5.0, True, None),
         ])
         entry = s._tests["existing_test"]
         assert entry.duration == 5.0
@@ -154,7 +154,7 @@ class TestEnsureTestsBatch:
     def test_new_test_inserts(self, store):
         s, db, run_id = store
         result = s.ensure_tests_batch(run_id, [
-            ("new_test", "test_new.py", 3.0, False),
+            ("new_test", "test_new.py", 3.0, False, None),
         ])
         assert "new_test" in result
         assert "new_test" in s._tests
@@ -168,8 +168,8 @@ class TestEnsureTestsBatch:
     def test_mixed_batch(self, store):
         s, _, run_id = store
         result = s.ensure_tests_batch(run_id, [
-            ("existing_test", "test_file.py", 2.0, False),
-            ("brand_new_test", "test_new.py", 1.0, False),
+            ("existing_test", "test_file.py", 2.0, False, None),
+            ("brand_new_test", "test_new.py", 1.0, False, None),
         ])
         assert "existing_test" in result
         assert "brand_new_test" in result
@@ -222,7 +222,7 @@ class TestSaveBatch:
     def test_flush_dirty_tests(self, store):
         s, db, run_id = store
         # Create a test and mark it dirty
-        s.ensure_tests_batch(run_id, [("test_flush", "test.py", 1.0, False)])
+        s.ensure_tests_batch(run_id, [("test_flush", "test.py", 1.0, False, None)])
         entry = s._tests["test_flush"]
         entry.duration = 99.0
         entry.dirty = True
@@ -241,7 +241,7 @@ class TestSaveBatch:
     def test_write_test_deps(self, store):
         s, db, run_id = store
         file_id = s.get_file_id("src/foo.py", checksum=100)
-        result = s.ensure_tests_batch(run_id, [("test_deps", "test.py", 1.0, False)])
+        result = s.ensure_tests_batch(run_id, [("test_deps", "test.py", 1.0, False, None)])
         test_id = result["test_deps"]
 
         deps = TestDeps.from_file_ids(test_id, {file_id}, set())

@@ -1,6 +1,8 @@
 import React, {useEffect, useState} from "react";
 import {Save, ChevronDown, GripVertical, Info, RotateCcw} from "lucide-react";
 import {DragDropContext, Droppable, Draggable} from "@hello-pangea/dnd";
+import {Toaster, toast} from "react-hot-toast";
+import {formatDuration} from "./utils.jsx";
 
 const API_BASE = "/api";
 
@@ -11,7 +13,17 @@ const reorder = (list, startIndex, endIndex) => {
     return result;
 };
 
-function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
+// Multi-item reordering helper
+const multiReorder = (list, selectedIds, insertAtIndex) => {
+    const result = Array.from(list);
+    const selectedItems = result.filter(item => selectedIds.includes(item.file_name));
+    const unselectedItems = result.filter(item => !selectedIds.includes(item.file_name));
+
+    unselectedItems.splice(insertAtIndex, 0, ...selectedItems);
+    return unselectedItems;
+};
+
+function TestManagementTab({currentRepo, currentJob, currentRuns, pytestTests}) {
     const [searchTerm, setSearchTerm] = useState("");
     const [isOpen, setIsOpen] = useState(false);
     const [testFileList, setTestFileList] = useState([]);
@@ -20,6 +32,9 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
     const [prioritizedTests, setPrioritizedTests] = useState([]);
     const [loading, setLoading] = useState(false);
     const [failedAttemptId, setFailedAttemptId] = useState(null);
+
+    const [selectedTests, setSelectedTests] = useState([]);
+    const [lastSelectedTest, setLastSelectedTest] = useState(null);
 
     const filteredTests = testFileList.filter((testFile) =>
         testFile.file_name.toLowerCase().includes(searchTerm.toLowerCase())
@@ -31,20 +46,52 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                 ? prev.filter((filename) => filename !== testName)
                 : [...prev, testName]
         );
-        // Don't automatically add to prioritized - user controls that separately
     };
 
     const handleFileClick = (fileName) => {
         setExpandedFile(fileName === expandedFile ? null : fileName);
     };
 
+    // Handle test selection for multi-drag
+    const handleTestSelect = (testName, event) => {
+        event.stopPropagation();
+
+        if (event.ctrlKey || event.metaKey) {
+            // Toggle selection with Ctrl/Cmd
+            setSelectedTests(prev =>
+                prev.includes(testName)
+                    ? prev.filter(name => name !== testName)
+                    : [...prev, testName]
+            );
+            setLastSelectedTest(testName);
+        } else if (event.shiftKey && lastSelectedTest) {
+            // Range selection with Shift
+            const currentList = testFileList.map(t => t.file_name);
+            const lastIndex = currentList.indexOf(lastSelectedTest);
+            const currentIndex = currentList.indexOf(testName);
+
+            const start = Math.min(lastIndex, currentIndex);
+            const end = Math.max(lastIndex, currentIndex);
+            const range = currentList.slice(start, end + 1);
+
+            setSelectedTests(prev => {
+                const newSelection = new Set([...prev, ...range]);
+                return Array.from(newSelection);
+            });
+        } else {
+            // Single selection
+            setSelectedTests([testName]);
+            setLastSelectedTest(testName);
+        }
+    };
+
     const handleSave = async () => {
         try {
-            // Order alwaysRunTests according to prioritizedTests order
-            const orderedAlwaysRunTests = prioritizedTests.filter(test =>
-                alwaysRunTests.includes(test)
-            );
-
+            const orderedAlwaysRunTests = [
+                ...prioritizedTests.filter(test => alwaysRunTests.includes(test)),
+                ...alwaysRunTests.filter(test => !prioritizedTests.includes(test)),
+            ];
+            console.log("always run tests" ,orderedAlwaysRunTests)
             const response = await fetch("/api/client/testPreferences", {
                 method: "POST",
                 headers: {
@@ -58,13 +105,13 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                 }),
             });
             if (response.ok) {
-                alert(`Saved test choices`);
+                toast.success(`Test preferences have been successfully saved!`);
             } else {
-                alert("Failed to save test preferences");
+                toast.error("Failed to save test preferences!");
             }
         } catch (error) {
             console.error("Error saving preferences:", error);
-            alert("Error saving test preferences");
+            toast.error("Test preferences couldn't be saved!");
         }
     };
 
@@ -73,6 +120,8 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
         setPrioritizedTests([]);
         setSearchTerm("");
         setExpandedFile(null);
+        setSelectedTests([]);
+        setLastSelectedTest(null);
 
         try {
             const response = await fetch("/api/client/testPreferences", {
@@ -88,37 +137,45 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                 }),
             });
             if (response.ok) {
-                alert("Selections reset and saved");
+                toast.success("Test preferences have been successfully reset!");
             } else {
-                alert("Failed to reset preferences");
+                toast.error("Failed to reset test preferences!");
             }
         } catch (error) {
             console.error("Error resetting preferences:", error);
-            alert("Error resetting preferences");
+            toast.error("Test preferences couldn't be reset!");
         }
     };
 
-    /*Send latest run id as parameter */
     useEffect(() => {
-        if (!repos || repos.length === 0) return;
-        const currentRepoLocal = repos.find((repo) => repo.id === currentRepo);
-        if (!currentRepoLocal) {
-            console.error("Repo not found:", currentRepo);
-        }
-        const currentJobLocal = currentRepoLocal.jobs.find(
-            (job) => job.name === currentJob
-        );
+        if (!pytestTests || pytestTests.length === 0) return;
 
-        if (!currentJobLocal) {
-            console.error("Job not found:", currentJob);
-        }
-        const latestRun = currentJobLocal.runs.at(-1);
+        const latestRunId = currentRuns[currentRuns.length - 1];
+        const runData = pytestTests.find((r) => r.run_id === latestRunId) ?? pytestTests[pytestTests.length - 1];
 
-        if (latestRun) {
-            loadTestFileList(latestRun.id);
-            loadTestPreferences();
+        const fileMap = {};
+        for (const t of runData.tests) {
+            const sepIdx = t.nodeid.indexOf("::");
+            const fileName = sepIdx > -1 ? t.nodeid.slice(0, sepIdx) : t.nodeid;
+            const method = sepIdx > -1 ? t.nodeid.slice(sepIdx + 2) : null;
+            if (!fileMap[fileName]) {
+                fileMap[fileName] = { file_name: fileName, test_count: 0, total_duration: 0, failed_count: 0, methods: [] };
+            }
+            fileMap[fileName].test_count += 1;
+            fileMap[fileName].total_duration += t.duration || 0;
+            if (t.outcome === "failed" || t.outcome === "error") fileMap[fileName].failed_count += 1;
+            if (method) fileMap[fileName].methods.push(method);
         }
-    }, [repos]);
+
+        const derived = Object.values(fileMap).map((f) => ({
+            ...f,
+            test_methods: f.methods.join(","),
+        }));
+
+        setTestFileList(derived);
+        setLoading(true);
+        loadTestPreferences();
+    }, [pytestTests, currentRuns, currentRepo, currentJob]);
 
     const loadTestPreferences = async () => {
         try {
@@ -138,57 +195,68 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
         }
     };
 
-    const loadTestFileList = async (run_id) => {
-        try {
-            const response = await fetch(
-                `${API_BASE}/data/${currentRepo}/${currentJob}/${run_id}/test_files`
-            );
-            const data = await response.json();
 
-            setTestFileList(data.test_files || []);
-            setLoading(true);
-        } catch (err) {
-            console.error("Failed to load test file list:", err);
-        }
-    };
-
-    const onDragStart = () => {
+    const onDragStart = (result) => {
         setFailedAttemptId(null);
+
+        const id = result.draggableId.replace(/^(available|prioritized)-/, '');
+
+        // If dragging an unselected item, select only that item
+        if (!selectedTests.includes(id)) {
+            setSelectedTests([id]);
+        }
     };
 
     const onDragEnd = (result) => {
         const {source, destination} = result;
-        if (!destination) return;
+        if (!destination) {
+            return;
+        }
 
-        setFailedAttemptId(null);
+        const draggedId = result.draggableId.replace(/^(available|prioritized)-/, '');
 
-        let available = testFileList.filter(
-            (t) => !prioritizedTests.includes(t.file_name)
-        );
-        let prioritized = testFileList.filter((t) =>
-            prioritizedTests.includes(t.file_name)
-        );
+        // Get all items to move (either selected items or just the dragged item)
+        const itemsToMove = selectedTests.length > 0 && selectedTests.includes(draggedId)
+            ? selectedTests
+            : [draggedId];
 
-        // Case 1: Reordering within the same list
+        let available = testFileList.filter((t) => !prioritizedTests.includes(t.file_name));
+        let prioritized = testFileList.filter((t) => prioritizedTests.includes(t.file_name));
+
+        // Moving within the same list
         if (source.droppableId === destination.droppableId) {
             if (source.droppableId === "prioritized") {
-                prioritized = reorder(prioritized, source.index, destination.index);
+                if (itemsToMove.length > 1) {
+                    // Multi-item reorder
+                    prioritized = multiReorder(prioritized, itemsToMove, destination.index);
+                } else {
+                    // Single item reorder
+                    prioritized = reorder(prioritized, source.index, destination.index);
+                }
             } else {
-                available = reorder(available, source.index, destination.index);
+                if (itemsToMove.length > 1) {
+                    available = multiReorder(available, itemsToMove, destination.index);
+                } else {
+                    available = reorder(available, source.index, destination.index);
+                }
             }
         }
-        // Case 2: Moving between lists
+        // Moving between lists
         else {
-            if (
-                source.droppableId === "available" &&
-                destination.droppableId === "prioritized"
-            ) {
-                const [moved] = available.splice(source.index, 1);
-                prioritized.splice(destination.index, 0, moved);
+            if (source.droppableId === "available" && destination.droppableId === "prioritized") {
+                // Remove items from available
+                const itemsToMoveObjects = available.filter(t => itemsToMove.includes(t.file_name));
+                available = available.filter(t => !itemsToMove.includes(t.file_name));
+
+                // Add to prioritized at destination
+                prioritized.splice(destination.index, 0, ...itemsToMoveObjects);
             } else {
-                // Moving from prioritized to available
-                const [moved] = prioritized.splice(source.index, 1);
-                available.splice(destination.index, 0, moved);
+                // Remove items from prioritized
+                const itemsToMoveObjects = prioritized.filter(t => itemsToMove.includes(t.file_name));
+                prioritized = prioritized.filter(t => !itemsToMove.includes(t.file_name));
+
+                // Add to available at destination
+                available.splice(destination.index, 0, ...itemsToMoveObjects);
             }
         }
 
@@ -197,10 +265,98 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
 
         setTestFileList(newTestFileList);
         setPrioritizedTests(newPrioritizedTests);
+
+        // Clear selection after drop
+        setSelectedTests([]);
+    };
+
+    const renderDraggableItem = (test, index, listType) => {
+        const isExpanded = test.file_name === expandedFile;
+        const isSelected = selectedTests.includes(test.file_name);
+        const methods = test.test_methods
+            ? test.test_methods
+                .split(",")
+                .map((m) => m.trim())
+                .filter((m) => m.length > 0)
+            : [];
+
+        return (
+            <Draggable
+                key={test.file_name}
+                draggableId={`${listType}-${test.file_name}`}
+                index={index}
+            >
+                {(provided, snapshot) => (
+                    <React.Fragment>
+                        <li
+                            ref={provided.innerRef}
+                            {...provided.draggableProps}
+                            {...provided.dragHandleProps}
+                            onClick={(e) => handleTestSelect(test.file_name, e)}
+                            className={`draggable-item 
+                                ${snapshot.isDragging ? "draggable-item-dragging" : "draggable-item-static"} 
+                                ${isExpanded ? "draggable-item-expanded" : "draggable-item-collapsed"}
+                                ${isSelected ? "draggable-item-selected" : ""}`}
+                        >
+                            <div className="draggable-content">
+                                {isSelected && (
+                                    <div className="selection-badge">
+                                        {selectedTests.indexOf(test.file_name) + 1}
+                                    </div>
+                                )}
+                                <GripVertical size={16} className="grip-icon"/>
+                                <span className="file-name">{test.file_name}</span>
+                                {methods.length > 0 && (
+                                    <ChevronDown
+                                        size={14}
+                                        className={`chevron-icon text-gray-400 shrink-0 ${
+                                            isExpanded ? "rotate-180" : ""
+                                        }`}
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleFileClick(test.file_name);
+                                        }}
+                                    />
+                                )}
+                            </div>
+                            <div className="info-icon-container">
+                                <Info size={16} className="info-icon"/>
+                                <div className="tooltip">
+                                    <div className="tooltip-content">
+                                        Took {formatDuration(test.total_duration)} last run
+                                        <div className="tooltip-arrow"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </li>
+                        {failedAttemptId === test.file_name && listType === "prioritized" && (
+                            <div className="failed-attempt-message">
+                                This test is in the priority list. It will run in priority order IF testmon selects it.
+                                Check the box above to FORCE it to always run.
+                            </div>
+                        )}
+                        {isExpanded && (
+                            <ul className="draggable-methods-list">
+                                {methods.length > 0 ? (
+                                    methods.map((method, methodIndex) => (
+                                        <li key={methodIndex} className="method-item">
+                                            • {method}
+                                        </li>
+                                    ))
+                                ) : (
+                                    <li className="no-methods">No individual methods listed.</li>
+                                )}
+                            </ul>
+                        )}
+                    </React.Fragment>
+                )}
+            </Draggable>
+        );
     };
 
     return loading ? (
         <div className="test-management-container">
+            <Toaster />
             <h3 className="section-heading">Manage Tests</h3>
             <div className="select-tests-container">
                 <button
@@ -227,15 +383,8 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                         {filteredTests.length > 0 ? (
                             filteredTests.map((test) => {
                                 const id = `checkbox-${test.file_name}`;
-                                const methods = test.test_methods
-                                    ? test.test_methods
-                                        .split(",")
-                                        .map((m) => m.trim())
-                                        .filter((m) => m.length > 0)
-                                    : [];
-
+                                const methods = test.test_methods ? test.test_methods.split(",").map((m) => m.trim()).filter((m) => m.length > 0) : [];
                                 const isExpanded = test.file_name === expandedFile;
-
                                 return (
                                     <React.Fragment key={test.file_name}>
                                         <li
@@ -259,9 +408,7 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                                             {methods.length > 0 && (
                                                 <ChevronDown
                                                     size={14}
-                                                    className={`chevron-icon text-gray-400 ${
-                                                        isExpanded ? "rotate-180" : ""
-                                                    }`}
+                                                    className={`chevron-icon text-gray-400 ${isExpanded ? "rotate-180" : ""}`}
                                                 />
                                             )}
                                         </li>
@@ -298,9 +445,19 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
             <div className="prioritization-section">
                 <h3 className="section-heading">Test Prioritization</h3>
                 <p className="section-description">
-                    Drag tests from the left to prioritize them (right). You can reorder
-                    the prioritized list.
+                    Click to select tests (Ctrl/Cmd for multi-select, Shift for range). Drag selected tests to reorder or move between lists.
                 </p>
+                {selectedTests.length > 0 && (
+                    <div className="px-3 py-2 bg-blue-500 text-white rounded mb-3 text-sm">
+                        {selectedTests.length} test{selectedTests.length > 1 ? 's' : ''} selected
+                        <button
+                            onClick={() => setSelectedTests([])}
+                            className="ml-3 px-2 py-0.5 bg-white bg-opacity-20 hover:bg-opacity-30 border-0 rounded text-white cursor-pointer"
+                        >
+                            Clear
+                        </button>
+                    </div>
+                )}
                 <DragDropContext onDragEnd={onDragEnd} onDragStart={onDragStart}>
                     <div className="drag-drop-grid">
                         <Droppable droppableId="available">
@@ -314,94 +471,7 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                                     <ul className="draggable-list">
                                         {testFileList
                                             .filter((t) => !prioritizedTests.includes(t.file_name))
-                                            .map((test, index) => {
-                                                const isExpanded = test.file_name === expandedFile;
-                                                const methods = test.test_methods
-                                                    ? test.test_methods
-                                                        .split(",")
-                                                        .map((m) => m.trim())
-                                                        .filter((m) => m.length > 0)
-                                                    : [];
-
-                                                return (
-                                                    <Draggable
-                                                        key={test.file_name}
-                                                        draggableId={`available-${test.file_name}`}
-                                                        index={index}
-                                                    >
-                                                        {(provided, snapshot) => (
-                                                            <React.Fragment>
-                                                                <li
-                                                                    ref={provided.innerRef}
-                                                                    {...provided.draggableProps}
-                                                                    {...provided.dragHandleProps}
-                                                                    onClick={() =>
-                                                                        handleFileClick(test.file_name)
-                                                                    }
-                                                                    className={`draggable-item 
-                                  ${
-                                                                        snapshot.isDragging
-                                                                            ? "draggable-item-dragging"
-                                                                            : "draggable-item-static"
-                                                                    } 
-                                  ${
-                                                                        isExpanded
-                                                                            ? "draggable-item-expanded"
-                                                                            : "draggable-item-collapsed"
-                                                                    }`}
-                                                                >
-                                                                    <div className="draggable-content">
-                                                                        <GripVertical
-                                                                            size={16}
-                                                                            className="grip-icon"
-                                                                        />
-                                                                        <span className="file-name">
-                                      {test.file_name}
-                                    </span>
-                                                                        {methods.length > 0 && (
-                                                                            <ChevronDown
-                                                                                size={14}
-                                                                                className={`chevron-icon text-gray-400 shrink-0 ${
-                                                                                    isExpanded ? "rotate-180" : ""
-                                                                                }`}
-                                                                            />
-                                                                        )}
-                                                                    </div>
-                                                                    <div className="info-icon-container">
-                                                                        <Info size={16} className="info-icon"/>
-                                                                        <div className="tooltip">
-                                                                            <div className="tooltip-content">
-                                                                                Took{" "}
-                                                                                {(test.total_duration / 2).toFixed(4)}s
-                                                                                last run
-                                                                                <div className="tooltip-arrow"></div>
-                                                                            </div>
-                                                                        </div>
-                                                                    </div>
-                                                                </li>
-                                                                {isExpanded && (
-                                                                    <ul className="draggable-methods-list">
-                                                                        {methods.length > 0 ? (
-                                                                            methods.map((method, methodIndex) => (
-                                                                                <li
-                                                                                    key={methodIndex}
-                                                                                    className="method-item"
-                                                                                >
-                                                                                    • {method}
-                                                                                </li>
-                                                                            ))
-                                                                        ) : (
-                                                                            <li className="no-methods">
-                                                                                No individual methods listed.
-                                                                            </li>
-                                                                        )}
-                                                                    </ul>
-                                                                )}
-                                                            </React.Fragment>
-                                                        )}
-                                                    </Draggable>
-                                                );
-                                            })}
+                                            .map((test, index) => renderDraggableItem(test, index, "available"))}
                                         {provided.placeholder}
                                     </ul>
                                 </div>
@@ -419,101 +489,7 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                                     <ul className="draggable-list">
                                         {testFileList
                                             .filter((t) => prioritizedTests.includes(t.file_name))
-                                            .map((test, index) => {
-                                                const isExpanded = test.file_name === expandedFile;
-                                                const methods = test.test_methods
-                                                    ? test.test_methods
-                                                        .split(",")
-                                                        .map((m) => m.trim())
-                                                        .filter((m) => m.length > 0)
-                                                    : [];
-
-                                                return (
-                                                    <Draggable
-                                                        key={test.file_name}
-                                                        draggableId={`prioritized-${test.file_name}`}
-                                                        index={index}
-                                                    >
-                                                        {(provided, snapshot) => (
-                                                            <React.Fragment>
-                                                                <li
-                                                                    ref={provided.innerRef}
-                                                                    {...provided.draggableProps}
-                                                                    {...provided.dragHandleProps}
-                                                                    onClick={() =>
-                                                                        handleFileClick(test.file_name)
-                                                                    }
-                                                                    className={`draggable-item
-                                                                                ${
-                                                                        snapshot.isDragging
-                                                                            ? "draggable-item-dragging"
-                                                                            : "draggable-item-static"
-                                                                    } 
-                                                                                ${
-                                                                        isExpanded
-                                                                            ? "draggable-item-expanded"
-                                                                            : "draggable-item-collapsed"
-                                                                    }`}
-                                                                >
-                                                                    <div className="draggable-content">
-                                                                        <GripVertical
-                                                                            size={16}
-                                                                            className="grip-icon"
-                                                                        />
-                                                                        <span className="file-name">
-                                      {test.file_name}
-                                    </span>
-                                                                        {methods.length > 0 && (
-                                                                            <ChevronDown
-                                                                                size={14}
-                                                                                className={`chevron-icon text-gray-400 shrink-0 ${
-                                                                                    isExpanded ? "rotate-180" : ""
-                                                                                }`}
-                                                                            />
-                                                                        )}
-                                                                    </div>
-                                                                    <div className="info-icon-container">
-                                                                        <Info size={16} className="info-icon"/>
-                                                                        <div className="tooltip">
-                                                                            <div className="tooltip-content">
-                                                                                Took{" "}
-                                                                                {(test.total_duration / 2).toFixed(4)}s
-                                                                                last run
-                                                                                <div className="tooltip-arrow"></div>
-                                                                            </div>
-                                                                        </div>
-                                                                    </div>
-                                                                </li>
-                                                                {failedAttemptId === test.file_name && (
-                                                                    <div className="failed-attempt-message">
-                                                                        This test is in the priority list. It will run
-                                                                        in priority order IF testmon selects it.
-                                                                        Check the box above to FORCE it to always run.
-                                                                    </div>
-                                                                )}
-                                                                {isExpanded && (
-                                                                    <ul className="draggable-methods-list">
-                                                                        {methods.length > 0 ? (
-                                                                            methods.map((method, methodIndex) => (
-                                                                                <li
-                                                                                    key={methodIndex}
-                                                                                    className="method-item"
-                                                                                >
-                                                                                    • {method}
-                                                                                </li>
-                                                                            ))
-                                                                        ) : (
-                                                                            <li className="no-methods">
-                                                                                No individual methods listed.
-                                                                            </li>
-                                                                        )}
-                                                                    </ul>
-                                                                )}
-                                                            </React.Fragment>
-                                                        )}
-                                                    </Draggable>
-                                                );
-                                            })}
+                                            .map((test, index) => renderDraggableItem(test, index, "prioritized"))}
                                         {provided.placeholder}
                                     </ul>
                                 </div>
@@ -523,19 +499,12 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
                 </DragDropContext>
             </div>
 
-            <div
-                className="save-button-container"
-                style={{display: "flex", gap: "1rem", justifyContent: "center"}}
-            >
+            <div className="save-button-container">
                 <button onClick={handleSave} className="save-button">
                     <Save size={20}/>
                     Save Choices
                 </button>
-                <button
-                    onClick={handleReset}
-                    className="save-button"
-                    style={{backgroundColor: "#ef4444", borderColor: "#dc2626"}}
-                >
+                <button onClick={handleReset} className="reset-button">
                     <RotateCcw size={20}/>
                     Reset Selections
                 </button>
@@ -543,10 +512,9 @@ function TestManagementTab({repos, currentRepo, currentJob, currentRuns}) {
             <div className="tip-box">
                 <p className="tip-text">
                     <strong>Tip:</strong>
-                    <br/>• <strong>Checked tests (Always Run):</strong> Will ALWAYS be forced to run in your priority
-                    order
-                    <br/>• <strong>Prioritized but unchecked:</strong> Only run IF testmon selects them (due to
-                    changes), but in your priority order instead of duration order
+                    <br/>• <strong>Checked tests (Always Run):</strong> Will ALWAYS be forced to run in your priority order
+                    <br/>• <strong>Prioritized but unchecked:</strong> Only run IF testmon selects them (due to changes), but in your priority order instead of duration order
+                    <br/>• <strong>Multi-select:</strong> Click to select, Ctrl/Cmd+Click for multiple, Shift+Click for range
                     <br/>• Save your configuration for your CI pipeline.
                 </p>
             </div>

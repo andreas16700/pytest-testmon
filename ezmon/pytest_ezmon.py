@@ -841,6 +841,14 @@ class TestmonCollect:
         outcome["duration"] += getattr(report, "duration", 0.0) or 0.0
         if report.outcome == "failed":
             outcome["failed"] = True
+            if hasattr(report, "longrepr") and report.longrepr:
+                outcome["longrepr"] = str(report.longrepr)
+                reprcrash = getattr(report.longrepr, "reprcrash", None)
+                if reprcrash:
+                    outcome["error_message"] = reprcrash.message
+        if "forced" not in outcome:
+            forced_nodeids = getattr(self, "_forced_nodeids", set())
+            outcome["forced"] = 1 if report.nodeid in forced_nodeids else 0
 
         if self._running_as == "worker":
             if report.when == "call" and self._worker_batches:
@@ -967,7 +975,7 @@ class TestmonCollect:
                 if ds:
                     ds.ensure_tests_batch(
                         self.testmon_data.run_id,
-                        [(test_name, test_file, outcome.get("duration"), True)],
+                        [(test_name, test_file, outcome.get("duration"), True, None)],
                     )
                 else:
                     self.testmon_data.db.get_or_create_test_id(
@@ -1217,18 +1225,20 @@ class TestmonCollect:
                 (name,
                  name.split("::")[0] if "::" in name else name,
                  outcome.get("duration", 0.0),
-                 True)
+                 True,
+                 None)
                 for name, outcome in self._outcomes.items()
                 if outcome.get("failed")
             ]
             ds = self.testmon_data.dep_store
+            tests_failed_count = len(failed_tests_for_db)
             if failed_tests_for_db:
                 if ds:
                     ds.ensure_tests_batch(
                         self.testmon_data.run_id, failed_tests_for_db
                     )
                 else:
-                    for name, test_file, dur, _failed in failed_tests_for_db:
+                    for name, test_file, dur, _failed, _forced in failed_tests_for_db:
                         self.testmon_data.db.get_or_create_test_id(
                             name, duration=dur, failed=True,
                             test_file=test_file,
@@ -1244,13 +1254,14 @@ class TestmonCollect:
                     ds.save_batch([])
             _timing_log(session.config, "controller_save_deps_start")
             duration = time.time() - self._sessionstarttime
-            run_stats = self.testmon_data.db.fetch_current_run_stats()
+            run_stats = self.testmon_data.db.fetch_current_run_stats(self.testmon_data.run_id)
             run_saved_time, run_all_time, run_saved_tests, run_all_tests = run_stats
             self.testmon_data.db.finish_run(
                 self.testmon_data.run_id,
                 duration=duration,
                 tests_selected=run_saved_tests or 0,
                 tests_deselected=(run_all_tests or 0) - (run_saved_tests or 0),
+                tests_failed=tests_failed_count,
                 tests_all=run_all_tests or 0,
                 time_saved=run_saved_time or 0,
                 time_all=run_all_time or 0,
@@ -1270,6 +1281,68 @@ class TestmonCollect:
         if timing_dir:
             _flush_timing_logs(timing_dir)
         self.testmon.close()
+
+        if self._running_as in ("single", "controller"):
+            self._write_test_report(session)
+
+    def _write_test_report(self, session):
+        """Build a JSON test report (run + deselected) and write to test-report.json."""
+        select_plugin = session.config.pluginmanager.get_plugin("TestmonSelect")
+        deselected_nodeids = getattr(select_plugin, "_deselected_nodeids", []) if select_plugin else []
+        item_locations = getattr(select_plugin, "_item_locations", {}) if select_plugin else {}
+
+        # Also include tests known to the DB but skipped via pytest_ignore_collect
+        # (entire stable files that never entered collection at all)
+        ran_or_collected = set(self._outcomes.keys()) | {e["nodeid"] for e in deselected_nodeids}
+        nocollect_deselected = [
+            {"nodeid": name, "lineno": None}
+            for name in (self.testmon_data.all_tests or {})
+            if name not in ran_or_collected
+        ]
+        deselected_nodeids = deselected_nodeids + nocollect_deselected
+
+        tests = []
+        for nodeid, outcome in self._outcomes.items():
+            entry = {
+                "nodeid": nodeid,
+                "outcome": "failed" if outcome.get("failed") else "passed",
+                "duration": outcome.get("duration", 0.0),
+            }
+            if nodeid in item_locations:
+                entry["lineno"] = item_locations[nodeid]
+            if outcome.get("longrepr"):
+                entry["longrepr"] = outcome["longrepr"]
+            if outcome.get("error_message"):
+                entry["error_message"] = outcome["error_message"]
+            tests.append(entry)
+        for entry in deselected_nodeids:
+            tests.append({
+                "nodeid": entry["nodeid"],
+                "lineno": entry["lineno"],
+                "outcome": "deselected",
+                "duration": 0.0,
+            })
+
+        summary = {
+            "total": len(tests),
+            "passed": sum(1 for t in tests if t["outcome"] == "passed"),
+            "failed": sum(1 for t in tests if t["outcome"] == "failed"),
+            "deselected": len(deselected_nodeids),
+        }
+        report = {
+            "tests": tests,
+            "summary": summary,
+            "commit_id": os.environ.get("GITHUB_SHA", ""),
+            "repo_id": os.environ.get("GITHUB_REPOSITORY", ""),
+        }
+
+        report_path = "test-report.json"
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            logger.info(f"Test report written to {report_path}")
+        except OSError as e:
+            logger.warning(f"Could not write test report: {e}")
 
     def _handle_worker_output(self, workeroutput, worker_id):
         _timing_log_for_actor("controller", "controller_receive_start", worker_id=worker_id)
@@ -1453,7 +1526,8 @@ class TestmonCollect:
                     (name,
                      name.split("::")[0] if "::" in name else name,
                      self._outcomes.get(name, {}).get("duration", 0.0),
-                     True)
+                     True,
+                     None)
                     for name in failed_tests
                 ]
                 ds = self.testmon_data.dep_store
@@ -1643,6 +1717,7 @@ class TestmonSelect:
         )
 
         self._interrupted = False
+        self._deselected_nodeids = []
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), config.rootdir.strpath)
@@ -1667,6 +1742,7 @@ class TestmonSelect:
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
         _timing_log(config, "selection_start", item_count=len(items))
+        self._item_locations = {item.nodeid: item.location[1] for item in items}
         always_run_files = getattr(config, "always_run_files", [])
         prioritized_files = getattr(config, "prioritized_files", [])
 
@@ -1749,6 +1825,7 @@ class TestmonSelect:
             sort_items_by_duration(normal_selected, self.testmon_data.avg_durations)
 
         selected = forced + prioritized + normal_selected
+        self._forced_nodeids = {item.nodeid for item in forced}
 
 
 
@@ -1767,6 +1844,10 @@ class TestmonSelect:
             if not no_reorder:
                 sort_items_by_duration(deselected, self.testmon_data.avg_durations)
             items[:] = selected + deselected
+        self._deselected_nodeids = [
+            {"nodeid": item.nodeid, "lineno": item.location[1]}
+            for item in deselected
+        ]
         _timing_log(
             config,
             "selection_end",

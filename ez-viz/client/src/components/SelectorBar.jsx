@@ -1,7 +1,7 @@
 import {RefreshCw, ChevronDown, Loader2, FileCode, AlertCircle} from "lucide-react";
 import React, {useState, useRef, useEffect} from "react";
 
-function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo, selectedJob, onRepoChange, onJobChange, onRunChange, onRefresh, setIsAdded, setSummary, setAllTests, setAllFiles, selectedRunId, setSelectedRunId, userOtherRepos, generateWorkflowFile}) {
+function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo, selectedJob, onRepoChange, onJobChange, onRunChange, onRefresh, setIsAdded, setSummary, setAllTests, setAllFiles, setAllPytestTests, selectedRunId, setSelectedRunId, userOtherRepos, generateWorkflowFile}) {
     const [isRepoDropdownOpen, setIsRepoDropdownOpen] = useState(false);
     const [isJobDropdownOpen, setIsJobDropdownOpen] = useState(false);
     const [isRunDropdownOpen, setIsRunDropdownOpen] = useState(false);
@@ -36,7 +36,6 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
     }, []);
 
     const handleOtherRepoSelect = async (otherRepo) => {
-        console.log(otherRepo)
         setSelectedOtherRepo(otherRepo);
         setIsFutureRepoDropdownOpen(false);
 
@@ -190,6 +189,7 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                             setSummary(prev => prev.filter(item => item.run_id != run.id));
                                             setAllTests(prev => prev.filter(item => item.run_id != run.id));
                                             setAllFiles(prev => prev.filter(item => item.run_id != run.id));
+                                            setAllPytestTests(prev => prev.filter(item => item.run_id != run.id));
                                             if (run.id === selectedRunId) {
                                                 setSelectedRunId(remaining.length > 0 ? remaining[0] : null);
                                             }
@@ -199,10 +199,9 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                 <div className="flex flex-col">
                                     <div className="flex items-center gap-2">
                                         <span className="font-semibold">Run #{run.id}</span>
-                                        {run.tests_total != null ? (
+                                        {run.tests_all != null ? (
                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700">
-                                                {run.tests_total - (run.tests_skipped || 0)} ran
-                                                {run.tests_skipped > 0 && `, ${run.tests_skipped} skipped`}
+                                                {run.tests_selected} executed, {run.tests_all - run.tests_selected} skipped
                                             </span>
                                         ) : (
                                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700">
@@ -211,7 +210,7 @@ function SelectorBar({repos, currentRepo, currentJob, currentRuns, selectedRepo,
                                         )}
                                     </div>
                                     <span className="text-[10px] text-gray-400">
-                                        {new Date(run.created).toLocaleString()}
+                                        {new Date(run.created_at).toLocaleString()}
                                         {run.repo_run_id && <span className="ml-1 text-gray-500">(GH: {run.repo_run_id})</span>}
                                     </span>
                                 </div>

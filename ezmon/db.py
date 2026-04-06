@@ -9,7 +9,7 @@ from ezmon.common import get_logger
 from ezmon.bitmap_deps import TestDeps, find_affected_tests
 
 
-DATA_VERSION = 20  # v20: empty history tables added alongside v19 schema
+DATA_VERSION = 21  # v20: history tables; v21: tests_failed + forced columns
 
 
 class TestmonDbException(Exception):
@@ -102,12 +102,48 @@ def _migrate_19_to_20(connection: sqlite3.Connection) -> None:
         connection.execute(stmt)
 
 
+def _migrate_20_to_21(connection: sqlite3.Connection) -> None:
+    """Upgrade a v20 DB to v21 by adding tests_failed, forced columns and history tables.
+
+    Idempotent: uses ALTER TABLE ADD COLUMN wrapped in try/except (SQLite
+    raises OperationalError if the column already exists) and CREATE TABLE
+    IF NOT EXISTS for history tables. This handles both upgrade paths:
+
+    - From our v20 (history tables exist, but tests_failed/forced missing)
+    - From remote's v20 (tests_failed/forced exist, but history tables missing)
+
+    Uses individual execute() calls instead of executescript() because
+    executescript() implicitly commits any open transaction, which would
+    break the BEGIN IMMEDIATE / ROLLBACK guarantee in _apply_migrations.
+    """
+    # Add tests_failed column to runs table (remote's v20 feature)
+    try:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN tests_failed INTEGER DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Add forced column to tests table (remote's v20 feature)
+    try:
+        connection.execute(
+            "ALTER TABLE tests ADD COLUMN forced INTEGER DEFAULT NULL"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Create history tables (our v20 feature) — idempotent via IF NOT EXISTS
+    for stmt in _HISTORY_DDL_STATEMENTS:
+        connection.execute(stmt)
+
+
 # Registry of migration callables. MIGRATIONS[K] upgrades a DB from
 # user_version K to K+1. Migrations are plain functions that run SQL on
 # a sqlite3.Connection. They must be idempotent (use CREATE IF NOT
 # EXISTS etc.) so partial applications followed by retry are safe.
 MIGRATIONS: Dict[int, Callable[[sqlite3.Connection], None]] = {
     19: _migrate_19_to_20,
+    20: _migrate_20_to_21,
 }
 
 
@@ -328,16 +364,20 @@ class DB:  # pylint: disable=too-many-public-methods
             """DELETE FROM tests WHERE id NOT IN (SELECT test_id FROM test_deps)"""
         )
 
-    def fetch_current_run_stats(self):
+    def fetch_current_run_stats(self, run_id=None):
         """Fetch run statistics from the tests table."""
         with self.con as con:
             cursor = con.cursor()
-            run_saved_tests, run_saved_time = cursor.execute(
-                "SELECT count(*), sum(duration) FROM tests"
-            ).fetchone()
             run_all_tests, run_all_time = cursor.execute(
                 "SELECT count(*), sum(duration) FROM tests"
             ).fetchone()
+            if run_id is not None:
+                run_saved_tests, run_saved_time = cursor.execute(
+                    "SELECT count(*), sum(duration) FROM tests WHERE run_id = ?",
+                    (run_id,)
+                ).fetchone()
+            else:
+                run_saved_tests, run_saved_time = run_all_tests, run_all_time
 
         return (
             run_saved_time,
@@ -389,13 +429,13 @@ class DB:  # pylint: disable=too-many-public-methods
         return cursor.lastrowid
 
     def finish_run(self, run_id, duration, tests_selected, tests_deselected,
-                   tests_all, time_saved, time_all):
+                   tests_failed, tests_all, time_saved, time_all):
         """Update a run with final stats. Called at session end."""
         self.con.execute(
             """UPDATE runs SET duration=?, tests_selected=?, tests_deselected=?,
-               tests_all=?, time_saved=?, time_all=? WHERE id=?""",
-            (duration, tests_selected, tests_deselected, tests_all,
-             time_saved, time_all, run_id),
+               tests_failed=?, tests_all=?, time_saved=?, time_all=? WHERE id=?""",
+            (duration, tests_selected, tests_deselected, tests_failed,
+             tests_all, time_saved, time_all, run_id),
         )
 
     def get_latest_run_commit_id(self) -> Optional[str]:
@@ -464,6 +504,7 @@ class DB:  # pylint: disable=too-many-public-methods
             duration REAL,
             tests_selected INTEGER DEFAULT 0,
             tests_deselected INTEGER DEFAULT 0,
+            tests_failed INTEGER DEFAULT 0,
             tests_all INTEGER DEFAULT 0,
             time_saved REAL DEFAULT 0,
             time_all REAL DEFAULT 0
@@ -492,7 +533,8 @@ class DB:  # pylint: disable=too-many-public-methods
                 name TEXT NOT NULL UNIQUE,
                 test_file TEXT,
                 duration REAL,
-                failed INTEGER DEFAULT 0
+                failed INTEGER DEFAULT 0,
+                forced INTEGER DEFAULT NULL
             );
             CREATE INDEX IF NOT EXISTS tests_name ON tests (name);
         """
@@ -553,9 +595,9 @@ class DB:  # pylint: disable=too-many-public-methods
     def all_test_executions(self):
         """Get all tests with their metadata."""
         return {
-            row["name"]: {"duration": row["duration"], "failed": bool(row["failed"]), "forced": None}
+            row["name"]: {"duration": row["duration"], "failed": bool(row["failed"]), "forced": row["forced"]}
             for row in self.con.execute(
-                "SELECT name, duration, failed FROM tests"
+                "SELECT name, duration, failed, forced FROM tests"
             )
         }
 
@@ -672,6 +714,7 @@ class DB:  # pylint: disable=too-many-public-methods
         failed: bool = False,
         test_file: Optional[str] = None,
         run_id: int = None,
+        forced: Optional[int] = None,
     ) -> int:
         """Get or create a test ID for a given test name.
 
@@ -691,8 +734,8 @@ class DB:  # pylint: disable=too-many-public-methods
         if row:
             test_id = row[0]
             updates = ["duration = COALESCE(?, duration)", "failed = ?",
-                        "test_file = COALESCE(?, test_file)"]
-            params = [duration, 1 if failed else 0, test_file]
+                        "test_file = COALESCE(?, test_file)", "forced = ?"]
+            params = [duration, 1 if failed else 0, test_file, forced]
             if run_id is not None:
                 updates.append("run_id = ?")
                 params.append(run_id)
@@ -703,9 +746,9 @@ class DB:  # pylint: disable=too-many-public-methods
             return test_id
 
         cursor.execute(
-            """INSERT INTO tests (name, test_file, duration, failed, run_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (test_name, test_file, duration, 1 if failed else 0, run_id)
+            """INSERT INTO tests (name, test_file, duration, failed, forced, run_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (test_name, test_file, duration, 1 if failed else 0, forced, run_id)
         )
         return cursor.lastrowid
 
@@ -731,9 +774,9 @@ class DB:  # pylint: disable=too-many-public-methods
 
         # 1. Bulk INSERT OR IGNORE — creates rows for new tests
         cursor.executemany(
-            """INSERT OR IGNORE INTO tests (name, test_file, duration, failed, run_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            [(name, tf, dur, 1 if fail else 0, run_id) for name, tf, dur, fail in tests],
+            """INSERT OR IGNORE INTO tests (name, test_file, duration, failed, forced, run_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [(name, tf, dur, 1 if fail else 0, forced, run_id) for name, tf, dur, fail, forced in tests],
         )
 
         # 2. Bulk SELECT to get all IDs
@@ -749,13 +792,13 @@ class DB:  # pylint: disable=too-many-public-methods
             for row in rows:
                 result[row[1]] = row[0]
 
-        # 3. Bulk UPDATE duration/failed/run_id for all tests
+        # 3. Bulk UPDATE duration/failed/forced/run_id for all tests
         cursor.executemany(
             """UPDATE tests SET duration = COALESCE(?, duration),
-               failed = ?, test_file = COALESCE(?, test_file),
+               failed = ?, forced = ?, test_file = COALESCE(?, test_file),
                run_id = COALESCE(?, run_id)
                WHERE name = ?""",
-            [(dur, 1 if fail else 0, tf, run_id, name) for name, tf, dur, fail in tests],
+            [(dur, 1 if fail else 0, forced, tf, run_id, name) for name, tf, dur, fail, forced in tests],
         )
 
         return result

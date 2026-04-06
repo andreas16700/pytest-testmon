@@ -15,31 +15,25 @@ import { CheckCircle2, ArrowRightLeft, LayoutDashboard, GitCompare } from "lucid
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement);
 
-function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, selectedRunId, setSelectedRunId }) {
+function SummaryTab({ summary, allTests, currentRuns, selectedRunId, setSelectedRunId }) {
     const [activeTab, setActiveTab] = useState('single');
     const [compareRunA, setCompareRunA] = useState(selectedRunId);
     const [compareRunB, setCompareRunB] = useState(currentRuns.find(r => r !== selectedRunId) || currentRuns[0]);
+
     const getRunData = (runId) => {
         const runTests = allTests.find(run => run.run_id == runId) || { tests: [] };
         const runSummary = summary.find(s => s.run_id == runId) || {};
-
         const currentTests = runTests.tests || [];
-        const failed = currentTests.filter(t => t.failed).length;
-        const ran = currentTests.filter(t => t.forced === 0 || t.forced===1) .length; 
-        const totalTests = runSummary.test_count || 0;
-        const skipped = totalTests - ran;
-        const passed= totalTests - skipped - failed
-        const [runtimeSpent, runtimeSaved] = currentTests.reduce(
-            (acc, test) => {
-                if (test.forced !== null ) {
-                    acc[0] += test.duration;
-                } else {
-                    acc[1] += test.duration;
-                }
-                return acc;
-            },
-            [0, 0]
-        );
+        const ran = currentTests.filter(t => t.forced === 0 || t.forced === 1).length;
+        const totalTests = runSummary?.test_count ?? 0;
+        const failed = runSummary?.tests_failed ?? 0;
+        const skipped = runSummary?.savings?.tests_saved ?? 0;
+        const passed = totalTests - skipped - failed;
+
+        const runtimeAll = (runSummary?.savings?.time_all || 0) * 1000;
+        const runtimeSpent = (runSummary?.savings?.time_saved || 0) * 1000;
+
+        const runtimeSaved = Math.max(0, runtimeAll - runtimeSpent);
 
         return {
             id: runId,
@@ -56,7 +50,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
 
     // Data for single view
     const primaryRun = useMemo(() => getRunData(selectedRunId), [selectedRunId, allTests, summary]);
-        const { passed, failed, skipped, totalTests } = primaryRun.stats;
+    const { passed, failed, skipped, totalTests } = primaryRun.stats;
 
     const passRatio   = totalTests ? (passed  / totalTests) * 100 : 0;
     const skipRatio   = totalTests ? (skipped / totalTests) * 100 : 0;
@@ -74,12 +68,12 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
 
     // --- Charts for Single View ---
     const testsChartData = {
-        labels: ["Tests Executed", "Tests Skipped"],
+        labels: ["Tests Executed", "Tests Skipped", "Tests Failed"],
         datasets: [
             {
-                data: [primaryRun.stats.ran, primaryRun.stats.skipped],
-                backgroundColor: ["#10B981", "#eab308"],
-                borderColor: ["#059669", "#ca8a04"],
+                data: [primaryRun.stats.passed, primaryRun.stats.skipped, primaryRun.stats.failed],
+                backgroundColor: ["#10B981", "#eab308", "#ef4444"],
+                borderColor: ["#059669", "#ca8a04", "#dc2626"],
                 borderWidth: 2,
             },
         ],
@@ -142,6 +136,23 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
         plugins: {
             legend: { position: 'bottom' },
         },
+    };
+
+    const runtimeChartOptions = {
+        ...chartOptions,
+        plugins: {
+            ...chartOptions.plugins,
+            tooltip: {
+                callbacks: {
+                    label: function(context) {
+                        if (context.parsed !== null) {
+                            return ' ' + Number(context.parsed).toFixed(2) + ' ms';
+                        }
+                        return '';
+                    }
+                }
+            }
+        }
     };
 
     return (
@@ -237,10 +248,17 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                         { label: 'Executed', key: 'ran' },
                                         { label: 'Skipped', key: 'skipped' },
                                         { label: 'Failed', key: 'failed', reverseColor: true },
-                                        { label: 'Runtime (s)', key: 'runtimeSpent', format: (v) => v.toFixed(2) },
+                                        { label: 'Runtime (ms)', key: 'runtimeSpent', format: (v) => v.toFixed(2) },
                                     ].map((row) => {
-                                        const v1 = runAData.stats[row.key];
-                                        const v2 = runBData.stats[row.key];
+                                        let v1;
+                                        let v2;
+                                        if (row.key === "ran") {
+                                            v1 = runAData.stats['failed'] + runAData.stats['passed'];
+                                            v2 = runBData.stats['failed'] + runBData.stats['passed'];
+                                        } else {
+                                            v1 = runAData.stats[row.key];
+                                            v2 = runBData.stats[row.key];
+                                        }
                                         const diff = v1 - v2;
                                         const format = row.format || ((v) => v);
                                         const colorClass = diff === 0 ? 'text-gray-400' : (row.reverseColor ? (diff < 0 ? 'text-green-600' : 'text-red-600') : (diff > 0 ? 'text-green-600' : 'text-red-600'));
@@ -283,7 +301,8 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                                 }
                                             },
                                             plugins: {
-                                                legend: { 
+                                                legend: {
+                                                    display: false,
                                                     position: 'top',
                                                     labels: {
                                                         font: { size: 13 },
@@ -313,7 +332,7 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                     return (
                                         <div
                                             key={index}
-                                           s className={`run-card ${isSelected ? 'run-card-selected' : 'run-card-unselected'}`}
+                                            className={`run-card ${isSelected ? 'run-card-selected' : 'run-card-unselected'}`}
                                             onClick={() => setSelectedRunId(runId)}
                                         >
                                             <div className="run-card-header">
@@ -348,12 +367,12 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                             />
                         </div>
 
-                        <div className="charts-grid">
+                        <div className="charts-grid mt-8">
                             <div className="chart-card">
                                 <h3 className="chart-title">
                                     Test Distribution
                                 </h3>
-                                <div className="chart-wrapper" style={{ maxWidth: "300px", margin: "0 auto" }}>
+                                <div className="chart-wrapper" style={{ maxWidth: "350px", margin: "0 auto" }}>
                                     <Doughnut data={testsChartData} options={chartOptions} />
                                 </div>
                             </div>
@@ -361,8 +380,8 @@ function SummaryTab({ summary, allTests, currentRepo, currentJob, currentRuns, s
                                 <h3 className="chart-title">
                                     Runtime Distribution
                                 </h3>
-                                <div className="chart-wrapper" style={{ maxWidth: "300px", margin: "0 auto" }}>
-                                    <Doughnut data={runtimeChartData} options={chartOptions} />
+                                <div className="chart-wrapper" style={{ maxWidth: "350px", margin: "0 auto" }}>
+                                    <Doughnut data={runtimeChartData} options={runtimeChartOptions} />
                                 </div>
                             </div>
                         </div>

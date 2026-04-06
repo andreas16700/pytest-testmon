@@ -250,8 +250,8 @@ class TestRunManagement:
     def test_finish_run(self, temp_db):
         run_id = temp_db.create_run("abc123", "packages", "3.11.0")
         temp_db.finish_run(run_id, duration=10.5, tests_selected=50,
-                          tests_deselected=100, tests_all=150,
-                          time_saved=30.0, time_all=45.0)
+                          tests_deselected=100, tests_failed=2,
+                          tests_all=150, time_saved=30.0, time_all=45.0)
         row = temp_db.con.execute(
             "SELECT * FROM runs WHERE id = ?", (run_id,)
         ).fetchone()
@@ -417,7 +417,7 @@ class TestSchemaIntegrity:
         result = temp_db.fetch_attribute("test_key")
         assert result == "test_value"
 
-    def test_data_version_is_20(self, temp_db):
-        """Data version should be 20 (v20 added empty history tables)."""
+    def test_data_version_is_21(self, temp_db):
+        """Data version should be 21 (v21: history tables + forced/tests_failed)."""
         version = temp_db.con.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 20
+        assert version == 21

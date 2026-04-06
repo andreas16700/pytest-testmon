@@ -318,18 +318,18 @@ class TestSuccessfulMigration:
 
 
 class TestV19ToV20:
-    """Schema v20 adds empty history tables alongside the v19 schema.
+    """Schema v21: history tables + runs.tests_failed + tests.forced.
 
-    These tests pin the migration-framework integration for the real
-    v19 -> v20 upgrade registered in db.MIGRATIONS. The v1 schema PR
-    creates the tables but does not yet write to them — rows only
-    appear once the versioning writers land in a later PR.
+    The v19→v20 migration adds history tables. The v20→v21 migration
+    adds runs.tests_failed and tests.forced columns (and idempotently
+    re-creates history tables for DBs that took the remote v20 path).
+    A fresh DB gets all of this via init_tables and lands at v21.
     """
 
-    def test_fresh_v20_db_has_history_tables(self, tmp_db_path):
-        """A freshly initialized DB has all 8 tables at v20."""
+    def test_fresh_v21_db_has_history_tables(self, tmp_db_path):
+        """A freshly initialized DB has all 8 tables at v21."""
         database = DB(tmp_db_path)
-        assert _read_user_version(tmp_db_path) == 20
+        assert _read_user_version(tmp_db_path) == 21
         tables = {
             row[0]
             for row in database.con.execute(
@@ -347,7 +347,7 @@ class TestV19ToV20:
             assert count == 0
         database.close()
 
-    def test_v19_db_upgrades_to_v20_in_place(self, tmp_db_path):
+    def test_v19_db_upgrades_to_v21_in_place(self, tmp_db_path):
         """An existing v19 DB with data upgrades without losing anything."""
         # Build a v19-shaped DB by hand: same tables as the v19 schema
         con = sqlite3.connect(tmp_db_path)
@@ -418,7 +418,7 @@ class TestV19ToV20:
         # Open with current plugin — migration runs automatically
         database = DB(tmp_db_path)
         assert database.file_created is False  # in-place upgrade, not recreation
-        assert _read_user_version(tmp_db_path) == 20
+        assert _read_user_version(tmp_db_path) == 21
 
         # Existing data is intact
         files = database.con.execute(
@@ -452,7 +452,7 @@ class TestV19ToV20:
 
         database.close()
 
-    def test_v19_to_v20_migration_is_idempotent(self, tmp_db_path, monkeypatch):
+    def test_v19_to_v21_migration_is_idempotent(self, tmp_db_path, monkeypatch):
         """Running the 19->20 migration twice does not error and adds nothing."""
         from ezmon.db import _migrate_19_to_20
 
@@ -484,7 +484,7 @@ class TestV19ToV20:
         assert "test_deps_history" in tables
         con.close()
 
-    def test_v20_history_tables_have_expected_columns(self, tmp_db_path):
+    def test_v21_history_tables_have_expected_columns(self, tmp_db_path):
         """Verify each history table's column set matches the schema doc."""
         database = DB(tmp_db_path)
 

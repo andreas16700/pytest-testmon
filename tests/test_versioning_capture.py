@@ -61,7 +61,7 @@ class TestVersioningDisabled:
         # Make some mutations
         ds.get_file_id("src/a.py", checksum=1, fsha="sha1")
         ds.update_file_checksum("src/a.py", 2, fsha="sha2")
-        ds.ensure_tests_batch(run_id, [("t1", "src/test_a.py", 0.1, False)])
+        ds.ensure_tests_batch(run_id, [("t1", "src/test_a.py", 0.1, False, None)])
         test_id = ds._tests["t1"].id
         deps = TestDeps.from_file_ids(test_id, {ds._files["src/a.py"].id}, {"numpy"})
         ds.save_batch([(test_id, deps.serialize(), "numpy")])
@@ -192,7 +192,7 @@ class TestTestsFailedHistory:
         database, run_id = fresh_db
         ds = _make_store(database, run_id)
 
-        ds.ensure_tests_batch(run_id, [("test_new", "src/test_new.py", 0.5, False)])
+        ds.ensure_tests_batch(run_id, [("test_new", "src/test_new.py", 0.5, False, None)])
         ds.save_batch([])
 
         rows = _history_rows(database, "tests_failed_history")
@@ -206,7 +206,7 @@ class TestTestsFailedHistory:
         database, run_id = fresh_db
         ds = _make_store(database, run_id)
 
-        ds.ensure_tests_batch(run_id, [("test_fail", "src/test_f.py", 0.1, True)])
+        ds.ensure_tests_batch(run_id, [("test_fail", "src/test_f.py", 0.1, True, None)])
         ds.save_batch([])
 
         rows = _history_rows(database, "tests_failed_history")
@@ -221,7 +221,7 @@ class TestTestsFailedHistory:
         ds = _make_store(database, run_id)
 
         # Re-record with same failed state
-        ds.ensure_tests_batch(run_id, [("test_x", "src/test_x.py", 0.2, False)])
+        ds.ensure_tests_batch(run_id, [("test_x", "src/test_x.py", 0.2, False, None)])
         ds.save_batch([])
 
         assert _history_rows(database, "tests_failed_history") == []
@@ -233,7 +233,7 @@ class TestTestsFailedHistory:
         )
         ds = _make_store(database, run_id)
 
-        ds.ensure_tests_batch(run_id, [("test_flip", "src/test_flip.py", 0.1, True)])
+        ds.ensure_tests_batch(run_id, [("test_flip", "src/test_flip.py", 0.1, True, None)])
         ds.save_batch([])
 
         rows = _history_rows(database, "tests_failed_history")
@@ -249,9 +249,9 @@ class TestTestsFailedHistory:
         ds = _make_store(database, run_id)
 
         # Fail
-        ds.ensure_tests_batch(run_id, [("test_rerun", "src/test_r.py", 0.1, True)])
+        ds.ensure_tests_batch(run_id, [("test_rerun", "src/test_r.py", 0.1, True, None)])
         # Rerun, now passes
-        ds.ensure_tests_batch(run_id, [("test_rerun", "src/test_r.py", 0.1, False)])
+        ds.ensure_tests_batch(run_id, [("test_rerun", "src/test_r.py", 0.1, False, None)])
         ds.save_batch([])
 
         # final state is failed=False, same as baseline → no history row
@@ -265,8 +265,8 @@ class TestTestsFailedHistory:
         )
         ds = _make_store(database, run_id)
 
-        ds.ensure_tests_batch(run_id, [("test_ok_fail_ok", None, 0.1, False)])
-        ds.ensure_tests_batch(run_id, [("test_ok_fail_ok", None, 0.1, True)])
+        ds.ensure_tests_batch(run_id, [("test_ok_fail_ok", None, 0.1, False, None)])
+        ds.ensure_tests_batch(run_id, [("test_ok_fail_ok", None, 0.1, True, None)])
         ds.save_batch([])
         # Baseline was True, final is True — nothing to record
         assert _history_rows(database, "tests_failed_history") == []
