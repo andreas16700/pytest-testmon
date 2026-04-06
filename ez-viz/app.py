@@ -580,7 +580,7 @@ def login_required(f):
 
 @app.route("/auth/github/login")
 def github_login():
-    
+
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
     params = {
@@ -640,7 +640,64 @@ def get_current_user():
 def logout():
     session.clear()
     return jsonify({"message": "Logged out"})
-                
+
+def update_testmon_run_id(db_path, run_id):
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Insert run id if not existing
+        cursor.execute(
+            "INSERT OR IGNORE INTO run_uid (id) VALUES (?)",
+            (run_id,)
+        )
+
+        # Update only NULL values
+        cursor.execute(
+            "UPDATE run_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+        cursor.execute(
+            "UPDATE test_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+        cursor.execute(
+            "UPDATE file_fp_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+        cursor.execute(
+            "UPDATE test_execution_file_fp_infos SET run_uid = ? WHERE run_uid IS NULL",
+            (run_id,)
+        )
+
+        affected = cursor.rowcount
+        conn.commit()
+        log.info(f"Successfully updated run_uid for {affected} rows in file: {db_path}")
+        return affected
+
+    except Exception as e:
+        log.error(f"Error updating testmon run_id for file {db_path}: {e}")
+        return None
+
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def add_run_id_to_testmon_data(db_path, run_id):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE run_uid SET repo_run_id=? WHERE repo_run_id IS NULL",
+            (run_id,)
+        )
+        conn.commit()
+
+    except Exception as e:
+        log.error("Error updating run_ids for file %s: %s", db_path, e)
+        return []
+    finally:
+        conn.close()
+
 def get_run_infos(db_path):
     conn = None
     try:
@@ -685,6 +742,149 @@ def get_run_infos(db_path):
         if conn is not None:
             conn.close()
 
+@app.route("/api/client/upload", methods=["POST"])
+def upload_testmon_data():
+    file = request.files.get("file")
+    repo_id = request.form.get("repo_id")
+    job_id = request.form.get("job_id")
+    repo_name = request.form.get("repo_name")
+    run_id= request.form.get("run_id")
+
+    # Enrich per-request context for logging
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not file:
+        log.warning("upload_missing_file")
+        return jsonify({"error": "No file provided"}), 400
+
+    log.info(
+        "upload_received filename=%s", getattr(file, "filename", None)
+    )
+
+    if not repo_id or not job_id:
+        log.warning("upload_missing_params")
+        return jsonify({"error": "repo_id and job_id are required"}), 400
+
+    try:
+        register_repo_job(repo_id, job_id, repo_name)
+
+        db_path = get_job_db_path(repo_id, job_id)
+
+        # Attempt to write uploaded file
+        log.info("file_write_attempt dest=%s", db_path)
+        file.save(db_path)
+        add_run_id_to_testmon_data(db_path, run_id)
+        size = db_path.stat().st_size
+        log.info("file_write_success dest=%s size=%s (%s)", db_path, size, human_bytes(size))
+
+        # Update metadata
+        metadata = get_metadata()
+        metadata["repos"][repo_id]["jobs"][job_id]["last_updated"] = now_iso()
+        metadata["repos"][repo_id]["jobs"][job_id]["upload_count"] += 1
+        save_metadata(metadata)
+        log.info("upload_metadata_updated")
+
+        return jsonify(
+            {
+                "success": True,
+                "message": f"Testmon data uploaded for {repo_id}/{job_id}",
+                "db_path": str(db_path.relative_to(BASE_DATA_DIR)),
+            }
+        ), 200
+
+    except Exception:
+        log_exception("upload_handler", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Upload failed"}), 500
+
+@app.route("/api/client/download", methods=["GET"])
+def download_testmon_data():
+    repo_id = request.args.get("repo_id")
+    job_id = request.args.get("job_id")
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    log.info("download_request")
+
+    if not repo_id or not job_id:
+        log.warning("download_missing_params")
+        return jsonify({"error": "repo_id and job_id are required"}), 400
+
+    db_path = get_job_db_path(repo_id, job_id)
+
+    log.info("file_read_attempt path=%s", db_path)
+    if not db_path.exists():
+        log.warning("file_read_not_found path=%s", db_path)
+        return jsonify({"error": "No data found for this repo/job"}), 404
+
+    try:
+        size = db_path.stat().st_size
+        log.info("file_read_success path=%s size=%s (%s)", db_path, size, human_bytes(size))
+        return send_file(
+            db_path,
+            as_attachment=True,
+            download_name=".testmondata",
+            mimetype="application/octet-stream",
+        )
+    except Exception:
+        log_exception("download_send_file", path=str(db_path))
+        return jsonify({"error": "Failed to send file"}), 500
+
+@app.route("/api/client/upload_graph", methods=["POST"])
+def upload_dependency_graph():
+    file = request.files.get("file")
+    repo_id = request.form.get("repo_id")
+    job_id = request.form.get("job_id")
+    run_id = request.form.get("run_id")
+
+    g.repo_id, g.job_id = repo_id or "-", job_id or "-"
+
+    if not file:
+        log.warning("upload_graph_missing_file")
+        return jsonify({"error": "No file provided"}), 400
+
+    log.info(
+        "upload_graph_received filename=%s", getattr(file, "filename", None)
+    )
+
+    if not repo_id or not job_id:
+        log.warning("upload_graph_missing_params")
+        return jsonify({"error": "repo_id and job_id are required"}), 400
+
+    try:
+        # 1. Determine Path
+        # We get the standard DB path, then swap the filename
+        db_path = get_job_db_path(repo_id, job_id)
+        graph_path = db_path.parent / f"dependency_graph_{run_id}.html"
+
+        # 2. Write File
+        log.info("graph_write_attempt dest=%s", graph_path)
+        file.save(graph_path)
+
+        size = graph_path.stat().st_size
+        log.info("graph_write_success dest=%s size=%s (%s)", graph_path, size, human_bytes(size))
+
+        # 3. Update Metadata
+        metadata = get_metadata()
+        job_meta = metadata["repos"][repo_id]["jobs"][job_id]
+
+        job_meta["last_updated"] = now_iso()
+        # Add a flag or timestamp specifically for the graph so the UI knows to show the button
+        job_meta["last_graph_upload"] = now_iso()
+
+        save_metadata(metadata)
+        log.info("upload_graph_metadata_updated")
+
+        return jsonify(
+            {
+                "success": True,
+                "message": f"Dependency graph uploaded for {repo_id}/{job_id}",
+                "graph_path": str(graph_path.relative_to(BASE_DATA_DIR)),
+            }
+        ), 200
+
+    except Exception:
+        log_exception("upload_graph_handler", repo_id=repo_id, job_id=job_id)
+        return jsonify({"error": "Graph upload failed"}), 500
+
 @app.route("/api/client/exists", methods=["GET"])
 def check_testmon_data_exists():
     repo_id = request.args.get("repo_id")
@@ -720,7 +920,7 @@ def list_repos():
     user_repositories_dict = get_user_repositories()
     user_repositories_set = set()
     for repo in user_repositories_dict:
-         user_repositories_set.add(repo.get('full_name'))
+        user_repositories_set.add(repo.get('full_name'))
     system_repositories = []
     for repo_id, repo_data in metadata.get("repos", {}).items():
         if not (repo_data.get('name') in user_repositories_set):
@@ -761,7 +961,7 @@ def list_repos():
             "permissions": repo.get("permissions", {}),
             "default_branch": repo["default_branch"]
         }
-        for repo in user_repositories_dict]
+            for repo in user_repositories_dict]
     })
 
 @login_required
@@ -1380,25 +1580,120 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: str):
             ]
         })
 
-    except Exception as e:
+    except Exception:
         log_exception("file_dependencies_query", repo_id=repo_id, job_id=job_id)
         return jsonify({
             "error": "Failed to fetch file dependencies from database snapshot",
             "detail": str(e)
         }), 500
 
+
+def _get_file_dependencies_legacy(repo_id: str, job_id: str, run_id: int):
+    """Legacy fallback: get file dependencies using co-files heuristic.
+
+    This is kept for backward compatibility with databases that don't
+    have the new dependency_graph table.
+    """
+    db_path = get_job_db_path(repo_id, job_id)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # 1) Get all files that appear in this run (by external repo_run_id)
+    all_files_sql = """
+        SELECT DISTINCT
+          fpi.filename
+        FROM file_fp_infos fpi
+        JOIN run_uid ru
+          ON fpi.run_uid = ru.id
+        WHERE ru.repo_run_id = ?
+    """
+    cur.execute(all_files_sql, (run_id,))
+    all_files_rows = cur.fetchall()
+
+    # Initialize map: filename -> set(dependencies)
+    deps_map = {row["filename"]: set() for row in all_files_rows}
+
+    # Early-out if no files in this run
+    if not deps_map:
+        conn.close()
+        return jsonify({"run_id": run_id, "files": []})
+
+    # 2) Get pairwise "file -> dependency" relations via shared test executions
+    file_deps_sql = """
+        WITH run AS (
+          SELECT id AS run_uid
+          FROM run_uid
+          WHERE repo_run_id = ?
+        ),
+        file_tests AS (
+          SELECT DISTINCT
+            fpi.filename      AS file,
+            tefi.test_execution_id
+          FROM file_fp_infos fpi
+          JOIN run r
+            ON fpi.run_uid = r.run_uid
+          JOIN test_execution_file_fp_infos tefi
+            ON tefi.run_uid        = r.run_uid
+           AND tefi.fingerprint_id = fpi.fingerprint_id
+        ),
+        file_cofiles AS (
+          SELECT DISTINCT
+            ft.file           AS filename,
+            fpi2.filename     AS dependency
+          FROM file_tests ft
+          JOIN test_execution_file_fp_infos tefi2
+            ON tefi2.test_execution_id = ft.test_execution_id
+          JOIN file_fp_infos fpi2
+            ON fpi2.run_uid        = tefi2.run_uid
+           AND fpi2.fingerprint_id = tefi2.fingerprint_id
+          JOIN run r
+            ON fpi2.run_uid = r.run_uid
+          WHERE fpi2.filename <> ft.file
+        )
+        SELECT
+          filename,
+          dependency
+        FROM file_cofiles
+        ORDER BY filename, dependency;
+    """
+    cur.execute(file_deps_sql, (run_id,))
+    for row in cur.fetchall():
+        filename = row["filename"]
+        dependency = row["dependency"]
+        # Only add dependencies for files that are in this run
+        if filename in deps_map:
+            deps_map[filename].add(dependency)
+
+    conn.close()
+
+    # 3) Build final JSON in the shape the React graph expects
+    files_list = [
+        {
+            "filename": filename,
+            "dependencies": sorted(list(deps))
+        }
+        for filename, deps in sorted(deps_map.items())
+    ]
+
+    return jsonify({
+        "run_id": run_id,
+        "files": files_list
+    })
+
+
 @app.route("/api/client/testPreferences", methods=["POST"])
 def upload_test_preferences():
     """Store user's test preferences (which tests to always run and which to prioritize)"""
-    
+
     # Get data from request body (JSON)
     data = request.get_json()
     repo_id = data.get("repo_id")
     job_id = data.get("job_id")
-    
+
     always_run_tests = data.get("alwaysRunTests", [])  # Array of test file names
     prioritized_tests = data.get("prioritizedTests", [])  # Array of test file names
-    
+
     log.info("Always run tests %s", always_run_tests)
     log.info("Prioritized tests %s", prioritized_tests)
     # Enrich per-request context for logging
@@ -1416,14 +1711,14 @@ def upload_test_preferences():
         # Create preferences file path
         job_path = get_job_db_path(repo_id, job_id).parent
         preferences_path = job_path / "test_preferences.json"
-        
+
         log.info(
-            "preferences_write_attempt path=%s always_run=%s prioritized=%s", 
-            preferences_path, 
+            "preferences_write_attempt path=%s always_run=%s prioritized=%s",
+            preferences_path,
             len(always_run_tests),
             len(prioritized_tests)
         )
-        
+
         # Store preferences as JSON
         preferences_data = {
             "repo_id": repo_id,
@@ -1432,10 +1727,10 @@ def upload_test_preferences():
             "prioritized_tests": prioritized_tests,
             "updated_at": now_iso(),
         }
-        
+
         with open(preferences_path, "w") as f:
             json.dump(preferences_data, f, indent=2)
-        
+
         size = preferences_path.stat().st_size
         log.info(
             "preferences_write_success path=%s size=%s (%s) always_run=%s prioritized=%s",
@@ -1461,7 +1756,7 @@ def upload_test_preferences():
 @app.route("/api/client/testPreferences", methods=["GET"])
 def get_test_preferences():
     """Retrieve user's test preferences"""
-    
+
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
@@ -1473,9 +1768,9 @@ def get_test_preferences():
     try:
         job_path = get_job_db_path(repo_id, job_id).parent
         preferences_path = job_path / "test_preferences.json"
-        
+
         log.info("preferences_read_attempt path=%s", preferences_path)
-        
+
         if not preferences_path.exists():
             log.info("preferences_not_found path=%s", preferences_path)
             return jsonify({
@@ -1485,16 +1780,16 @@ def get_test_preferences():
                 "prioritized_tests": [],
                 "updated_at": None,
             }), 200
-        
+
         with open(preferences_path, "r") as f:
             preferences_data = json.load(f)
-        
+
         # Ensure both fields exist for backward compatibility
         if "prioritized_tests" not in preferences_data:
             preferences_data["prioritized_tests"] = []
         if "always_run_tests" not in preferences_data:
             preferences_data["always_run_tests"] = []
-        
+
         size = preferences_path.stat().st_size
         log.info(
             "preferences_read_success path=%s size=%s (%s)",
@@ -1502,22 +1797,25 @@ def get_test_preferences():
             size,
             human_bytes(size)
         )
-        
+
         return jsonify(preferences_data), 200
 
     except Exception:
         log_exception("preferences_get_handler", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to read preferences"}), 500
 
+
 # -----------------------------------------------------------------------------
 # Pytest JSON Report Storage
 # -----------------------------------------------------------------------------
+
+
 def get_pytest_report_path(repo_id: str, job_id: str, run_id: str) -> Path:
     """Get path for storing pytest JSON report inside job folder"""
     repo_path = get_repo_path(repo_id)
     safe_job_id = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
     safe_run_id = "".join(c for c in run_id if c.isalnum() or c in ("-", "_"))
-    
+
     job_path = repo_path / safe_job_id
     if not job_path.exists():
         log.info(
@@ -1529,6 +1827,8 @@ def get_pytest_report_path(repo_id: str, job_id: str, run_id: str) -> Path:
 
     # Store as pytest_report_{run_id}.json in the job folder
     return job_path / f"pytest_report_{safe_run_id}.json"
+
+
 
 @app.route("/api/client/pytest-report", methods=["POST"])
 def upload_pytest_report():
@@ -1542,7 +1842,7 @@ def upload_pytest_report():
     repo_id = request.args.get("repo_id") or data.get("repo_id")
     job_id = request.args.get("job_id") or data.get("job_id")
     run_id = request.args.get("run_id") or data.get("run_id")
-    
+
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     if not repo_id or not job_id or not run_id:
@@ -1555,15 +1855,15 @@ def upload_pytest_report():
 
         # Save the pytest report
         report_path = get_pytest_report_path(repo_id, job_id, run_id)
-        
+
         log.info("pytest_report_write_attempt dest=%s", report_path)
         with open(report_path, "w") as f:
             json.dump(data, f, indent=2)
-        
+
         size = report_path.stat().st_size
         log.info("pytest_report_write_success dest=%s size=%s (%s)",
                  report_path, size, human_bytes(size))
-        
+
         # Update metadata with run info
         metadata = get_metadata()
         if repo_id in metadata["repos"] and job_id in metadata["repos"][repo_id]["jobs"]:
@@ -1591,13 +1891,14 @@ def upload_pytest_report():
         log_exception("pytest_report_upload", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to store pytest report"}), 500
 
+
 @app.route("/api/client/pytest-report", methods=["GET"])
 def get_pytest_report():
     """Retrieve pytest JSON report"""
     repo_id = request.args.get("repo_id")
     job_id = request.args.get("job_id")
     run_id = request.args.get("run_id")
-    
+
     g.repo_id, g.job_id = repo_id or "-", job_id or "-"
 
     if not repo_id or not job_id or not run_id:
@@ -1618,6 +1919,7 @@ def get_pytest_report():
     except Exception:
         log_exception("pytest_report_read", path=str(report_path))
         return jsonify({"error": "Failed to read pytest report"}), 500
+
 
 @app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-summary", methods=["GET"])
 def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
@@ -1691,6 +1993,7 @@ def get_pytest_summary(repo_id: str, job_id: str, run_id: str):
         log_exception("pytest_summary_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
         return jsonify({"error": "Failed to read pytest summary"}), 500
 
+
 def _gh_headers():
     """Build GitHub API headers using the session token if available."""
     headers = {"Accept": "application/vnd.github+json"}
@@ -1698,6 +2001,7 @@ def _gh_headers():
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
 
 def _get_commit_sha_for_run(db_path, run_id: str) -> Optional[str]:
     """Look up commit_id from the testmon DB for a given run_id."""
@@ -1711,16 +2015,169 @@ def _get_commit_sha_for_run(db_path, run_id: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def _parse_test_duration(t: dict) -> float:
     """Return test duration, supporting both flat and pytest-json-report nested formats."""
     flat = t.get("duration")
     if flat is not None:
         return float(flat)
     return (
-        t.get("setup", {}).get("duration", 0) +
-        t.get("call", {}).get("duration", 0) +
-        t.get("teardown", {}).get("duration", 0)
+            t.get("setup", {}).get("duration", 0) +
+            t.get("call", {}).get("duration", 0) +
+            t.get("teardown", {}).get("duration", 0)
     )
+
+
+def _download_artifact_from_run(repo_id: str, gh_run_id: int, headers: dict) -> Optional[dict]:
+    """Find and download the test-report artifact from a specific GitHub Actions run ID."""
+    artifacts_url = f"https://api.github.com/repos/{repo_id}/actions/runs/{gh_run_id}/artifacts"
+    art_resp = requests.get(artifacts_url, headers=headers, timeout=15)
+    if not art_resp.ok:
+        return None
+    artifacts = art_resp.json().get("artifacts", [])
+    artifact = next((a for a in artifacts if "test-report" in a["name"]), None)
+    if not artifact:
+        log.warning("gh_artifact_not_found repo=%s gh_run_id=%s", repo_id, gh_run_id)
+        return None
+
+    zip_url = f"https://api.github.com/repos/{repo_id}/actions/artifacts/{artifact['id']}/zip"
+    zip_resp = requests.get(zip_url, headers=headers, timeout=30)
+    zip_resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+        json_file = next((n for n in zf.namelist() if n.endswith(".json")), None)
+        if not json_file:
+            return None
+        with zf.open(json_file) as f:
+            data = json.load(f)
+    log.info("gh_artifact_fetched repo=%s gh_run_id=%s artifact=%s", repo_id, gh_run_id, artifact["name"])
+    return data
+
+
+def _fetch_pytest_report_from_github(repo_id: str, commit_sha: str) -> Optional[dict]:
+    """Fetch pytest JSON report artifact from GitHub Actions for a given commit SHA."""
+    try:
+        headers = _gh_headers()
+
+        runs_url = f"https://api.github.com/repos/{repo_id}/actions/runs?head_sha={commit_sha}"
+        runs_resp = requests.get(runs_url, headers=headers, timeout=15)
+        runs_resp.raise_for_status()
+        workflow_runs = runs_resp.json().get("workflow_runs", [])
+        if not workflow_runs:
+            log.warning("gh_artifact_no_runs repo=%s sha=%s", repo_id, commit_sha)
+            return None
+
+        for run in workflow_runs:
+            data = _download_artifact_from_run(repo_id, run["id"], headers)
+            if data:
+                return data
+
+        log.warning("gh_artifact_not_found repo=%s sha=%s", repo_id, commit_sha)
+        return None
+
+    except Exception:
+        log_exception("gh_artifact_fetch", repo_id=repo_id, commit_sha=commit_sha)
+        return None
+
+
+@app.route("/api/pytest-tests-from-url", methods=["GET"])
+def get_pytest_tests_from_url():
+    """Fetch pytest test report directly from a GitHub Actions URL.
+    Query param: url = https://github.com/{owner}/{repo}/actions/runs/{run_id}[/job/{job_id}]
+    """
+    gh_url = request.args.get("url")
+    if not gh_url:
+        return jsonify({"error": "url param required"}), 400
+
+    match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", gh_url)
+    if not match:
+        return jsonify({"error": "Could not parse GitHub Actions URL"}), 400
+
+    repo_id = match.group(1)
+    gh_run_id = int(match.group(2))
+
+    try:
+        data = _download_artifact_from_run(repo_id, gh_run_id, _gh_headers())
+        if not data:
+            return jsonify({"error": "No test-report artifact found"}), 404
+
+        tests = []
+        for t in data.get("tests", []):
+            outcome = t.get("outcome")
+            duration = _parse_test_duration(t)
+            tests.append({
+                "nodeid": t.get("nodeid"),
+                "lineno": t.get("lineno"),
+                "outcome": outcome,
+                "duration": duration,
+                "error_message": (t.get("error_message") or t.get("call", {}).get("crash", {}).get("message")) if outcome == "failed" else None,
+                "longrepr": (t.get("longrepr") or t.get("call", {}).get("longrepr")) if outcome == "failed" else None,
+            })
+
+        log.info("pytest_tests_from_url repo=%s gh_run_id=%s count=%s", repo_id, gh_run_id, len(tests))
+        return jsonify({
+            "repo_id": repo_id,
+            "gh_run_id": gh_run_id,
+            "summary": data.get("summary", {}),
+            "tests": tests,
+        })
+
+    except Exception:
+        log_exception("pytest_tests_from_url", url=gh_url)
+        return jsonify({"error": "Failed to fetch pytest tests"}), 500
+
+
+@app.route("/api/data/<path:repo_id>/<job_id>/<run_id>/pytest-tests", methods=["GET"])
+def get_pytest_tests(repo_id: str, job_id: str, run_id: str):
+    """Get all tests from pytest JSON report fetched from GitHub Actions artifact."""
+    g.repo_id, g.job_id = repo_id, job_id
+
+    try:
+        gh_run_id = request.args.get("gh_run_id")
+        commit_sha = request.args.get("commit_id")
+
+        if gh_run_id:
+            log.info("pytest_tests_direct_gh_run repo=%s gh_run_id=%s", repo_id, gh_run_id)
+            data = _download_artifact_from_run(repo_id, int(gh_run_id), _gh_headers())
+        elif commit_sha:
+            log.info("pytest_tests_commit_sha repo=%s sha=%s", repo_id, commit_sha)
+            data = _fetch_pytest_report_from_github(repo_id, commit_sha)
+        else:
+            # Last resort: look up commit SHA from DB
+            db_path = get_job_db_path(repo_id, job_id)
+            commit_sha = _get_commit_sha_for_run(db_path, run_id) if db_path.exists() else None
+            if not commit_sha:
+                log.warning("pytest_tests_no_commit repo=%s job=%s run=%s", repo_id, job_id, run_id)
+                return jsonify({"error": "No commit SHA found for this run"}), 404
+            data = _fetch_pytest_report_from_github(repo_id, commit_sha)
+        if not data:
+            return jsonify({"error": "No pytest report artifact found on GitHub"}), 404
+
+        tests = []
+        for t in data.get("tests", []):
+            outcome = t.get("outcome")
+            duration = _parse_test_duration(t)
+            tests.append({
+                "nodeid": t.get("nodeid"),
+                "lineno": t.get("lineno"),
+                "outcome": outcome,
+                "duration": duration,
+                "error_message": (t.get("error_message") or t.get("call", {}).get("crash", {}).get("message")) if outcome == "failed" else None,
+                "longrepr": (t.get("longrepr") or t.get("call", {}).get("longrepr")) if outcome == "failed" else None,
+            })
+
+        log.info("pytest_tests_success count=%s", len(tests))
+        return jsonify({
+            "repo_id": repo_id,
+            "job_id": job_id,
+            "run_id": run_id,
+            "commit_sha": commit_sha,
+            "tests": tests,
+        })
+
+    except Exception:
+        log_exception("pytest_tests_read", repo_id=repo_id, job_id=job_id, run_id=run_id)
+        return jsonify({"error": "Failed to fetch pytest tests"}), 500
+
 
 @app.route("/api/data/<path:repo_id>/<job_id>/runs", methods=["GET"])
 def list_runs(repo_id: str, job_id: str):
@@ -1761,6 +2218,7 @@ def list_runs(repo_id: str, job_id: str):
     except Exception:
         log_exception("list_runs", repo_id=repo_id, job_id=job_id)
         return jsonify({"error": "Failed to list runs"}), 500
+
 
 
 # -----------------------------------------------------------------------------
@@ -3009,14 +3467,14 @@ def rpc_tests_determine():
 
         # Check file dependency changes
         for row in cursor.execute(
-            """
-            SELECT te.test_name, fd.filename, fd.sha
-            FROM test_execution te
-            JOIN test_execution_file_dependency tefd ON te.id = tefd.test_execution_id
-            JOIN file_dependency fd ON tefd.file_dependency_id = fd.id
-            WHERE te.environment_id = ?
-            """,
-            (exec_id,),
+                """
+                SELECT te.test_name, fd.filename, fd.sha
+                FROM test_execution te
+                JOIN test_execution_file_dependency tefd ON te.id = tefd.test_execution_id
+                JOIN file_dependency fd ON tefd.file_dependency_id = fd.id
+                WHERE te.environment_id = ?
+                """,
+                (exec_id,),
         ):
             test_name = row["test_name"]
             filename = row["filename"]
@@ -3030,21 +3488,21 @@ def rpc_tests_determine():
             if "__python_version_changed__" in changed_packages:
                 # Python version changed - all tests must re-run
                 for row in cursor.execute(
-                    "SELECT DISTINCT test_name FROM test_execution WHERE environment_id = ?",
-                    (exec_id,),
+                        "SELECT DISTINCT test_name FROM test_execution WHERE environment_id = ?",
+                        (exec_id,),
                 ):
                     method_misses.add(row["test_name"])
             else:
                 # Find tests using any of the changed packages
                 placeholders = ", ".join("?" * len(changed_packages))
                 for row in cursor.execute(
-                    f"""
+                        f"""
                     SELECT DISTINCT te.test_name
                     FROM test_execution te
                     JOIN test_external_dependency ted ON te.id = ted.test_execution_id
                     WHERE te.environment_id = ? AND ted.package_name IN ({placeholders})
                     """,
-                    [exec_id] + list(changed_packages),
+                        [exec_id] + list(changed_packages),
                 ):
                     method_misses.add(row["test_name"])
 
@@ -3618,7 +4076,7 @@ def rpc_files_changed_data():
                 f.id IN ({placeholders})
             """,
             [exec_id] + fingerprint_ids,
-        ).fetchall()
+            ).fetchall()
 
         conn.close()
 
