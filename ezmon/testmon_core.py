@@ -199,6 +199,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         system_packages=None,
         python_version=None,
         readonly=False,
+        versioning_enabled=None,
     ):
         self.rootdir = rootdir
         self.environment = environment if environment else "default"
@@ -239,7 +240,11 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         # Pass run_id so DepStore's history-capture emits can tag rows
         # with the active run. versioning_enabled defaults to reading
         # the EZMON_VERSIONING env var inside DepStore.__init__.
-        self.dep_store = DepStore(self.db, run_id=self.run_id)
+        self.dep_store = DepStore(
+            self.db,
+            run_id=self.run_id,
+            versioning_enabled=versioning_enabled,
+        )
         self.files_of_interest = self.dep_store.all_filenames()
 
         self.expected_files_list = []

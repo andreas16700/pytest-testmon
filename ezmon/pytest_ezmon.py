@@ -151,6 +151,14 @@ def pytest_addoption(parser):
     )
     parser.addini("tmnet_url", "URL of the ezmon.net api server.")
     parser.addini("tmnet_api_key", "ezmon api key")
+    parser.addini(
+        "ezmon_versioning",
+        "Enable DB versioning history (files_history, tests_failed_history, "
+        "test_deps_history). Default off. Can also be set via "
+        "EZMON_VERSIONING=1 env var (env var takes precedence).",
+        type="bool",
+        default=False,
+    )
 
 
 def pytest_load_initial_conftests(early_config, parser, args):
@@ -319,12 +327,20 @@ def init_testmon_data(config: Config):
     )
 
 
+    # Resolve versioning flag: env var takes precedence over ini.
+    versioning_env = os.environ.get("EZMON_VERSIONING")
+    if versioning_env is not None:
+        versioning_enabled = versioning_env == "1"
+    else:
+        versioning_enabled = config.getini("ezmon_versioning") or False
+
     testmon_data = TestmonData(
         rootdir=config.rootdir.strpath,
         database=None,
         environment=environment,
         system_packages=system_packages,
         readonly=False,  # Controller/single always writes
+        versioning_enabled=versioning_enabled,
     )
     testmon_data.determine_stable()
 

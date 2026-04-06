@@ -348,6 +348,80 @@ There is no automatic in-place migration for pre-v19 DBs because the schema betw
 
 `tests/test_migrations.py` covers 12 cases: fresh init, fresh-but-corrupt (user_version=0 with existing tables), table-list truncation in the corruption error message, matching version no-op, future version refuses, missing migration refuses, missing migration error message is actionable, single and chained successful migrations, rollback on mid-migration exception, rollback on later-migration exception.
 
+## File/Test Version History (2026-04-06)
+
+### Overview
+
+The DB now supports opt-in change-history tracking. When enabled, every file checksum change, test `failed` flag flip, and test_deps bitmap/packages change gets an append-only row in the corresponding history table. The current-state tables (`files`, `tests`, `test_deps`) are **untouched** — the hot path for `determine_stable()` and selection is byte-identical to the versioning-off case.
+
+### How to enable
+
+Set the environment variable or pytest ini option:
+
+```bash
+EZMON_VERSIONING=1 pytest --ezmon
+```
+
+Or in `pytest.ini` / `pyproject.toml` `[tool.pytest.ini_options]`:
+
+```ini
+ezmon_versioning = true
+```
+
+The env var takes precedence over the ini. Default is **off** — history tables exist (created by the v19→v20 migration) but contain zero rows and carry zero runtime cost.
+
+### What it captures
+
+| Table | Trigger | Row content |
+|---|---|---|
+| `files_history` | File checksum or fsha changes from session baseline | `(file_id, run_id, path, file_type, checksum, fsha)` |
+| `files_history` | File deleted from git (`git rm`) | Tombstone: checksum=NULL, fsha=NULL |
+| `tests_failed_history` | `failed` flag flips (or first observation for new tests) | `(test_id, run_id, name, test_file, failed)` |
+| `test_deps_history` | Bitmap or external_packages differs from session baseline | `(test_id, run_id, name, test_file, file_bitmap, external_packages)` |
+
+**What it does NOT capture**: duration changes (noisy, never drives selection), steady-state re-observations (change-only writes), or file presence tracking for rollback (deferred — see Known Limitations).
+
+### Guardrails
+
+1. **PK dedup within a session**: the buffer is keyed by `(entity_id, run_id)`. Reruns, retries, and multiple updates to the same entity within one session produce exactly one history row (last-write-wins). Revert-to-baseline cancels the buffered entry.
+2. **No NULL pollution**: `get_file_id()` with unknown checksum/fsha does NOT emit a history row. NULL values in `files_history` are reserved for explicit git-deletion tombstones.
+3. **Unconditional flush**: `save_batch([])` runs at session end regardless of whether failed tests or test_deps were written, so file-change history from `determine_stable()` is never dropped.
+
+### Query helpers (`ezmon/history.py`)
+
+```python
+from ezmon.history import explain_selection, file_churn, get_file_at_run
+
+# "Why was test_foo selected in run 5?"
+exp = explain_selection(db, "test_foo", run_id=5)
+print(exp.triggering_files, exp.was_failed, exp.is_new)
+
+# "What was src/utils.py's checksum at run 3?"
+fv = get_file_at_run(db, "src/utils.py", run_id=3)
+print(fv.checksum, fv.is_tombstone)
+
+# "Which files change most often?"
+for entry in file_churn(db):
+    print(f"{entry['path']}: {entry['versions']} versions")
+```
+
+Full API: `get_file_at_run`, `get_test_deps_at_run`, `get_file_changes_between`, `get_test_deps_changes_between`, `explain_selection`, `file_churn`, `prune_history_before_run`.
+
+### Pruning
+
+```python
+from ezmon.history import prune_history_before_run
+stats = prune_history_before_run(db, keep_from_run_id=10)
+# PruneStats(files_deleted=42, tests_failed_deleted=3, test_deps_deleted=200)
+db.con.commit()
+```
+
+Not automatic. Users decide their own retention policy.
+
+### Storage impact
+
+Not yet measured at pandas scale. Expected: matplotlib DB grows ~2× over a full 27-commit pipeline sequence (5.5 MB → ~11 MB). Pandas may grow more aggressively due to higher test count; measure before enabling.
+
 ## Historical Fixes
 
 ### Checkpoint Dependency Fix (2026-02-01)
@@ -370,18 +444,9 @@ All historical run data is stored on external drive: `/Volumes/2tb/pandas/run_da
 
 ## Known Limitations
 
-### No file/test version history
+### No rollback / point-in-time presence tracking
 
-The schema stores only the latest state per file and per test. Both tables have a `run_id` column but it is a "last updated by run N" back-reference, not a version pointer. Updates are in place (`UPDATE files SET checksum = ?...`, `INSERT OR REPLACE INTO test_deps`). When a file's AST checksum changes between runs, the previous checksum is overwritten and lost.
-
-This is efficient (storage is bounded by project size, not by history depth) but prevents:
-
-- Debugging "why did test T get reselected between runs X and Y?" — the fingerprint that triggered the selection is gone
-- Analyzing fingerprint churn over time (which files change most often?)
-- Rolling back to a previous session state
-- Cross-run forensics when a test flips between selected and deselected unexpectedly
-
-A proper versioning design will be planned separately.
+Version history (shipped 2026-04-06) tracks content changes but not file/test **presence** across runs. A file deleted at run 2 that was last changed at run 1 still appears "present" at run 10 unless a git-deletion tombstone was recorded. This means full "rollback to run N" is not supported — the history enables debugging, churn analysis, and forensics, but not state reconstruction.
 
 ### Concurrent writers on NetDB
 

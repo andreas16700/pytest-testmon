@@ -277,6 +277,39 @@ def explain_selection(db, test_name: str, run_id: int) -> SelectionExplanation:
     )
 
 
+# ---- Maintenance ----
+
+@dataclass
+class PruneStats:
+    """Summary of a prune operation."""
+    files_deleted: int
+    tests_failed_deleted: int
+    test_deps_deleted: int
+
+
+def prune_history_before_run(db, keep_from_run_id: int) -> PruneStats:
+    """Delete all history rows with ``run_id < keep_from_run_id``.
+
+    This is an explicit, user-initiated operation — NOT called
+    automatically. Users decide their own retention policy.
+
+    The prune runs inside the DB's connection context. Callers should
+    call ``db.con.commit()`` afterward if they want the deletion to
+    persist, or rely on the plugin's normal session-end commit.
+    """
+    con = db.con
+    f = con.execute(
+        "DELETE FROM files_history WHERE run_id < ?", (keep_from_run_id,)
+    ).rowcount
+    t = con.execute(
+        "DELETE FROM tests_failed_history WHERE run_id < ?", (keep_from_run_id,)
+    ).rowcount
+    d = con.execute(
+        "DELETE FROM test_deps_history WHERE run_id < ?", (keep_from_run_id,)
+    ).rowcount
+    return PruneStats(files_deleted=f, tests_failed_deleted=t, test_deps_deleted=d)
+
+
 def file_churn(db, since_run: int = 0) -> List[Dict[str, object]]:
     """Return files sorted by number of distinct versions since ``since_run``.
 
