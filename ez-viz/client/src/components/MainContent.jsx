@@ -58,7 +58,7 @@ function MainContent({
                     </svg>
                 </div>
                 <p className="empty-state-text">
-                    Select a repository and job above to view your testmon analysis.
+                    Select repository, job, and run from the left sidebar to view your project's test insights.
                 </p>
             </div>
         );
