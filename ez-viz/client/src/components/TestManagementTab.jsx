@@ -96,6 +96,7 @@ function TestManagementTab({repos, currentRepo, currentJob}) {
                 headers: {
                     "Content-Type": "application/json",
                 },
+                credentials: "include",
                 body: JSON.stringify({
                     repo_id: currentRepo,
                     job_id: currentJob,
@@ -171,9 +172,7 @@ function TestManagementTab({repos, currentRepo, currentJob}) {
 
     const loadTestPreferences = async () => {
         try {
-            const response = await fetch(
-                `${API_BASE}/client/testPreferences?repo_id=${currentRepo}&job_id=${currentJob}`
-            );
+            const response = await fetch(`${API_BASE}/client/testPreferences?repo_id=${currentRepo}&job_id=${currentJob}`, {credentials: "include"});
             const data = await response.json();
 
             if (data.always_run_tests && data.always_run_tests.length > 0) {
