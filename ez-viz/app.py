@@ -1247,25 +1247,6 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
         conn.row_factory = sqlite3.Row
 
         query = """
-            WITH RankedHistory AS (
-                SELECT 
-                    test_id,
-                    name,
-                    failed,
-                    duration,
-                    ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
-                FROM tests_failed_history
-                WHERE run_id <= ?
-            ),
-            PointInTimeTests AS (
-                SELECT 
-                    rh.name,
-                    rh.failed,
-                    COALESCE(t.duration, rh.duration) AS duration
-                FROM RankedHistory rh
-                LEFT JOIN tests t ON rh.test_id = t.id
-                WHERE rh.rn = 1 AND rh.failed != -1
-            )
             SELECT
                 CASE 
                     WHEN instr(name, '::') > 0 
@@ -1283,11 +1264,12 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
                         ELSE NULL
                     END
                 ) AS test_methods
-            FROM PointInTimeTests
+            FROM tests
             GROUP BY file_name
             ORDER BY file_name;
         """
-        test_files = conn.execute(query, (run_id,)).fetchall()
+
+        test_files = conn.execute(query).fetchall()
 
         conn.close()
 
