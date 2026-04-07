@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Github, LogOut, ChevronDown, User, Activity, Zap } from "lucide-react";
+import ezmonLogo from "../assets/ezmon-logo.png";
 
 function Header({ user, handleLogout }) {
     const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -17,9 +18,13 @@ function Header({ user, handleLogout }) {
 
     return (
         <header className="header-bg border-b border-white/10 shadow-xl">
-            <div className="flex items-center justify-between max-w-[1600px] mx-auto px-6 py-4">
+            <div className="flex items-center justify-between max-w-[1600px] mx-auto px-6 py-2.5">
                 <div className="flex items-center gap-3">
-                    <Zap className="w-7 h-7 text-yellow-300 fill-yellow-300" />
+                    <img
+                        src={ezmonLogo}
+                        alt="Ezmon Logo"
+                        className="h-16 w-auto drop-shadow-md"
+                    />
                     <div>
                         <h1 className="text-2xl font-bold text-white leading-tight tracking-tight">
                             Ezmon

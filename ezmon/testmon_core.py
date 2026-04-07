@@ -1159,7 +1159,8 @@ class TestmonCollector:
         """
         # Stop dependency tracking and collect tracked dependencies
         files, local_imports, external_imports, test_file = self.dependency_tracker.stop()
-        self._tracked_deps[self._test_name] = (files, local_imports, external_imports, test_file)
+        if self._test_name is not None:
+            self._tracked_deps[self._test_name] = (files, local_imports, external_imports, test_file)
 
         nodes_files_lines = {}
 
