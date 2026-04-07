@@ -31,6 +31,7 @@ def get_test_preferences() -> dict:
 
     try:
         req = urllib.request.Request(url, method='GET')
+        req.add_header("User-Agent", "pytest-ezmon-client/1.0")
         auth_token = net_config.get("auth_token")
         if auth_token:
             req.add_header("Authorization", f"Bearer {auth_token}")
