@@ -157,6 +157,14 @@ function App() {
     const showTestDetails = async (testId, runId) => {
         try {
             const resp = await fetch(`/api/data/${currentRepo}/${currentJob}/${runId}/test/${testId}`, {credentials: "include"});
+
+            if (!resp.ok) {
+                if (resp.status === 404) {
+                    throw new Error("Test details not found.");
+                }
+                throw new Error(`Server responded with status: ${resp.status}`);
+            }
+
             const data = await resp.json();
 
             setModal({
@@ -166,7 +174,10 @@ function App() {
             });
         } catch (err) {
             console.error(err);
-            toast.error("Failed to load test details. Please try again later.");
+            toast.error(err.message === "Test details not found."
+                ? "This test could not be found."
+                : "Failed to load test details. Please try again later."
+            );
         }
     };
 

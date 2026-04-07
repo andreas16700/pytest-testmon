@@ -1246,32 +1246,48 @@ def list_test_files(repo_id: str, job_id: str, run_id: str):
         conn = get_db_connection(db_path, readonly=True)
         conn.row_factory = sqlite3.Row
 
-        test_files = conn.execute(
-            """
+        query = """
+            WITH RankedHistory AS (
+                SELECT 
+                    test_id,
+                    name,
+                    failed,
+                    duration,
+                    ROW_NUMBER() OVER(PARTITION BY test_id ORDER BY run_id DESC) as rn
+                FROM tests_failed_history
+                WHERE run_id <= ?
+            ),
+            PointInTimeTests AS (
+                SELECT 
+                    rh.name,
+                    rh.failed,
+                    COALESCE(t.duration, rh.duration) AS duration
+                FROM RankedHistory rh
+                LEFT JOIN tests t ON rh.test_id = t.id
+                WHERE rh.rn = 1 AND rh.failed != -1
+            )
             SELECT
                 CASE 
-                    WHEN instr(t.name, '::') > 0 
-                        THEN substr(t.name, 1, instr(t.name, '::') - 1)
-                    ELSE t.name
+                    WHEN instr(name, '::') > 0 
+                        THEN substr(name, 1, instr(name, '::') - 1)
+                    ELSE name
                 END AS file_name,
                 COUNT(*) AS test_count,
-                SUM(t.duration) AS total_duration,
-                SUM(CASE WHEN t.failed = 1 THEN 1 ELSE 0 END) AS failed_count,
+                SUM(duration) AS total_duration,
+                SUM(CASE WHEN failed = 1 THEN 1 ELSE 0 END) AS failed_count,
                 GROUP_CONCAT(
                     DISTINCT
                     CASE 
-                        WHEN instr(t.name, '::') > 0 
-                            THEN substr(t.name, instr(t.name, '::') + 2)
+                        WHEN instr(name, '::') > 0 
+                            THEN substr(name, instr(name, '::') + 2)
                         ELSE NULL
                     END
                 ) AS test_methods
-            FROM tests t 
-            WHERE t.run_id = ?                      
+            FROM PointInTimeTests
             GROUP BY file_name
             ORDER BY file_name;
-            """,
-            (run_id,),
-        ).fetchall()
+        """
+        test_files = conn.execute(query, (run_id,)).fetchall()
 
         conn.close()
 
@@ -1580,7 +1596,7 @@ def get_file_dependencies(repo_id: str, job_id: str, run_id: str):
             ]
         })
 
-    except Exception:
+    except Exception as e:
         log_exception("file_dependencies_query", repo_id=repo_id, job_id=job_id)
         return jsonify({
             "error": "Failed to fetch file dependencies from database snapshot",
