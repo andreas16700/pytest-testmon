@@ -54,3 +54,6 @@ nosetests.xml
 /htmlcov/
 /tags
 tmserver
+
+.idea/
+.vscode/
