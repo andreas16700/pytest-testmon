@@ -300,20 +300,16 @@ def git_current_head(path=None):
     path = git_path(path)
     if not path:
         return None
-    git_head_file = os.path.join(path, "HEAD")
     try:
-        with open(git_head_file, "r", encoding="utf8") as head_file:
-            head_content = head_file.read().strip()
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(path),  # the repo root, not .git
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            return sha if len(sha) == 40 else None
     except FileNotFoundError:
         return None
-    # Detached HEAD: raw SHA
-    if not head_content.startswith("ref:"):
-        return head_content if len(head_content) == 40 else None
-    # Branch ref: resolve to SHA
-    branch = head_content.split("/")[-1]
-    git_branch_file = os.path.join(path, "refs", "heads", branch)
-    try:
-        with open(git_branch_file, "r", encoding="utf8") as branch_file:
-            return branch_file.read().strip()
-    except FileNotFoundError:
-        return None
+    return None
