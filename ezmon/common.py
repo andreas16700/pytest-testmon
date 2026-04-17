@@ -300,16 +300,39 @@ def git_current_head(path=None):
     path = git_path(path)
     if not path:
         return None
+    git_head_file = os.path.join(path, "HEAD")
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=os.path.dirname(path),  # the repo root, not .git
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            sha = result.stdout.strip()
-            return sha if len(sha) == 40 else None
+        with open(git_head_file, "r", encoding="utf8") as f:
+            head_content = f.read().strip()
     except FileNotFoundError:
         return None
+
+    if not head_content.startswith("ref:"):
+        return head_content if len(head_content) == 40 else None
+
+    ref = head_content[len("ref: "):].strip()   # e.g. "refs/heads/master"
+    branch = ref.split("/")[-1]
+
+    # Try loose ref first
+    loose = os.path.join(path, "refs", "heads", branch)
+    try:
+        with open(loose, "r", encoding="utf8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        pass
+
+    # Fall back to packed-refs (used by actions/checkout@v4)
+    packed = os.path.join(path, "packed-refs")
+    try:
+        with open(packed, "r", encoding="utf8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2 and parts[1] == ref:
+                    return parts[0]
+    except FileNotFoundError:
+        pass
+
     return None
