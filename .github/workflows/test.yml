@@ -23,9 +23,11 @@ jobs:
   # Unit Tests - Self-hosted macOS runner with NetDB
   # ============================================================================
   unit-tests:
-    runs-on: self-hosted
+    # m4's sandbox user cipublic: no secrets, no sudo, can't read other users' files.
+    runs-on: [self-hosted, cipublic]
     # Skip if triggered by workflow_run and deploy failed
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # Pull requests from forks never run on the self-hosted runner (docs/ci.md in andreas16700/machines).
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     env:
       REPO_ID: ${{ github.repository }}
       JOB_ID: "unit-tests"
@@ -68,9 +70,11 @@ jobs:
   # Integration Tests - Self-hosted macOS runner with NetDB
   # ============================================================================
   integration-tests:
-    runs-on: self-hosted
+    # m4's sandbox user cipublic: no secrets, no sudo, can't read other users' files.
+    runs-on: [self-hosted, cipublic]
     # Skip if triggered by workflow_run and deploy failed
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # Pull requests from forks never run on the self-hosted runner (docs/ci.md in andreas16700/machines).
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     env:
       REPO_ID: ${{ github.repository }}
       JOB_ID: "integration-tests"
@@ -91,9 +95,11 @@ jobs:
   # Lint
   # ============================================================================
   lint:
-    runs-on: self-hosted
+    # m4's sandbox user cipublic: no secrets, no sudo, can't read other users' files.
+    runs-on: [self-hosted, cipublic]
     # Skip if triggered by workflow_run and deploy failed
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # Pull requests from forks never run on the self-hosted runner (docs/ci.md in andreas16700/machines).
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
       - uses: actions/checkout@v4
 

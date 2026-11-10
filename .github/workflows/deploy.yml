@@ -6,15 +6,18 @@ on:
   workflow_dispatch:
 
 env:
-  APP_REPO_PATH: /Users/andreasloizides/pytest-testmon/ez-viz          # ⬅️ change if needed
-  DEPLOY_STATE_DIR: /Users/andreasloizides/pytest-testmon/ez-viz.deploy-state
+  APP_REPO_PATH: /Users/ezmon/pytest-testmon/ez-viz          # ⬅️ change if needed
+  DEPLOY_STATE_DIR: /Users/ezmon/pytest-testmon/ez-viz.deploy-state
   PM2_NAME: testmon-server                                           # ⬅️ matches your PM2 app name
-  VENV_DIR: /Users/andreasloizides/pytest-testmon/ez-viz/.venv          # ⬅️ your venv path
+  VENV_DIR: /Users/ezmon/pytest-testmon/ez-viz/.venv          # ⬅️ your venv path
   HEALTH_URL: http://127.0.0.1:8004/health
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    # m4's runner as the user ezmon, which owns testmon-server and its secrets (not an admin, no keys to other
+    # hosts; docs/ci.md in andreas16700/machines). Never for pull requests: only pushes to main and manual runs.
+    runs-on: [self-hosted, ezmon]
+    if: github.repository == 'andreas16700/pytest-testmon' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     defaults:
       run:
         working-directory: ${{ env.APP_REPO_PATH }}
@@ -138,7 +141,7 @@ jobs:
           else
             echo "▶️ Starting ${{ env.PM2_NAME }} from ecosystem file..."
             # You can keep your ecosystem at repo root
-            pm2 start /Users/andreasloizides/ecosystem.config.js --only "${{ env.PM2_NAME }}"
+            pm2 start "$HOME/ecosystem.config.js" --only "${{ env.PM2_NAME }}"
           fi
 
           pm2 save
